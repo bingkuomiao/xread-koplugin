@@ -1,0 +1,19 @@
+# 本地凭据（不进版本库）
+.publish_env
+*.env.local
+
+# Python
+__pycache__/
+*.pyc
+
+# 构建/发布产物
+publish/
+dist/
+*.zip
+*.xup_tmp
+
+# 测试报告与临时文件
+tests/reports/
+wsl-setup/probe*/
+wsl-setup/*.log
+tmp/
