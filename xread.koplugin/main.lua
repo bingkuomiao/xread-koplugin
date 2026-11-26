@@ -4796,9 +4796,15 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
     local function chapterLabel()
 
-        -- 工具栏左下格显示书名（单行截断），章号信息由中间位置格承担
+        -- 工具栏左下格显示「当前章节名」（单行截断），章号由中间位置格承担；
+        -- 书名改到第二行标题位显示
+        local ch = chapters[index]
 
-        return name
+        local t = ch and (ch.title or ch.name)
+
+        if t and tostring(t) ~= "" then return tostring(t) end
+
+        return T(_("第 %1 章"), tostring(index))
 
     end
 
@@ -4834,13 +4840,13 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
     end)
 
-    -- 状态栏与首页一致：第一行显示昵称，右侧同步位显示连接状态
-
+    -- 昵称跟在「首页」按钮后面；第二行标题位显示书名；左下格显示当前章节名。
+    -- 昵称兜底与首页一致：设置昵称 > 登录账号 > 「书友」。
     local nickname = tostring(self:getSetting("nickname", "") or "")
 
     if nickname == "" then nickname = tostring(self:getSetting("username", "") or "") end
 
-    if nickname == "" then nickname = name end
+    if nickname == "" then nickname = _("书友") end
 
     local health_text = _("已连接")
 
@@ -4850,7 +4856,9 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
         header = {
 
-            title = nickname,
+            home_label = _("首页") .. " " .. nickname,
+
+            title = name,
 
             time_label = os.date("%H:%M"),
 
@@ -5663,6 +5671,18 @@ function XRead:_restoreReaderFooter()
 
         if footer.set_mode_index then footer:set_mode_index() end
 
+        -- 与 _applyReaderFooter 对称：settings 变了就要重建 mode_list / 重算 has_no_mode，
+        -- 否则恢复后 mode_list 仍是 xread 定制态，原生书的底栏显示/切换会错乱
+        footer.mode_list = {}
+
+        for i = 0, #footer.mode_index do
+
+            footer.mode_list[footer.mode_index[i]] = i
+
+        end
+
+        if footer.set_has_no_mode then footer:set_has_no_mode() end
+
         if footer.updateFooterTextGenerator then footer:updateFooterTextGenerator() end
 
         if footer.updateFooterContainer then footer:updateFooterContainer() end
@@ -5732,9 +5752,30 @@ function XRead:_applyReaderFooter()
 
         footer:set_mode_index()
 
+        -- set_mode_index 只重建 mode_index（模式名数组），不重建 mode_list（name→index 映射），
+        -- 也不重算 has_no_mode、不更新 view.footer_visible。这三样正是决定底栏是否显示的关键，
+        -- init() 里是依次做的；这里改 settings 后必须同样补齐，否则底栏「消失」、页码不显示。
+        footer.mode_list = {}
+
+        for i = 0, #footer.mode_index do
+
+            footer.mode_list[footer.mode_index[i]] = i
+
+        end
+
+        if footer.set_has_no_mode then footer:set_has_no_mode() end
+
         footer:updateFooterTextGenerator()
 
         footer:updateFooterContainer()
+
+        -- 强制把底栏置为可见（切到 page_progress 模式），并触发可见性变化通知，
+        -- 让 ReaderView 重新为底栏分配显示空间
+        if footer.applyFooterMode and footer.mode_list.page_progress then
+
+            footer:applyFooterMode(footer.mode_list.page_progress)
+
+        end
 
         -- updateFooterContainer 重建了 positioner（dimen 为空），必须强制重算布局
         footer:resetLayout(true)
@@ -5777,9 +5818,37 @@ function XRead:_injectTocFromText()
 
     if type(native) == "table" and #native > 0 then
 
+        -- crengine 会把 <title> 标签也生成一条「空标题」TOC 条目（通常在 page=1）。
+        -- footer 的 book_chapter 通过 getTocTitleByPage 命中的是「本页第一条」，
+        -- 空标题条目会让正文底部左侧章节名显示为空。这里过滤掉空标题条目（page 映射不变）。
+        local cleaned = {}
+
+        for _, e in ipairs(native) do
+
+            local t = e and e.title
+
+            if type(t) == "string" and t:gsub("%s", "") ~= "" then
+
+                cleaned[#cleaned + 1] = e
+
+            end
+
+        end
+
+        if #cleaned > 0 then
+
+            ui.toc.toc = cleaned
+
+            local footer = ui.view and ui.view.footer
+
+            if footer and footer.updateFooterText then footer:updateFooterText(true) end
+
+        end
+
         if os.getenv("XREAD_AUTOTEST") then
 
-            print("[XREAD_AUTOTEST] toc injected: native " .. tostring(#native))
+            print("[XREAD_AUTOTEST] toc injected: native " .. tostring(#native)
+                .. " cleaned " .. tostring(#cleaned))
 
         end
 
