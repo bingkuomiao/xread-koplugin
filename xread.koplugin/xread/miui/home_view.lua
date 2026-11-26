@@ -1335,7 +1335,8 @@ function HomeWidget:_build_header(children, m)
         return time_cell
     end,nil,1)
     add("tools",min_hit,function(w)
-        return Ui.icon("more",w,m.header_h,icon_size,{icon_key="more"})
+        -- 「更多」用三横杠（menu）图标，与正文工具栏保持一致
+        return Ui.icon("menu",w,m.header_h,icon_size,{icon_key="menu"})
     end,function()
         if self.opts and self.opts.on_menu then self.opts.on_menu()
         elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end

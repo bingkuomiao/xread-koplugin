@@ -455,7 +455,7 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
             {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true, weight = 1.15},
             {label = header.time_label or "", enabled = true, text_align = "center", bold = true, weight = 0.9},
             {icon = "battery", label = header.battery_label or "", enabled = true, bold = true, weight = 1.05},
-            {icon = "more", icon_only = true, enabled = type(header.more_callback) == "function", weight = 0.62},
+            {icon = "menu", icon_only = true, enabled = type(header.more_callback) == "function", weight = 0.62},
         }
         callbacks = {
             function() self:_activate(header.home_callback, "首页") end,
@@ -482,7 +482,7 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
             {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true, weight = 1.15},
             {label = header.time_label or "", enabled = true, text_align = "center", bold = true, weight = 0.9},
             {icon = "battery", label = header.battery_label or "", enabled = true, bold = true, weight = 1.05},
-            {icon = "more", icon_only = true, enabled = type(header.more_callback) == "function", weight = 0.62},
+            {icon = "menu", icon_only = true, enabled = type(header.more_callback) == "function", weight = 0.62},
         }
         callbacks = {
             function() self:_activate(header.home_callback, "首页") end,

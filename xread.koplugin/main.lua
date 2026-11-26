@@ -2653,7 +2653,8 @@ function XRead:showHome(page)
 
         date_text = os.date("%m月%d日 ") .. ({ "周日", "周一", "周二", "周三", "周四", "周五", "周六" })[(tonumber(os.date("%w")) or 0) + 1],
 
-        on_local_stats = function() self:showReadingStats() end,
+        -- 「本地阅读」：先列出本机导出的书，再给一个阅读统计入口
+        on_local_stats = function() self:showLocalBooks() end,
 
         on_open_book = function(mbook) self:openBook(mbook._xread_book) end,
 
@@ -3606,7 +3607,7 @@ function XRead:showBookCatalog(book, cover_path, page)
 end
 -- ---------- 阅读器内：目录 / 跳章 ----------
 
-function XRead:showReaderCatalog(page)
+function XRead:showReaderCatalog(page, order)
 
     local doc = self.ui.document
 
@@ -3684,6 +3685,8 @@ function XRead:showReaderCatalog(page)
 
         page = page,
 
+        order = order or "asc",
+
         back_label = _("返回"),
 
         on_select = function(i)
@@ -3707,21 +3710,22 @@ function XRead:showReaderCatalog(page)
 
         end,
 
-        on_toc_first = function()
+        on_order_toggle = function(next_order)
 
-            self:showReaderCatalog(1)
+            -- 切顺序时回到第 1 页：倒序就从最后一章开始看
+            self:showReaderCatalog(1, next_order)
 
         end,
 
         on_page_changed = function(new_page)
 
-            self:showReaderCatalog(new_page)
+            self:showReaderCatalog(new_page, order)
 
         end,
 
         cache_fn = function(i) return self:chapterCacheState(book, i) end,
 
-        on_cache_changed = function(p) self:showReaderCatalog(p) end,
+        on_cache_changed = function(p) self:showReaderCatalog(p, order) end,
 
     }
 
@@ -3785,7 +3789,7 @@ function XRead:jumpToChapterFromCatalog(view, book, chapters, i)
 
 end
 
-function XRead:showCatalog(book, chapters, dur_index, page, cover_path)
+function XRead:showCatalog(book, chapters, dur_index, page, cover_path, order)
 
     if self._catalog_view then
 
@@ -3809,6 +3813,8 @@ function XRead:showCatalog(book, chapters, dur_index, page, cover_path)
 
         page = page or 1,
 
+        order = order or "asc",
+
         on_select = function(i)
 
             -- 同阅读器内目录：目录盖到新文档就绪再关，避免中间空档闪出书架/首页
@@ -3828,15 +3834,15 @@ function XRead:showCatalog(book, chapters, dur_index, page, cover_path)
 
         end,
 
-        on_toc_first = function()
+        on_order_toggle = function(next_order)
 
-            self:showCatalog(book, chapters, dur_index, 1, cover_path)
+            self:showCatalog(book, chapters, dur_index, 1, cover_path, next_order)
 
         end,
 
         on_page_changed = function(new_page)
 
-            self:showCatalog(book, chapters, dur_index, new_page, cover_path)
+            self:showCatalog(book, chapters, dur_index, new_page, cover_path, order)
 
         end,
 
@@ -3844,7 +3850,7 @@ function XRead:showCatalog(book, chapters, dur_index, page, cover_path)
 
         on_cache_changed = function(p)
 
-            self:showCatalog(book, chapters, dur_index, p, cover_path)
+            self:showCatalog(book, chapters, dur_index, p, cover_path, order)
 
         end,
 
@@ -4936,15 +4942,30 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
                 callback = function()
 
+                    -- 缓存多少章由「设置 → 缓存管理 → 默认服务器缓存章节数」决定
+                    local count = self:cacheDepthCount()
+
+                    local text
+
+                    if count == 0 then
+
+                        text = T(_("让服务器缓存「%1」的全部章节？\n缓存后阅读秒开，失败会提示。"), book.name or "")
+
+                    else
+
+                        text = T(_("让服务器缓存「%1」的 %2 章？\n缓存后阅读秒开，失败会提示。"),
+
+                            book.name or "", tostring(count))
+
+                    end
+
                     UIManager:show(ConfirmBox:new{
 
-                        text = T(_("让服务器缓存「%1」全部章节？\n缓存后阅读秒开，失败会提示。"),
-
-                            book.name or ""),
+                        text = text,
 
                         ok_text = _("开始缓存"),
 
-                        ok_callback = function() self:doCacheBook(book) end,
+                        ok_callback = function() self:doCacheBook(book, count) end,
 
                     })
 
@@ -5254,6 +5275,88 @@ function XRead:_showLegacyQuickPanel()
 
 end
 -- ---------- 面板里各快捷动作 ----------
+
+-- 本机导出的书：正文「下载」会把整本导出成 EPUB，放在「文档目录/xread」。
+-- 这里扫一遍目录，给「本地阅读」面板用（文件名排序按修改时间倒序）。
+function XRead:listExportedBooks()
+    local dir
+    local ok = pcall(function() dir = BookExport:exportDir() end)
+    if not ok or not dir or dir == "" then return "", {} end
+    local files = {}
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok_lfs and lfs and lfs.dir then
+        local ok_dir, iter, dobj = pcall(lfs.dir, dir)
+        if ok_dir and iter then
+            for name in iter, dobj do
+                if type(name) == "string" and name:lower():match("%.epub$") then
+                    local path = dir .. "/" .. name
+                    local size, mtime = 0, 0
+                    pcall(function()
+                        local attr = lfs.attributes(path)
+                        if attr then
+                            size = tonumber(attr.size) or 0
+                            mtime = tonumber(attr.modification) or 0
+                        end
+                    end)
+                    files[#files + 1] = { name = name, path = path, size = size, mtime = mtime }
+                end
+            end
+        end
+    end
+    table.sort(files, function(a, b)
+        if (a.mtime or 0) ~= (b.mtime or 0) then return (a.mtime or 0) > (b.mtime or 0) end
+        return a.name < b.name
+    end)
+    return dir, files
+end
+
+function XRead:openLocalBook(path)
+    if not path or path == "" then return end
+    local ReaderUI = require("apps/reader/readerui")
+    local tries = 0
+    local function doOpen()
+        tries = tries + 1
+        if self.ui and self.ui.document then
+            -- 已经在阅读器里：直接换文档，不用重建 ReaderUI
+            if self.ui.document.file == path then
+                local tf = io.open(path, "a")
+                if tf then tf:close() end
+            end
+            self.ui:switchDocument(path, true)
+            return
+        end
+        if ReaderUI.instance ~= nil and tries < 20 then
+            UIManager:scheduleIn(0.15, doOpen)   -- 旧 ReaderUI 还在拆除，等它收完
+            return
+        end
+        pcall(function() ReaderUI:showReader(path, nil, true) end)
+    end
+    UIManager:nextTick(doOpen)
+end
+
+-- 「本地阅读」面板：本机导出的书 + 阅读统计入口。
+-- 以前这个格子只能看阅读时长统计，导出的书得自己去文件管理器翻。
+function XRead:showLocalBooks()
+    local dir, files = self:listExportedBooks()
+    local items = {
+        { label = _("阅读统计"), callback = function() self:showReadingStats() end },
+    }
+    for _i, f in ipairs(files) do
+        local title = tostring(f.name):gsub("%.epub$", "")
+        local kb = math.max(1, math.floor((tonumber(f.size) or 0) / 1024 + 0.5))
+        local path = f.path
+        items[#items + 1] = {
+            label = title .. "　" .. T(_("%1 KB"), tostring(kb)),
+            callback = function() self:openLocalBook(path) end,
+        }
+    end
+    if #files == 0 then
+        items[#items + 1] = { label = _("暂无本机导出的书（在正文里按「下载」导出）") }
+    end
+    self:showMoreListPanel(_("本地阅读"), items, {
+        hint = dir ~= "" and T(_("导出的书存放在：%1"), dir) or nil,
+    })
+end
 
 function XRead:showReadingStats()
 
@@ -8014,7 +8117,16 @@ function XRead:applyServerAddress(ip, port)
     return true
 end
 
--- 「默认缓存章节数」：50 / 100 / 全部（all）
+-- 服务器缓存章数：设置里的 50 / 100 / 全部 → 后端 count（0 = 全部章节）
+function XRead:cacheDepthCount()
+    local v = tostring(self:getSetting("cache_depth", "50") or "50")
+    if v == "all" then return 0 end
+    local n = tonumber(v)
+    if not n or n < 1 then return 50 end
+    return n
+end
+
+-- 本地预加载深度：50 / 100 / 全部（all）
 function XRead:cacheDepthLimit()
     local v = tostring(self:getSetting("cache_depth", "50") or "50")
     if v == "all" then return math.huge end
@@ -8025,18 +8137,18 @@ end
 
 function XRead:showSettings()
 
-    -- 首页齿轮「设置」：地址管理 / 账号管理 / 翻页管理 / 缓存管理 四组。
-    -- 地址、端口、账号三项与「更多 → 地址管理 / 账号管理」同一套读写逻辑，
-    -- 这里只是把它们收在一页里；地址/端口即改即存，账号与缓存项关闭时保存。
+    -- 首页齿轮「设置」：地址管理 / 账号管理 / 翻页管理 / 缓存管理。
+    -- 版式用「分组卡片」：每组一个圆角白框、组内行之间一条细线、组与组之间留白。
+    -- 原来所有行挤成一竖列，分组标题和下一行贴在一起，看着很挤。
     local VerticalGroup = require("ui/widget/verticalgroup")
     local HorizontalGroup = require("ui/widget/horizontalgroup")
     local HorizontalSpan = require("ui/widget/horizontalspan")
+    local VerticalSpan = require("ui/widget/verticalspan")
     local FrameContainer = require("ui/widget/container/framecontainer")
     local CenterContainer = require("ui/widget/container/centercontainer")
     local LeftContainer = require("ui/widget/container/leftcontainer")
     local RightContainer = require("ui/widget/container/rightcontainer")
     local InputContainer = require("ui/widget/container/inputcontainer")
-    local TextBoxWidget = require("ui/widget/textboxwidget")
     local TextWidget = require("ui/widget/textwidget")
     local Button = require("ui/widget/button")
     local LineWidget = require("ui/widget/linewidget")
@@ -8061,20 +8173,19 @@ function XRead:showSettings()
     end
 
     local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local W = math.min(sw - 80, 860)
-    local pad = math.floor(sw * 0.03)
+    local W = math.min(sw - Screen:scaleBySize(56), Screen:scaleBySize(880))
+    local pad = Screen:scaleBySize(18)
     local inner_w = W - pad * 2
+    local hpad = Screen:scaleBySize(16)          -- 行内左右留白
+    local content_w = inner_w - 2 * hpad
+    local row_h = math.max(Screen:scaleBySize(44),
+        math.min(Screen:scaleBySize(58), math.floor(sh * 0.05)))
     local face_title = Font:getFace("cfont", 22)
-    local face_group = Font:getFace("smallinfofont", 15)
-    local face_row = Font:getFace("cfont", 18)
+    local face_group = Font:getFace("cfont", 15)
+    local face_row = Font:getFace("cfont", 17)
+    local face_value = Font:getFace("cfont", 16)
     local face_hint = Font:getFace("smallinfofont", 13)
-    local face_desc = Font:getFace("cfont", 14)
-
-    -- 行高按屏幕高度自适应：9 行 + 4 个分组标题在小屏上也能放下
-    local row_h = math.max(Screen:scaleBySize(32), math.min(Screen:scaleBySize(52), math.floor(sh * .045)))
-    local gap_row = Screen:scaleBySize(4)
-    local gap_group = Screen:scaleBySize(12)
-    local label_w = math.floor(inner_w * .38)
+    local face_desc = Font:getFace("cfont", 13)
 
     local dialog  -- forward
 
@@ -8110,52 +8221,76 @@ function XRead:showSettings()
         self:showSettings()
     end
 
-    local function groupLabel(text)
-        return TextBoxWidget:new{
-            text = text, face = face_group, bold = true,
-            width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
+    -- ---------- 版式零件 ----------
+    local function groupTitle(text)
+        return VerticalGroup:new{ align = "left",
+            VerticalSpan:new{ width = Screen:scaleBySize(16) },
+            TextWidget:new{
+                text = text, face = face_group, bold = true,
+                fgcolor = Blitbuffer.COLOR_GRAY_6,
+                max_width = inner_w,
+            },
+            VerticalSpan:new{ width = Screen:scaleBySize(7) },
         }
     end
 
-    local function separator()
-        return LineWidget:new{
-            background = Blitbuffer.COLOR_LIGHT_GRAY,
-            dimen = Geom:new{ w = inner_w, h = Screen:scaleBySize(1) },
+    local function rowLine()
+        return HorizontalGroup:new{ align = "center",
+            HorizontalSpan:new{ width = hpad },
+            LineWidget:new{
+                dimen = Geom:new{ w = content_w, h = 1 },
+                background = Blitbuffer.COLOR_GRAY_D,
+            },
+            HorizontalSpan:new{ width = hpad },
         }
     end
 
-    local function hintLine(text)
-        return TextBoxWidget:new{
-            text = text, face = face_hint,
-            width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
+    local function card(rows)
+        local box = VerticalGroup:new{ align = "left" }
+        for i = 1, #rows do
+            box[#box + 1] = rows[i]
+            if i < #rows then box[#box + 1] = rowLine() end
+        end
+        return FrameContainer:new{
+            bordersize = 1, color = Blitbuffer.COLOR_GRAY_B, radius = 8,
+            padding = 0, margin = 0,
+            background = Blitbuffer.COLOR_WHITE,
+            width = inner_w,
+            box,
         }
     end
 
-    -- 一行「左侧标签 + 右侧取值」，左右各自贴边（原来用 Button 左对齐拼字符串，
-    -- 长短不一时右边的值参差不齐，看着很乱）
+    local label_w = math.floor(content_w * 0.50)
+    local ctl_w = math.max(1, content_w - label_w)
+
+    -- 一行「左侧标签 + 右侧取值」：左右各自贴边，取值右对齐
     local ParamRow = InputContainer:extend{
-        label = nil, value = nil, width = nil, height = nil,
-        callback = nil, arrow = nil, value_face = nil,
+        label = nil, value = nil, height = nil,
+        callback = nil, arrow = nil, value_face = nil, selected = false,
     }
     function ParamRow:init()
-        local left_w = math.floor(self.width * .38)
-        local right_w = math.max(1, self.width - left_w)
         local label_tw = TextWidget:new{
             text = tostring(self.label or ""), face = face_row, bold = true,
-            max_width = left_w, fgcolor = Blitbuffer.COLOR_BLACK,
+            max_width = label_w, fgcolor = Blitbuffer.COLOR_BLACK,
         }
         local value_text = tostring(self.value or "")
         if self.arrow then value_text = value_text .. "   ›" end
         local value_tw = TextWidget:new{
-            text = value_text, face = self.value_face or face_row,
-            max_width = right_w, fgcolor = Blitbuffer.COLOR_GRAY_D,
+            text = value_text, face = self.value_face or face_value,
+            max_width = ctl_w, fgcolor = Blitbuffer.COLOR_GRAY_6,
         }
-        self[1] = HorizontalGroup:new{
-            align = "center",
-            LeftContainer:new{ dimen = Geom:new{ w = left_w, h = self.height }, label_tw },
-            RightContainer:new{ dimen = Geom:new{ w = right_w, h = self.height }, value_tw },
+        self[1] = FrameContainer:new{
+            bordersize = 0, padding = 0, margin = 0,
+            background = self.selected and Blitbuffer.COLOR_GRAY_D or Blitbuffer.COLOR_WHITE,
+            width = inner_w, height = self.height,
+            HorizontalGroup:new{ align = "center",
+                HorizontalSpan:new{ width = hpad },
+                LeftContainer:new{ dimen = Geom:new{ w = label_w, h = self.height }, label_tw },
+                RightContainer:new{ dimen = Geom:new{ w = ctl_w, h = self.height }, value_tw },
+                HorizontalSpan:new{ width = hpad },
+            },
         }
-        self.dimen = Geom:new{ w = self.width, h = self.height }
+        self.dimen = Geom:new{ w = inner_w, h = self.height }
         self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
     end
     function ParamRow:onTap()
@@ -8166,8 +8301,9 @@ function XRead:showSettings()
     local function row(label, value, on_tap, opts)
         opts = opts or {}
         return ParamRow:new{
-            label = label, value = value, width = inner_w, height = row_h,
-            callback = on_tap, arrow = opts.arrow, value_face = opts.value_face,
+            label = label, value = value, height = row_h,
+            callback = on_tap, arrow = opts.arrow,
+            value_face = opts.value_face, selected = opts.selected,
         }
     end
 
@@ -8258,12 +8394,13 @@ function XRead:showSettings()
                 pcall(function() self:setupCenterTap() end)   -- 阅读中即时生效
                 refreshDialog()
             end,
-            { value_face = face_desc })
+            { value_face = face_desc, selected = chosen })
     end
 
     -- ---------- 缓存管理 ----------
-    local step_btn_w = Screen:scaleBySize(56)
-    local value_w = Screen:scaleBySize(70)
+    local step_btn_w = Screen:scaleBySize(46)
+    local step_btn_h = row_h - Screen:scaleBySize(14)
+    local value_w = Screen:scaleBySize(62)
     local value_widget
     local function bumpChapters(delta)
         draft.max_chapters = math.max(1, math.min(200, (tonumber(draft.max_chapters) or 3) + delta))
@@ -8278,90 +8415,84 @@ function XRead:showSettings()
         end
     end
     local function stepButton(text, delta)
-        return CenterContainer:new{
-            dimen = Geom:new{ w = step_btn_w, h = row_h },
-            Button:new{
-                text = text, text_font_face = "cfont", text_font_size = 18,
-                text_font_bold = true, bordersize = 1, radius = 6,
-                width = step_btn_w,
-                callback = function() bumpChapters(delta) end,
-            },
+        return Button:new{
+            text = text, text_font_face = "cfont", text_font_size = 20,
+            text_font_bold = true, bordersize = 1, radius = 6,
+            width = step_btn_w, height = step_btn_h,
+            callback = function() bumpChapters(delta) end,
         }
     end
     value_widget = TextWidget:new{
         text = tostring(draft.max_chapters), face = face_row, bold = true,
         fgcolor = Blitbuffer.COLOR_BLACK,
     }
-    local stepper_row = HorizontalGroup:new{ align = "center",
-        LeftContainer:new{ dimen = Geom:new{ w = label_w, h = row_h },
-            TextWidget:new{ text = _("默认预缓存章节数"), face = face_row, bold = true,
-                max_width = label_w, fgcolor = Blitbuffer.COLOR_BLACK } },
-        RightContainer:new{ dimen = Geom:new{ w = inner_w - label_w, h = row_h },
-            HorizontalGroup:new{ align = "center",
-                stepButton("－", -1),
-                CenterContainer:new{ dimen = Geom:new{ w = value_w, h = row_h }, value_widget },
-                stepButton("＋", 1),
-            } },
+    local function ctlRow(label_text, ctl)
+        return HorizontalGroup:new{ align = "center",
+            HorizontalSpan:new{ width = hpad },
+            LeftContainer:new{ dimen = Geom:new{ w = label_w, h = row_h },
+                TextWidget:new{
+                    text = label_text, face = face_row, bold = true,
+                    max_width = label_w, fgcolor = Blitbuffer.COLOR_BLACK,
+                } },
+            RightContainer:new{ dimen = Geom:new{ w = ctl_w, h = row_h }, ctl },
+            HorizontalSpan:new{ width = hpad },
+        }
+    end
+    local stepper = HorizontalGroup:new{ align = "center",
+        stepButton("－", -1),
+        CenterContainer:new{ dimen = Geom:new{ w = value_w, h = row_h }, value_widget },
+        stepButton("＋", 1),
     }
+    local stepper_row = ctlRow(_("默认预加载章节数"), stepper)
 
-    -- 默认缓存章节数：50 章 / 100 章 / 全部（三段选择）
+    -- 默认服务器缓存章节数：50 章 / 100 章 / 全部（三段选择）
     local DEPTH_OPTIONS = {
         { key = "50", label = _("50 章") },
         { key = "100", label = _("100 章") },
         { key = "all", label = _("全部") },
     }
-    local seg_w = Screen:scaleBySize(88)
+    local seg_gap = Screen:scaleBySize(8)
+    local seg_w = math.max(Screen:scaleBySize(56),
+        math.floor((ctl_w - seg_gap * (#DEPTH_OPTIONS - 1)) / #DEPTH_OPTIONS))
     local seg_group = HorizontalGroup:new{ align = "center" }
     for _i, opt in ipairs(DEPTH_OPTIONS) do
         local key = opt.key
         local active = draft.cache_depth == key
-        seg_group[#seg_group + 1] = CenterContainer:new{
-            dimen = Geom:new{ w = seg_w, h = row_h },
-            Button:new{
-                text = opt.label, text_font_face = "cfont", text_font_size = 16,
-                text_font_bold = active == true,
-                bordersize = active and 3 or 1,
-                radius = 6, width = seg_w,
-                callback = function()
-                    if draft.cache_depth == key then return end
-                    draft.cache_depth = key
-                    refreshDialog()
-                end,
-            },
+        seg_group[#seg_group + 1] = Button:new{
+            text = opt.label, text_font_face = "cfont", text_font_size = 15,
+            text_font_bold = active == true,
+            bordersize = active and 3 or 1,
+            radius = 6,
+            width = seg_w, height = step_btn_h,
+            callback = function()
+                if draft.cache_depth == key then return end
+                draft.cache_depth = key
+                refreshDialog()
+            end,
         }
+        if _i < #DEPTH_OPTIONS then
+            seg_group[#seg_group + 1] = HorizontalSpan:new{ width = seg_gap }
+        end
     end
-    local depth_row = HorizontalGroup:new{ align = "center",
-        LeftContainer:new{ dimen = Geom:new{ w = label_w, h = row_h },
-            TextWidget:new{ text = _("默认缓存章节数"), face = face_row, bold = true,
-                max_width = label_w, fgcolor = Blitbuffer.COLOR_BLACK } },
-        RightContainer:new{ dimen = Geom:new{ w = inner_w - label_w, h = row_h }, seg_group },
-    }
+    local depth_row = ctlRow(_("默认服务器缓存章节数"), seg_group)
 
     local rows = VerticalGroup:new{ align = "left" }
-    local function addRow(widget, gap)
-        rows[#rows + 1] = widget
-        if gap then rows[#rows + 1] = HorizontalSpan:new{ width = gap } end
-    end
-    addRow(separator(), gap_group)
-    addRow(groupLabel(_("地址管理")), gap_row)
-    addRow(address_row, gap_row)
-    addRow(port_row, gap_group)
-    addRow(groupLabel(_("账号管理")), gap_row)
-    addRow(nickname_row, gap_row)
-    addRow(username_row, gap_row)
-    addRow(password_row, gap_group)
-    addRow(groupLabel(_("翻页管理")), gap_row)
-    for _i, page_row in ipairs(page_rows) do
-        addRow(page_row, gap_row)
-    end
-    addRow(HorizontalSpan:new{ width = gap_group - gap_row })
-    addRow(groupLabel(_("缓存管理")), gap_row)
-    addRow(stepper_row, gap_row)
-    addRow(depth_row, gap_group)
-    addRow(separator(), Screen:scaleBySize(8))
-    addRow(hintLine(_("点空白处或按返回键关闭并保存。修改地址/端口立即生效。")))
+    rows[#rows + 1] = groupTitle(_("地址管理"))
+    rows[#rows + 1] = card({ address_row, port_row })
+    rows[#rows + 1] = groupTitle(_("账号管理"))
+    rows[#rows + 1] = card({ nickname_row, username_row, password_row })
+    rows[#rows + 1] = groupTitle(_("翻页管理"))
+    rows[#rows + 1] = card(page_rows)
+    rows[#rows + 1] = groupTitle(_("缓存管理"))
+    rows[#rows + 1] = card({ stepper_row, depth_row })
+    rows[#rows + 1] = VerticalSpan:new{ width = Screen:scaleBySize(14) }
+    rows[#rows + 1] = TextWidget:new{
+        text = _("点空白处或按返回键关闭并保存；地址/端口立即生效。"),
+        face = face_hint, fgcolor = Blitbuffer.COLOR_GRAY_6,
+        max_width = inner_w,
+    }
 
-    local card = VerticalGroup:new{ align = "left" }
+    local card_box = VerticalGroup:new{ align = "left" }
 
     -- 标题行右侧「✕」：点空白关闭收不到手势时也有可见的关闭入口
     local title_tw = TextWidget:new{
@@ -8371,23 +8502,22 @@ function XRead:showSettings()
     local close_w = Screen:scaleBySize(44)
     local stretch = inner_w - title_tw:getSize().w - close_w
     if stretch < 0 then stretch = 0 end
-    card[#card + 1] = HorizontalGroup:new{ align = "center",
+    card_box[#card_box + 1] = HorizontalGroup:new{ align = "center",
         title_tw, HorizontalSpan:new{ width = stretch },
         UICommon.closeButtonAtEdge(saveAndClose, pad, close_w) }
-    card[#card + 1] = HorizontalSpan:new{ width = gap_group }
-    card[#card + 1] = rows
+    card_box[#card_box + 1] = rows
 
     -- 内容比屏幕高时套一层滚动容器（小屏上不至于把首尾行挤出屏幕）
-    local body = card
-    local max_body_h = sh - pad * 2 - Screen:scaleBySize(60)
-    local ok_size, card_size = pcall(function() return card:getSize() end)
+    local body = card_box
+    local max_body_h = sh - pad * 2 - Screen:scaleBySize(48)
+    local ok_size, card_size = pcall(function() return card_box:getSize() end)
     if ok_size and card_size and tonumber(card_size.h) and card_size.h > max_body_h then
         local ok_scroll, ScrollableContainer = pcall(require, "ui/widget/container/scrollablecontainer")
         if ok_scroll and ScrollableContainer then
             body = ScrollableContainer:new{
                 dimen = Geom:new{ w = inner_w, h = math.max(1, max_body_h) },
                 _show_v_scrollbar = true,
-                card,
+                card_box,
             }
         end
     end
@@ -8435,6 +8565,7 @@ function XRead:showSettings()
     UIManager:show(dialog)
 
 end
+
 -- ---------- 齿轮「设置」：预加载 + 字体（即改即存，无保存按钮） ----------
 
 function XRead:showBookSettingsPanel()
@@ -8525,10 +8656,10 @@ function XRead:showBookSettingsPanel()
         }
     end
 
-    -- 行1：默认缓存章数（进书时先拼这么多章立即打开）
+    -- 行1：默认预加载章节数（进书时先拼这么多章立即打开）
     local chapter_row = HorizontalGroup:new{ align = "center",
         LeftContainer:new{ dimen = Geom:new{ w = inner_w - 220, h = row_h },
-            labelRow(_("默认缓存章数")) },
+            labelRow(_("默认预加载章节数")) },
         stepBtn("－", function()
             local v = (tonumber(self:getSetting("max_chapters", "3")) or 3) - 1
             if v < 1 then v = 1 end
@@ -8654,7 +8785,7 @@ function XRead:showBookSettingsPanel()
     rows[#rows + 1] = chapter_row
     rows[#rows + 1] = HorizontalSpan:new{ width = gap }
     rows[#rows + 1] = TextWidget:new{
-        text = _("打开书后后台静默预缓存这么多章（1-200）"),
+        text = _("打开书后后台静默预加载这么多章（1-200）"),
         face = face_hint, width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
     }
     rows[#rows + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(20) }
@@ -9084,7 +9215,7 @@ function XRead:doCacheBook(book, count)
 
         local opts = {
 
-            count = tonumber(count) or 0,   -- 0 = 全部章节
+            count = tonumber(count) or self:cacheDepthCount(),   -- 0 = 全部章节
 
             concurrentCount = 8,
 

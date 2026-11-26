@@ -68,7 +68,8 @@ local CatalogView = FocusManager:extend{
 
     on_back = nil,
 
-    on_toc_first = nil,      -- 「目录」按钮：跳回目录第一页
+    order = "asc",           -- "asc" 正序 / "desc" 倒序
+    on_order_toggle = nil,    -- function(next_order) 点倒序/正序按钮时切顺序
 
     on_page_changed = nil,
 
@@ -143,172 +144,115 @@ local function wrapTitle(text, face, width)
     return lines[1] or "", lines[2] or ""
 
 end
--- 章节行：当前章黑底白字；正在静默预缓存的章黑底白字加粗并标注“缓存中”。
-
+-- 章节格子：双列方块，格子之间留缝隙（列表区底色透出来当缝）。
+-- 日间：白块 + 浅灰缝 + 黑字；当前章黑底白字；已缓存块浅灰底。
+-- 夜间整屏反色，这里写的是「反色前」的源色，屏幕上得到深底浅字。
 local ChapterRow = InputContainer:extend{
-
-    text = nil, width = nil, height = nil,
-
+    text = nil, width = nil, height = nil, gap = 0,
     is_current = false, cache_state = nil, callback = nil,
-
 }
 
+function ChapterRow:colors()
+    local night = Screen.night_mode == true
+    local is_caching = self.cache_state == "active"
+    if self.is_current or is_caching then
+        -- 日间黑底白字 / 夜间源色白底黑字（反色后仍是黑底白字）
+        return (night and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK),
+            (night and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE),
+            (night and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK)
+    end
+    if self.cache_state == "cached" then
+        return (night and Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_GRAY_D),
+            Blitbuffer.COLOR_BLACK,
+            (night and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY_9)
+    end
+    return (night and Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_WHITE),
+        Blitbuffer.COLOR_BLACK,
+        (night and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY_B)
+end
+
 function ChapterRow:init()
-
-    local pad = scaled(10)
-
+    local pad = scaled(7)
     local is_caching = self.cache_state == "active"
-
-    local is_cached = self.cache_state == "cached"
-
-    local is_caching = self.cache_state == "active"
-
-    local is_cached = self.cache_state == "cached"
-
-    local inverted = self.is_current or is_caching
-
-    -- 已缓存章节：日间深灰底白字、夜间反色后浅底黑字（对比目录普通行）
-    local fgcolor = inverted and Blitbuffer.COLOR_WHITE
-        or (is_cached and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK)
-
-    -- 夜间模式全局反色：GRAY_E(0xEE) 会变 0x11 近黑而失去区分度，改用 GRAY_3(0x33)，反色后为浅灰 0xCC
-    -- 日间用 GRAY_6(0x66) 深灰底 + 白字（用户要求深灰、更明显）
-    local cached_bg = Screen.night_mode and Blitbuffer.COLOR_GRAY_3 or Blitbuffer.COLOR_GRAY_6
-
-    local background = inverted and Blitbuffer.COLOR_BLACK
-        or (is_cached and cached_bg or Blitbuffer.COLOR_WHITE)
+    local bg, fg, border = self:colors()
+    local box_w = math.max(scaled(20), self.width - self.gap)
+    local box_h = math.max(scaled(20), self.height - self.gap)
 
     local tw = TextWidget:new{
-
         text = self.text,
-
-        face = Font:getFace("cfont", scaled(14)),
-
+        face = Font:getFace("cfont", scaled(12.5)),
         bold = is_caching or self.is_current,
-
-        fgcolor = fgcolor,
-
-        max_width = self.width - 2 * pad,
-
+        fgcolor = fg,
+        max_width = math.max(1, box_w - 2 * pad),
     }
-
-    local tw_h = tw:getSize().h
 
     self.frame = FrameContainer:new{
-
-        bordersize = 0, margin = 0,
-
+        bordersize = 1, color = border, radius = scaled(6),
+        margin = 0, padding = 0,
         padding_left = pad, padding_right = pad,
-
-        padding_top = math.max(0, math.floor((self.height - tw_h) / 2)),
-
-        padding_bottom = 0,
-
-        background = background,
-
-        width = self.width, height = self.height,
-
-        tw,
-
+        background = bg,
+        width = box_w, height = box_h,
+        CenterContainer:new{
+            dimen = Geom:new{ w = box_w - 2 * pad, h = box_h },
+            tw,
+        },
     }
-
     self[1] = self.frame
-
     self.dimen = Geom:new{ w = self.width, h = self.height }
-
     self.ges_events = {
-
         Tap = { GestureRange:new{ ges = "tap", range = self.dimen } },
-
     }
-
 end
 
 function ChapterRow:onTap()
-
     if self.callback then self.callback() end
-
     return true
-
 end
 
 function ChapterRow:onFocus()
-
-    if not self.is_current then self.frame.background = Blitbuffer.COLOR_GRAY_E end
-
+    if not self.is_current then
+        self.frame.background = Screen.night_mode and Blitbuffer.COLOR_GRAY_9 or Blitbuffer.COLOR_GRAY_E
+        UIManager:setDirty(self, "ui")
+    end
     return true
-
 end
 
 function ChapterRow:onUnfocus()
-
-    if not self.is_current then
-
-        local cached_bg = Screen.night_mode and Blitbuffer.COLOR_GRAY_3 or Blitbuffer.COLOR_GRAY_6
-
-        self.frame.background = (self.cache_state == "active")
-
-            and Blitbuffer.COLOR_BLACK
-
-            or (self.cache_state == "cached")
-
-                and cached_bg or Blitbuffer.COLOR_WHITE
-
-    end
-
+    self.frame.background = self:colors()
+    UIManager:setDirty(self, "ui")
     return true
-
 end
 
 function CatalogView.computeLayout()
-
     local sw, sh = Screen:getWidth(), Screen:getHeight()
-
-    -- 压缩固定占用，让每页能容纳更多章节行
-
     local header_h = 0   -- 顶部“目录”标题行已去掉，章节列表占满内容区
-
     local footer_h = scaled(44)
-
     local body_h = sh - header_h - footer_h - scaled(12)
-
     local pad = scaled(8)
-
     local divider = 1
-
-    local left_w = math.floor(sw * 0.30)
-
+    local left_w = math.floor(sw * 0.29)
     local right_w = sw - left_w - divider
-
     local right_header_h = scaled(34)
 
-    -- 目录每页固定显示 14 章，行高按剩余空间自适应铺满
-
-    local rows = 14
-
-    local available = body_h - 2 * pad - right_header_h
-
-    local row_h = math.max(scaled(30), math.floor(available / rows) - 1)
+    -- 双列方块网格：格子之间留 gap，视觉上是一张张卡片而不是连成一片的长条。
+    local cols = 2
+    local rows = 8
+    local gap = scaled(7)
+    local list_h = body_h - 2 * pad - right_header_h - 1
+    local row_h = math.max(scaled(36), math.floor(list_h / rows))
+    local cell_w = math.floor((right_w - 2 * pad - gap * cols) / cols)
 
     return {
-
         screen_w = sw, screen_h = sh,
-
         header_h = header_h, footer_h = footer_h, body_h = body_h,
-
         pad = pad, divider = divider,
-
         left_w = left_w, right_w = right_w,
-
         right_header_h = right_header_h,
-
-        row_h = row_h, rows = rows,
-
-        page_size = rows,
-
+        row_h = row_h, rows = rows, cols = cols, gap = gap, cell_w = cell_w,
+        page_size = rows * cols,
     }
-
 end
+
 -- 小黑按钮（白字），用于“去底部”。
 
 local MiniButton = InputContainer:extend{
@@ -551,23 +495,31 @@ function CatalogView:init()
 
         text = back_label, width = half_btn_w, height = btn_h,
 
-        text_font_size = scaled(15), bordersize = 1, radius = 0,
+        text_font_size = scaled(15), bordersize = 1, radius = scaled(6),
 
-        background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_GRAY_D,
+        background = Blitbuffer.COLOR_GRAY_E, color = Blitbuffer.COLOR_GRAY_7,
 
         callback = function() if self.on_back then self.on_back() end end,
 
     }
 
-    local toc_btn = Button:new{
+    -- 「倒序 / 正序」：按钮上写的是「点一下会切到的方向」，
+    -- 正序时显示「倒序」，倒序时显示「正序」，点了列表立刻翻过来。
+    local order_btn = Button:new{
 
-        text = _("目录"), width = btn_w - half_btn_w - scaled(10), height = btn_h,
+        text = (self.order == "desc") and _("正序") or _("倒序"),
 
-        text_font_size = scaled(15), bordersize = 1, radius = 0,
+        width = btn_w - half_btn_w - scaled(10), height = btn_h,
 
-        background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_GRAY_D,
+        text_font_size = scaled(15), bordersize = 1, radius = scaled(6),
 
-        callback = function() if self.on_toc_first then self.on_toc_first() end end,
+        background = Blitbuffer.COLOR_GRAY_E, color = Blitbuffer.COLOR_GRAY_7,
+
+        callback = function()
+            if self.on_order_toggle then
+                self.on_order_toggle(self.order == "desc" and "asc" or "desc")
+            end
+        end,
 
     }
 
@@ -579,7 +531,7 @@ function CatalogView:init()
 
         HorizontalSpan:new{ width = scaled(10) },
 
-        toc_btn,
+        order_btn,
 
     }
 
@@ -686,98 +638,65 @@ function CatalogView:init()
     }
 
     local chapter_rows = {}
+    local chapter_count = #chapters
+    local order = (self.order == "desc") and "desc" or "asc"
 
-    local right_inner = VerticalGroup:new{ align = "left" }
-
-    table.insert(right_inner, right_header)
-
-    -- 目录顶与章节列表之间补一条黑色分隔线，消除白色缝隙（夜间反色后为白色）
-    table.insert(right_inner, LineWidget:new{
-
-        dimen = Geom:new{ w = L.right_w, h = 1 },
-
-        background = Blitbuffer.COLOR_BLACK,
-
-    })
-
-    local idx = 0
-
-    for i = first, last do
-
-        local ch = chapters[i]
-
-        local label = ch.title or (_("第") .. i .. _("章"))
-
-        if i - 1 == dur then
-
-            label = label .. "  · " .. _("上次读到")
-
-        end
-
-        local cache_state = self.cache_fn and self.cache_fn(i) or nil
-
-        if cache_state == "active" then
-
-            label = label .. "  · " .. _("缓存中")
-
-        end
-
-        local row = ChapterRow:new{
-
-            text = label,
-
-            width = L.right_w,
-
-            height = L.row_h,
-
-            is_current = (i - 1 == dur),
-
-            cache_state = cache_state,
-
-            callback = function()
-
-                if self.on_select then self.on_select(i) end
-
-            end,
-
-        }
-
-        table.insert(right_inner, row)
-
-        table.insert(chapter_rows, row)
-
-        idx = idx + 1
-
-        if idx < last - first + 1 then
-
-            table.insert(right_inner, LineWidget:new{
-
-                dimen = Geom:new{ w = L.right_w, h = 1 },
-
-                background = Blitbuffer.COLOR_BLACK,
-
-            })
-
-        end
-
+    -- 倒序时列表从最后一章往前排。pos 是「当前排序下的第几章」，
+    -- 换算回 chapters 的真实下标后再取标题 / 缓存状态 / 跳转目标。
+    local function bookIndex(pos)
+        if order == "desc" then return chapter_count - pos + 1 end
+        return pos
     end
 
+    local grid = VerticalGroup:new{ align = "left" }
+    local pos = first
+    while pos <= last do
+        local line = HorizontalGroup:new{ align = "top" }
+        for col = 1, L.cols do
+            if pos <= last then
+                local bi = bookIndex(pos)
+                local ch = chapters[bi] or {}
+                local label = ch.title or (_("第") .. bi .. _("章"))
+                local cache_state = self.cache_fn and self.cache_fn(bi) or nil
+                if cache_state == "active" then
+                    label = label .. " · " .. _("缓存中")
+                end
+                local row = ChapterRow:new{
+                    text = label,
+                    width = L.cell_w + L.gap,
+                    height = L.row_h,
+                    gap = L.gap,
+                    is_current = (bi - 1 == dur),
+                    cache_state = cache_state,
+                    callback = function() if self.on_select then self.on_select(bi) end end,
+                }
+                line[#line + 1] = row
+                table.insert(chapter_rows, row)
+                pos = pos + 1
+            else
+                line[#line + 1] = HorizontalSpan:new{ width = L.cell_w + L.gap }
+            end
+        end
+        grid[#grid + 1] = line
+    end
+
+    -- 章节区底色比格子深一档：格子之间露出来的那条就是缝。
     local right = FrameContainer:new{
-
         bordersize = 0, padding = 0, margin = 0,
-
-        background = Blitbuffer.COLOR_WHITE,
-
+        background = Blitbuffer.COLOR_GRAY_E,
         width = L.right_w, height = L.body_h,
-
-        CenterContainer:new{
-
-            dimen = Geom:new{ w = L.right_w, h = L.body_h },
-
-            right_inner,
-
+        VerticalGroup:new{
+            align = "left",
+            right_header,
+            LineWidget:new{
+                dimen = Geom:new{ w = L.right_w, h = 1 },
+                background = Blitbuffer.COLOR_BLACK,
+            },
+            CenterContainer:new{
+                dimen = Geom:new{ w = L.right_w, h = math.max(1, L.body_h - L.right_header_h - 1) },
+                grid,
+            },
         },
-
     }
 
     -- 底部分页
@@ -804,13 +723,36 @@ function CatalogView:init()
 
     end
 
-    local prev = newNavButton(_("上一页"), half - 2, self.page > 1,
+    local info_w = scaled(96)
+
+    -- 留出左右边距，别让「上一页」的边框贴到屏幕边被裁掉
+    local nav_w = math.max(scaled(60), half - info_w / 2 - scaled(14))
+
+    local prev = newNavButton(_("上一页"), nav_w, self.page > 1,
 
         function() self:onPageChanged(self.page - 1) end)
 
-    local next = newNavButton(_("下一页"), L.screen_w - half - 2, self.page < page_count,
+    local next = newNavButton(_("下一页"), nav_w, self.page < page_count,
 
         function() self:onPageChanged(self.page + 1) end)
+
+    local page_info = CenterContainer:new{
+
+        dimen = Geom:new{ w = info_w, h = nav_h },
+
+        TextWidget:new{
+
+            text = T(_("%1 / %2"), tostring(self.page), tostring(page_count)),
+
+            face = Font:getFace("cfont", scaled(14)),
+
+            bold = true,
+
+            fgcolor = Blitbuffer.COLOR_BLACK,
+
+        },
+
+    }
 
     local footer = FrameContainer:new{
 
@@ -826,7 +768,8 @@ function CatalogView:init()
 
             VerticalSpan:new{ width = btn_margin },
 
-            HorizontalGroup:new{ prev, HorizontalSpan:new{ width = 4 }, next },
+            HorizontalGroup:new{ prev, HorizontalSpan:new{ width = scaled(4) }, page_info,
+                HorizontalSpan:new{ width = scaled(4) }, next },
 
             VerticalSpan:new{ width = math.max(0, L.footer_h - btn_margin - nav_h) },
 
@@ -856,7 +799,7 @@ function CatalogView:init()
 
     self._page_buttons = { prev, next }
 
-    local focus_rows = { { back_btn, toc_btn }, chapter_rows, { prev, next } }
+    local focus_rows = { { back_btn, order_btn }, chapter_rows, { prev, next } }
 
     self.layout = focus_rows
 
