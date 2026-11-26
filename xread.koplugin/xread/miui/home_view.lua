@@ -395,7 +395,8 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     end
 
     -- 封面右侧信息，按参考图自上而下分行：
-    --   作者 · 书源 / 阅读至 N% · 时间 / 上次读到第 X 章 · 共 Y 章 / 简介（多行）
+    --   书名（第一行，两行高）/ 作者 · 书源 / 阅读至 N% / 上次读到第 X 章
+    -- 简介移到卡片底部（原来书名标题的位置），横贯全宽。
     local intro_text = U.trim(tostring(book.description or book.intro or book.summary or ""))
     if intro_text == "" then intro_text = "暂无简介" end
     local meta_line = U.trim(tostring(book.meta_line or ""))
@@ -407,7 +408,9 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     local info_h = body_h
     local line_h = math.max(UiScale.dp(15, 13, 20), math.floor(body_h * .088))
     local meta_gap = math.max(1, math.floor(line_h * .12))
-    local intro_top = 0
+    -- 书名占 info 区前两行；右上角刷新图标要给书名让出宽度
+    local title_w = math.max(1, text_w - (history_w > 0 and history_w + UiScale.dp(5, 4, 8) or 0))
+    local intro_top = title_h + meta_gap
     local info = OverlapGroup:new{dimen = Geom:new{w = text_w, h = info_h}, allow_mirroring = false}
     local function info_line(text, y, bold, size)
         if text == "" then return end
@@ -419,6 +422,14 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
             height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
         }}
     end
+    -- 书名（封面右侧第一行）
+    info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = 0, TextBoxWidget:new{
+        text = tostring(book.title or "未命名"),
+        face = title_face,
+        bold = true,
+        width = title_w, height = title_h, height_adjust = false,
+        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
+    }}
     info_line(meta_line, intro_top, false)
     if meta_line ~= "" then intro_top = intro_top + line_h + meta_gap end
     info_line(progress_line, intro_top, true)
@@ -427,19 +438,11 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     if source_line ~= "" then intro_top = intro_top + line_h + meta_gap end
     info_line(last_line, intro_top, true)
     if last_line ~= "" then intro_top = intro_top + line_h + meta_gap end
-    local intro_h = math.max(1, info_h - intro_top)
-    local intro_w = history_w > 0 and math.max(1, text_w - history_w) or text_w
-    info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = intro_top, TextBoxWidget:new{
+
+    -- 卡片底部的简介（原来书名标题的位置）
+    local intro = TextBoxWidget:new{
         text = intro_text,
         face = face("smallinfofont", mini and 9.0 or 9.6, mini and 12.2 or 13.0, mini and 7.6 or 8.0),
-        width = intro_w, height = intro_h, height_adjust = false,
-        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
-    }}
-
-    local title = TextBoxWidget:new{
-        text = tostring(book.title or "未命名"),
-        face = title_face,
-        bold = true,
         width = inner_w, height = title_h, height_adjust = false,
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     }
@@ -475,9 +478,9 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
             CenterContainer:new{dimen = Geom:new{w = text_w, h = body_h}, info},
         }}
     end
-    local title_y = body_h + section_gap
-    body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = title_y, title}
-    local progress_y = title_y + title_h + section_gap
+    local intro_y = body_h + section_gap
+    body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = intro_y, intro}
+    local progress_y = intro_y + title_h + section_gap
     body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = progress_y, VerticalGroup:new{
         align = "left",
         Ui.textbox(progress_label, inner_w, progress_label_h,

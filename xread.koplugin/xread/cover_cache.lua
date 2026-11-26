@@ -230,6 +230,52 @@ end
 -- 请求同一张图，重复请求白耗流量，两路同时 writePNG 还可能写出坏图。
 local inflight = {}
 
+--- 网络抓取（不含解码）：返回原始图片字节。
+-- 只碰 socket，不碰 RenderImage/Blitbuffer，可在 fork 子进程里跑。
+-- 供「异步封面队列」把最慢的网络段挪出 UI 线程。
+function CoverCache:fetchRaw(book, url)
+    -- WebUI 同款优先级：用户自定义封面 > 调用方给的封面 > 书源封面。
+    -- 调用点传的是 book.coverUrl，这里让 customCoverUrl 优先，
+    -- 否则本地书匹配到的网络封面（写进 customCoverUrl）会被内嵌封面路径盖掉。
+    local source = book.customCoverUrl or url or book.coverUrl
+    if not source or source == "" then return nil, "no url" end
+    -- 统一走后端 /reader3/cover：本地书由后端鉴权读包内封面，网络书由后端代理抓取并缓存。
+    local data, ferr = self:fetchViaProxy(source)
+    -- 网络书兜底：后端代理不可用时直连原 URL（本地相对路径无法直连）。
+    if not data and source:sub(1, 4):lower() == "http" then
+        data, ferr = fetch(source)
+    end
+    if not data then return nil, ferr end
+    if not isSupportedImage(data) then return nil, "unsupported image format" end
+    return data
+end
+
+--- 原始字节临时文件路径（子进程写、主线程读，父子共享文件系统）
+function CoverCache:rawTempPath(book, max_w, max_h)
+    return self.dir .. "/.raw_" .. self:keyFor(book, max_w, max_h)
+end
+
+--- 把抓到的原始字节写到临时文件（在 fork 子进程里调用）
+function CoverCache:writeRawFile(book, data, max_w, max_h)
+    local path = self:rawTempPath(book, max_w, max_h)
+    local f = io.open(path, "wb")
+    if not f then return nil end
+    f:write(data); f:close()
+    return path
+end
+
+--- 读原始字节文件并解码成缩略图 PNG（必须在主线程跑：RenderImage/Blitbuffer）
+function CoverCache:storeFromRawFile(book, max_w, max_h)
+    local path = self:rawTempPath(book, max_w, max_h)
+    local f = io.open(path, "rb")
+    if not f then return nil, "no raw file" end
+    local data = f:read("*a")
+    f:close()
+    pcall(os.remove, path)
+    if not data or #data < 100 then return nil, "raw too small" end
+    return self:storeFromData(book, data, max_w, max_h)
+end
+
 function CoverCache:fetchAndStore(book, url, max_w, max_h)
     local existing = self:pathFor(book, max_w, max_h)
     if existing then return existing end
@@ -239,19 +285,8 @@ function CoverCache:fetchAndStore(book, url, max_w, max_h)
     inflight[key] = true
 
     local ok, path, err = pcall(function()
-        -- WebUI 同款优先级：用户自定义封面 > 调用方给的封面 > 书源封面。
-        -- 调用点传的是 book.coverUrl，这里让 customCoverUrl 优先，
-        -- 否则本地书匹配到的网络封面（写进 customCoverUrl）会被内嵌封面路径盖掉。
-        local source = book.customCoverUrl or url or book.coverUrl
-        if not source or source == "" then return nil, "no url" end
-        -- 统一走后端 /reader3/cover：本地书由后端鉴权读包内封面，网络书由后端代理抓取并缓存。
-        local data, ferr = self:fetchViaProxy(source)
-        -- 网络书兜底：后端代理不可用时直连原 URL（本地相对路径无法直连）。
-        if not data and source:sub(1, 4):lower() == "http" then
-            data, ferr = fetch(source)
-        end
+        local data, ferr = self:fetchRaw(book, url)
         if not data then return nil, ferr end
-        if not isSupportedImage(data) then return nil, "unsupported image format" end
         return self:storeFromData(book, data, max_w, max_h)
     end)
 

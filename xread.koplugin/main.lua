@@ -1829,22 +1829,19 @@ function XRead:_refreshShelfInBackground()
 
             logger.info("xread shelf refreshed in background")
 
-        elseif not ok then
-
-            -- 静默记录：后续后台任务（封面/心跳/预取）按冷却窗口自动让路
-            self:markBackendDown(tostring(books))
-
         end
 
     end)
 
 end
 
--- 后台取一本书的章节目录并写缓存（错峰调度用；失败无声，下次再补）
+-- 后台取一本书的章节目录并写缓存（错峰调度用；失败无声，下次再补）。
+-- 网络请求放到 fork 子进程里：getChapterList 最长 10s+重试，原来在主线程
+-- 同步跑会把「返回首页后点更多/翻页/点书」冻结到请求结束。子进程直接写
+-- meta_cache 的磁盘 JSON（父子进程共享文件系统），主线程只需非阻塞轮询回收。
 function XRead:_bgFetchChapters(book, delay)
 
-    -- 记下排队时的代次：开书/重建页面会 +1，排队的预取自动作废，
-    -- 不再和「开书」抢网络（这些请求是同步阻塞 UI 线程的）
+    -- 记下排队时的代次：开书/重建页面会 +1，排队的预取自动作废
     local gen = self._prefetch_generation or 0
 
     self:_scheduleNetJob(delay, function()
@@ -1855,27 +1852,37 @@ function XRead:_bgFetchChapters(book, delay)
 
         if not self.client.accessToken then return end
 
-        -- 弹层正开着（更多/设置/账号等）时再确认一次，避免改期期间刚好好打开
+        -- 弹层正开着（更多/设置/账号等）时再确认一次
         if self:_uiHasOverlay() then return end
 
-        local ok, chapters = pcall(function() return self.client:getChapterList(book) end)
+        local client, cache = self.client, self.meta_cache
+        local b = book
 
-        if ok and chapters and #chapters > 0 then
+        local ok_fork, pid = pcall(ffiutil.runInSubProcess, function()
+            local ok, chapters = pcall(function() return client:getChapterList(b) end)
+            if ok and type(chapters) == "table" and #chapters > 0 then
+                pcall(function() cache:putChapters(b, chapters) end)
+            end
+        end, false)
 
-            self.meta_cache:putChapters(book, chapters)
+        if not (ok_fork and type(pid) == "number") then
+            logger.warn("xread prefetch fork failed:", tostring(pid))
+            return
+        end
 
-            -- 验收标记只在自动测试时输出：原来这行在生产环境也会打，白白污染日志
+        -- 非阻塞轮询；isSubProcessDone(pid,false) 内部 waitpid(WNOHANG)，
+        -- 子进程一退出就顺手回收，不产生僵尸。失败无声，下次再补。
+        local function poll()
+            if not ffiutil.isSubProcessDone(pid, false) then
+                UIManager:scheduleIn(0.3, poll)
+                return
+            end
             if os.getenv("XREAD_AUTOTEST") then
                 print("[XREAD_AUTOTEST] prefetch chapters done")
             end
-
             logger.info("xread prefetched chapters for", tostring(book.name))
-
-        elseif not ok then
-
-            self:markBackendDown(tostring(chapters))
-
         end
+        UIManager:scheduleIn(0.3, poll)
 
     end)
 
@@ -2349,8 +2356,6 @@ function XRead:buildHomeActions()
 
                     -- 后端拉取失败时退回原缓存重建首页，不让用户看到空白
 
-                    if not ok then self:markBackendDown(tostring(books)) end
-
                     self:showHome(self._home_shelf_page or 1)
 
                     UIManager:nextTick(function() self:showInfo(_("更新失败，显示本地缓存书架")) end)
@@ -2784,27 +2789,25 @@ function XRead:_startHomeTicker(view)
 
             if not self:_backendUsable() then
 
-                -- 已知连不上：不再发请求（每次 2.5s 的同步 health 会把首页冻住），
-                -- 直接按「已断开」显示，等冷却窗口过去再自动重试。
+                -- 已知连不上：不再发请求，直接按「已断开」显示，等冷却窗口过去再自动重试。
                 self._health_ok = false
 
                 pcall(function() view:updateHeader{ sync_text = _("已断开") } end)
 
             elseif not self:_uiHasOverlay() then
 
-                -- health 走短超时（client:health 内置 2.5s），避免后端异常时长时间阻塞界面；
-                -- 弹层开着时跳过，别卡住点击
-                local ok_h, res = pcall(function() return self.client:health() end)
+                -- 非阻塞 TCP 探活：原来 client:health 是同步 HTTP（2.5s），
+                -- 后端一慢就把首页冻住、还误判「已断开」并污染冷却状态。
+                -- 这里只改头部「已连接/已断开」的语义 = 网络可达，探活结果异步回调。
+                BackendProbe.check(self:backendAddress(), 2.5, function(ok)
 
-                local healthy = ok_h and res and res.isSuccess ~= false
+                    self._health_ok = ok
 
-                self._health_ok = healthy
+                    pcall(function()
 
-                if not healthy then self:markBackendDown(tostring(res)) end
+                        view:updateHeader{ sync_text = ok and _("已连接") or _("已断开") }
 
-                pcall(function()
-
-                    view:updateHeader{ sync_text = healthy and _("已连接") or _("已断开") }
+                    end)
 
                 end)
 
@@ -2959,6 +2962,56 @@ function XRead:prepareCovers(books, first, last, layout, skip_download)
 
 end
 
+-- 封面异步抓取：网络段（最长 8s）放 fork 子进程里跑，写原始字节到临时文件；
+-- 主线程只轮询回收 + 本地解码 + 回调，彻底消除封面下载对 UI 线程的阻塞。
+-- @param callback function(path|nil) 完成后回调（一定在主线程）
+function XRead:_fetchCoverAsync(book, max_w, max_h, callback)
+    local cc = self.cover_cache
+    if not cc or not book then
+        if callback then callback(nil) end
+        return
+    end
+    -- 已有缓存直接命中，不 fork
+    local existing = cc:pathFor(book, max_w, max_h)
+    if existing then
+        if callback then callback(existing) end
+        return
+    end
+    -- 主线程维护的 inflight 去重：封面队列与重试循环可能同时瞄同一张图
+    self._cover_inflight = self._cover_inflight or {}
+    local key = cc:keyFor(book, max_w, max_h)
+    if self._cover_inflight[key] then
+        if callback then callback(nil) end
+        return
+    end
+    self._cover_inflight[key] = true
+
+    local raw = cc:rawTempPath(book, max_w, max_h)
+    local ok_fork, pid = pcall(ffiutil.runInSubProcess, function()
+        local data = cc:fetchRaw(book, book.coverUrl)
+        if data then cc:writeRawFile(book, data, max_w, max_h) end
+    end, false)
+
+    if not (ok_fork and type(pid) == "number") then
+        self._cover_inflight[key] = nil
+        if callback then callback(nil) end
+        return
+    end
+
+    local function poll()
+        if not ffiutil.isSubProcessDone(pid, false) then
+            UIManager:scheduleIn(0.1, poll)
+            return
+        end
+        self._cover_inflight[key] = nil
+        local ok2, p = pcall(function()
+            return cc:storeFromRawFile(book, max_w, max_h)
+        end)
+        if callback then callback(ok2 and p or nil) end
+    end
+    UIManager:scheduleIn(0.1, poll)
+end
+
 -- 未缓存封面不阻塞书架：先显示占位，再逐张静默下载并局部刷新。
 -- 用 generation 号防止翻页/关闭后旧队列继续刷新界面。
 function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view, refresh_fn)
@@ -3006,31 +3059,28 @@ function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view,
 
             local item = queue[k]
 
-            local ok, p = pcall(function()
+            -- 网络段进子进程，主线程只做解码 + 局部刷新，不再被单张 8s 冻住
+            self:_fetchCoverAsync(item.book, layout.cover_w, layout.cover_h, function(p)
 
-                return self.cover_cache:fetchAndStore(item.book, item.book.coverUrl,
+                if self._cover_generation ~= gen or view._miu_closed then return end
 
-                    layout.cover_w, layout.cover_h)
+                if p and miui_books[item.i] then
 
-            end)
+                    miui_books[item.i].cover_path = p
 
-            if not ok then self:markBackendDown(tostring(p)) end
+                    if SHARED.cover_paths then SHARED.cover_paths[item.book] = p end
 
-            if ok and p and miui_books[item.i] then
+                    if refresh_fn then
+                        refresh_fn(item.i)
+                    elseif view.updateItems then
+                        view:updateItems()
+                    end
 
-                miui_books[item.i].cover_path = p
-
-                if SHARED.cover_paths then SHARED.cover_paths[item.book] = p end
-
-                if refresh_fn then
-                    refresh_fn(item.i)
-                elseif view.updateItems then
-                    view:updateItems()
                 end
 
-            end
+                nextOne(k + 1)
 
-            nextOne(k + 1)
+            end)
 
         end)
 
@@ -3088,9 +3138,7 @@ function XRead:_startCoverRetryLoop(view, on_cover)
 
         local books = nil
 
-        local ok_books, err_books = pcall(function() books = self.client:getBookshelf(want_refresh) end)
-
-        if not ok_books then self:markBackendDown(tostring(err_books)) end
+        pcall(function() books = self.client:getBookshelf(want_refresh) end)
 
         if type(books) ~= "table" or #books == 0 then
 
@@ -3148,17 +3196,14 @@ function XRead:_startCoverRetryLoop(view, on_cover)
                     return
                 end
 
-                local ok, p = pcall(function()
+                -- 网络段进子进程，主线程只做解码 + 回调
+                self:_fetchCoverAsync(b, layout.cover_w, layout.cover_h, function(p)
 
-                    return self.cover_cache:fetchAndStore(b, b.coverUrl,
+                    if p and on_cover then pcall(on_cover, b) end
 
-                        layout.cover_w, layout.cover_h)
+                    nextOne(k + 1, added + ((p ~= nil) and 1 or 0))
 
                 end)
-
-                if ok and p and on_cover then pcall(on_cover, b) end
-
-                nextOne(k + 1, added + ((ok and p) and 1 or 0))
 
             end)
 
@@ -3513,13 +3558,8 @@ function XRead:showBookCatalog(book, cover_path, page)
 
                 if self:_uiHasOverlay() then return end
 
-                pcall(function()
-
-                    self.cover_cache:fetchAndStore(book, book.coverUrl,
-
-                        layout.cover_w, layout.cover_h)
-
-                end)
+                -- 网络段进子进程，主线程只做解码
+                self:_fetchCoverAsync(book, layout.cover_w, layout.cover_h, nil)
 
             end)
 
@@ -8428,10 +8468,10 @@ function XRead:downloadBookToDevice(book)
     end
 
     local dir
-    pcall(function() dir = BookExport:docDir() end)
+    pcall(function() dir = BookExport:exportDir() end)
     local target = _("本地文档目录") .. "（" .. tostring(dir or "?") .. "）"
     UIManager:show(ConfirmBox:new{
-        text = T(_("把「%1」导出为 EPUB 保存到 %2？\n导出后可在 KOReader 文件管理器或 Kindle 书架直接打开，需要逐章拉取，章节较多时请耐心等待。"),
+        text = T(_("把「%1」导出为 EPUB 保存到 %2？\n导出后可在 KOReader 文件管理器（xread 文件夹）或 Kindle 书架直接打开，需要逐章拉取，章节较多时请耐心等待。"),
             tostring(book.name or ""), target),
         ok_text = _("下载"),
         cancel_text = _("取消"),

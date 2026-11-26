@@ -55,6 +55,13 @@ function BookExport:docDir()
     return dir
 end
 
+-- 导出目录：文档目录下的 xread 专属子文件夹。
+-- 不把 EPUB 直接撒进文档根目录，避免和用户其它本地书混在一起；
+-- 打开 KOReader 文件管理器 -> xread 文件夹，只看到自己下载的书。
+function BookExport:exportDir()
+    return self:docDir() .. "/xread"
+end
+
 local function safeFileName(s)
     s = tostring(s or "book"):gsub("[%/\\:%*%?\"<>|]", "_")
     if #s > 80 then s = s:sub(1, 80) end
@@ -103,7 +110,7 @@ function BookExport:createEpub(book, chapters, getContent, onProgress, opts)
     local ok_arch, Archiver = pcall(function() return require("ffi/archiver") end)
     if not ok_arch then return nil, _("当前固件不支持 EPUB 打包") end
 
-    local dir = self:docDir()
+    local dir = self:exportDir()
     local ok_mk = pcall(util.makePath, dir)
     if not ok_mk then return nil, _("文档目录不可写：") .. tostring(dir) end
 
