@@ -1,0 +1,13 @@
+# 换行符策略
+#
+# 背景：本仓库 core.autocrlf=true，没有 .gitattributes 时 git 会在 Windows 上
+# checkout 出 CRLF 文本，造成两类真实故障：
+#   1. tests/*.sh、release.sh 在 WSL / Linux 里报 `\r: command not found`
+#      （之前手动 sed -i "s/\r$//" 修过两次）
+#   2. KOReader 跑在 Linux 上，Lua 源码带 \r 会混进模式匹配与字符串比较
+#
+# 只强制脚本与源码用 LF，其余文本交给 * text=auto 按二进制探测处理。
+
+* text=auto
+*.sh   text eol=lf
+*.lua  text eol=lf
