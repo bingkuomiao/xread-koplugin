@@ -1,6 +1,6 @@
 # xread.koplugin 进度同步机制 与 WSL2 模拟测试指南
 
-> 更新：2026-11-24 · 配套版本 **v0.5.9**（110 文件，规范包 `xread.koplugin_v0.5.9_<时间>.zip`）
+> 更新：2026-11-25 · 配套版本 **v0.6.1**（110 文件，规范包 `xread.koplugin_v0.6.1_<时间>.zip`）
 > 用途：① 说明正文阅读中进度同步的实现方案；② 在另一台有 WSL2 的机器上从零搭起模拟测试环境；③ 规范 zip 热更新流程。
 > 一键脚本见 `wsl-setup/quickstart.sh` 与 `koplugin一键测试.bat`（放资料库 koplugin 文件夹的测试包内）。
 
@@ -81,13 +81,13 @@ ls /opt/koreader   # 应看到 bin/ lib/ share/
 
 ```
 koplugin-test-kit.zip
-├── xread.koplugin/                          # 最新源码 v0.5.9（110 文件）
+├── xread.koplugin/                          # 最新源码 v0.6.1（110 文件）
 ├── xread.koplugin.zip                       # 可直接装真机的插件包
-├── publish/xread.koplugin_v0.5.9_*.zip      # 规范命名热更新包
+├── publish/xread.koplugin_v0.6.1_*.zip      # 规范命名热更新包
 ├── publish_update.py                        # 一键发布脚本（生成清单+打包+上传+校验+清理旧包）
 ├── KOPlugin热更新发布说明.md                # 热更新发布流程（含设备端包留档规则）
-├── release.sh                               # 发布出包 + 13 项自动测试
-├── tests/                                   # 自动测试用例（TC-01~13）
+├── release.sh                               # 发布出包 + 17 项自动测试
+├── tests/                                   # 自动测试用例（TC-01~17）
 └── wsl-setup/                               # quickstart.sh / webdav_e2e.sh（真实 NAS 端到端）
 ```
 
@@ -104,7 +104,7 @@ cp -r <解压目录>/xread.koplugin /opt/koreader/lib/koreader/plugins/xread.kop
 wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/wsl-setup/quickstart.sh'
 ```
 
-脚本依次完成：安装依赖（xdotool/imagemagick/xvfb）→ 校验 KOReader 模拟器 → 写登录凭据 → 部署最新插件 → 跑 12 项自动回归 → 打印报告路径与 PASS/FAIL 汇总。人工实时操作另用 `manual_test.sh`（浏览器 noVNC）。
+脚本依次完成：安装依赖（xdotool/imagemagick/xvfb）→ 校验 KOReader 模拟器 → 写登录凭据 → 部署最新插件 → 跑全套自动回归 → 打印报告路径与 PASS/FAIL 汇总。人工实时操作另用 `manual_test.sh`（浏览器 noVNC）。
 
 ### 第 4 步：登录凭据
 
@@ -141,19 +141,60 @@ wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/<解压目录>/wsl-setup/manu
 # 一键（装依赖+部署+回归）
 wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/wsl-setup/quickstart.sh'
 
-# 发布出包 + 全套 13 项自动测试（大改动后必跑，全 PASS 才交付）
+# 发布出包 + 全套 17 项自动测试（大改动后必跑，全 PASS 才交付）
 wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/release.sh'
 
 # 只验证不重新打包 / 指定用例
 wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/tests/run_all.sh'
-wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/tests/run_all.sh --only 12_update_zip 13_package_retention'
+wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/tests/run_all.sh --only 12_update_zip 16_filelist_latest 13_package_retention 17_cover_api'
 
 # 真实 NAS 端到端热更新（先上传到服务端；参数=把本地降级到的版本）
-wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/wsl-setup/webdav_e2e.sh 0.5.7'
+wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/wsl-setup/webdav_e2e.sh 0.5.9'
 ```
 
 报告（含截图）在 `tests/reports/<时间戳>/SUMMARY.md`；改代码后重跑启动命令即自动同步源码。
-TC-12 = 规范 zip 包热更新（含同名解压目录校验），TC-13 = 包留存策略（只保留最近 3 次）；两者都用本地 http.server 模拟，只有 `webdav_e2e.sh` 需连真实 NAS。旧散文件更新用例（原 TC-11）已随老版本兼容代码一并移除。
+- TC-12 = 列目录模式 zip 热更新全流程（filelist.json + zip + md5 sidecar，含同名解压目录校验）；
+- TC-16 = 列目录挑最新（filelist.json 放两个包：高版本 / 时间戳更新的低版本，验证按语义版本挑中高版本、不误装旧包、包内版本裁决）；
+- TC-13 = 包留存策略（设备端只保留最近 3 次）；
+- TC-17 = 统一封面接口纯 Lua 单测（LuaJIT + mock socket.http，不依赖模拟器/NAS）：验证 `path=<customCoverUrl||coverUrl 原值>`、统一带 accessToken/secureKey/userNS、未登录网络书 URL 正确、Referer 为合法 header、本地书 401 重登重试。
+前三者用本地 http.server 模拟，只有 `webdav_e2e.sh` 需连真实 NAS。旧散文件更新用例（原 TC-11）已随老版本兼容代码一并移除。
+
+> 热更新现为纯列目录模式：列 `/plugin` 目录（webdav `getWebdavFileList` / raw `filelist.json`）按包名语义版本挑最新 zip，无 manifest 清单、无回退。发布端 `publish_update.py` 生成 filelist.json + 同名 `.md5` sidecar，服务端保留最近 3 个包。详见 `KOPlugin热更新发布说明.md`。
+
+### 第 7 步：真机触摸全流程 / 全按钮遍历（TC-14~15）
+
+这几个用例**不靠 autotest 钩子直达**，而是从文件管理器用真实触摸一步步走，截图覆盖每个弹窗/新页面。都已在 `tests/cases/` 中，可单独重跑：
+
+```powershell
+# 全流程：阅读X → 书架 → 开小说 → 正文 → 目录 → 跳章 → 正文阅读 → 返回书架 → 返回首页（13 步截图）
+wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/tests/run_all.sh --only 14_full_flow_touch'
+# 首页所有可点击按钮（每个按钮独立会话，互不干扰）
+wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/tests/run_all.sh --only 15a_home_buttons'
+# 阅读工具栏所有按钮
+wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/tests/run_all.sh --only 15b_toolbar_buttons'
+# 首页「更多」页所有菜单项
+wsl.exe -d Ubuntu -u root -e bash -lc 'bash /mnt/d/koplugin/tests/run_all.sh --only 15c_more_menu'
+```
+
+**真机触摸关键坐标**（Xvfb 屏幕 1072×1448，与截图一致）：
+
+| 界面 | 元素 | 坐标 (x,y) |
+| --- | --- | --- |
+| （引导）| v0.6.1 起原生菜单无阅读X入口，全流程用 `emu_start "shelf"` 直开书架引导，不再点主菜单 | — |
+| 首页顶部 | 阅读X / 昵称 / Wi-Fi / 已连接 / 更多≡ | 75 / 280 / 360 / 490 / 1005，y≈45 |
+| 首页功能区 | 更新 / 搜索 / 同步 / 夜晚 / 设置 | x≈90/245/400/555/710，y≈680 |
+| 首页 hero | 历史 / 本地阅读 | 455,140 / 595,290 |
+| 首页书架 | 书籍封面（第一行）/ 下一页 | y≈930 / 985,1410 |
+| 阅读工具栏 | 目录 / 缓存 / 删除 / 书架 | 148/400/652/906，y=330 |
+| 阅读工具栏 | 夜间 / 刷新 / 切换 / 设置 | 148/400/652/906，y=560 |
+| 目录页 | 章节条目 / 返回 / 上一页 / 下一页 | 列表区 x>260 / 75,1285 / 210,1385 / 800,1385 |
+
+**用例设计要点 / 已踩坑**：
+
+1. 弹窗关闭用 `xdotool key Escape`（搜索框等输入类弹窗 Escape 可能无效，需点「取消」）。批量点击同一界面时，若弹窗未关干净会导致后续点击全落空——**TC-15a~15c 采用「每个按钮独立 emu_start」规避**，慢但可靠。
+2. 开书后正文中央点击呼出工具栏；**跳章（switchDocument）会重建触摸分区并清空 `SHARED.txt_path`，导致跳章后点中央没反应**。已在 `onReaderReady()` 中补 `setupCenterTap()` 并在文档就绪时恢复 `SHARED.txt_path = doc.file` 修复（TC-14 第 11 步已覆盖该回归）。
+3. 漫画书（`.cbz`，如「灵世英雄」）目录/跳章行为与小说不同；全流程用小说「三国之宅行天下」跑，保证目录→跳章→正文链路可测。
+4. 截图命名：`step_`=全流程、`btn_`=首页按钮、`toolbtn_`=工具栏按钮、`menu_`=更多页菜单；归档到 `tests/reports/ui_test_screenshots/` 并上传到资料库 `test` 文件夹（文件名前缀 `test_`）。
 
 ---
 
