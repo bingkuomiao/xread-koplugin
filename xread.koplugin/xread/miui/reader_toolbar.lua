@@ -141,7 +141,9 @@ end
 function SliderBar:_refresh(force)
     if not self.owner or self.owner.closed then return end
     local interval = Screen.low_pan_rate and .10 or .04
-    local now = os.clock()
+    -- 墙面时钟而不是 os.clock：后者是 CPU 时间，UI 卡住时不增长，
+    -- 会把拖动刷新的节流窗口拖成几十秒（滑条看上去不跟手）
+    local now = U.now()
     if not force and now - (tonumber(self.last_refresh) or 0) < interval then return end
     self.last_refresh = now
     local region=self.refresh_dimen or self.owner.panel_dimen

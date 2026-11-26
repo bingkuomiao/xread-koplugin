@@ -1,5 +1,21 @@
 local lfs = require("libs/libkoreader-lfs")
 local U = {}
+-- 墙上时钟（秒，带小数）。
+-- 绝不能拿 os.clock() 做「双击防抖 / 刷新节流」：那是**进程 CPU 时间**，
+-- UI 卡在同步网络请求上的那几十秒它几乎不走。用它做 0.2s 防抖的后果是
+-- 点一次按钮后，接下来几十秒内的每次点击都被判成「还在防抖期」直接丢掉，
+-- 用户看到的就是「首页按钮点了没反应」。
+local socket_ok, socket_lib = pcall(require, "socket")
+function U.now()
+    if socket_ok and socket_lib and socket_lib.gettime then
+        return socket_lib.gettime()
+    end
+    local ok, ffiutil = pcall(require, "ffi/util")
+    if ok and ffiutil and ffiutil.gettime then
+        return ffiutil.gettime()
+    end
+    return os.time()
+end
 function U.copy(v, seen)
     if type(v) ~= "table" then return v end
     seen=seen or {}; if seen[v] then return seen[v] end

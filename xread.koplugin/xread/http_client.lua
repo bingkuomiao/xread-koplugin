@@ -28,29 +28,36 @@ local saved_timeout      -- 最外层进入前的原始 TIMEOUT
 --- 发起请求。
 -- @param req      ltn12/socket.http 的 request 表
 -- @param timeout  number，本次请求的超时秒数；nil 表示不改动超时
--- @return ok(boolean), code(number|nil), headers(table|nil)
---         网络层抛错时 ok=false、code=nil（错误信息通过第 4 个返回值给出）
+-- @return ok(boolean), code(number|nil), headers(table|nil), err(string|nil)
+--
+-- 关键：KOReader 的 socket.http.request 被 socket.protect 包装，**失败时返回
+-- nil, errmsg 而不是抛异常**，成功时返回 1, code, headers, status。
+-- 所以判断成败要看「第一个返回值是否等于 1」，而不是 pcall 的 ok。
+-- 之前只看 pcall 的 ok（失败时 protect 仍正常返回，pcall 恒 true），会把
+-- 失败误读成「成功 code=nil」，一路炸到 httpPost 的 `code >= 500` 比较。
 function HttpClient.request(req, timeout)
     local t = tonumber(timeout)
+    local ok, r1, r2, r3
     if not t or t <= 0 then
         -- 不改超时：仍用 pcall 统一返回值
-        local ok, r1, r2 = pcall(http.request, req)
-        if not ok then return false, nil, nil, tostring(r1) end
-        return true, tonumber(r2), nil
+        ok, r1, r2, r3 = pcall(http.request, req)
+    else
+        if depth == 0 then saved_timeout = http.TIMEOUT end
+        depth = depth + 1
+        http.TIMEOUT = t
+        ok, r1, r2, r3 = pcall(http.request, req)
+        depth = depth - 1
+        if depth == 0 then
+            http.TIMEOUT = saved_timeout
+            saved_timeout = nil
+        end
     end
-
-    if depth == 0 then saved_timeout = http.TIMEOUT end
-    depth = depth + 1
-    http.TIMEOUT = t
-    local ok, r1, r2, r3 = pcall(http.request, req)
-    depth = depth - 1
-    if depth == 0 then
-        http.TIMEOUT = saved_timeout
-        saved_timeout = nil
-    end
+    -- http.request 自身抛异常（极少见，protect 一般已兜住）
     if not ok then return false, nil, nil, tostring(r1) end
-    -- 注意：socket.http.request 返回 1, code, headers, status，
-    -- pcall 后位次整体右移一位，r1 恒为 1。
+    -- 成败判定：protect 成功返回 1, code, headers, status；失败返回 nil, errmsg
+    if r1 ~= 1 then
+        return false, nil, nil, tostring(r2 or r1)
+    end
     return true, tonumber(r2), r3
 end
 

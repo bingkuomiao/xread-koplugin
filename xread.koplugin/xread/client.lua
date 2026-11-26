@@ -16,6 +16,12 @@ if not ok_json then json = require("dkjson") end               -- 桌面/测试�
 local Client = {}
 Client.__index = Client
 
+-- 全部请求的默认超时（秒）。
+-- 之前不传 timeout 的请求会沿用 KOReader 全局 TIMEOUT（常见 12~60s），
+-- 地址填错时整机 UI 会被同步 socket 冻住几十秒，且用户看不到任何反馈。
+-- 这里统一收紧到 8s，配合 main.lua 的后端快速探测（2.5s）使用。
+Client.DEFAULT_TIMEOUT = 8
+
 --- URL 编码（query/表单参数用）
 local function urlencode(str)
     if not str then return "" end
@@ -129,14 +135,17 @@ end
 --- 检查后端连通性
 -- 新后端把 health 放在根路径 /health；旧后端在 /reader3/health。
 -- 先试根路径，失败再回退到 /reader3/health，二者都兼容。
-function Client:health()
+-- 超时给短（2.5s）：这条路径是「测试连接」和自检用的，用户等不起。
+function Client:health(opts)
+    opts = opts or {}
+    local t = tonumber(opts.timeout) or 2.5
     local ok_res, res = pcall(function()
-        return self:httpGet(self.address .. "/health", { timeout = 3 })
+        return self:httpGet(self.address .. "/health", { timeout = t })
     end)
     if ok_res and type(res) == "table" and res.isSuccess ~= nil then
         return res
     end
-    return self:httpGet(self.address .. "/reader3/health", { timeout = 3 })
+    return self:httpGet(self.address .. "/reader3/health", { timeout = t })
 end
 
 --- 登录，成功后自动保存鉴权参数（封面本地资源接口需要）
@@ -144,7 +153,7 @@ function Client:login(username, password)
     self.username, self.password = username, password
     local res = self:httpPost(self.address .. "/reader3/login", {
         isLogin = true, username = username, password = password, code = "",
-    })
+    }, { timeout = 5 })
     assert(res.isSuccess, "登录失败: " .. tostring(res.errorMsg))
     self.accessToken = res.data and res.data.accessToken
     self.secureKey = res.data and res.data.secureKey
@@ -200,11 +209,11 @@ end
 --- 底层 GET：返回 ok, code, data(已清洗), raw_body
 function Client:_rawGet(url, timeout)
     local chunks = {}
-    local ok, code = HttpClient.request({
+    local ok, code, _, err = HttpClient.request({
         url = url, sink = ltn12.sink.table(chunks),
     }, timeout)
     local body = table.concat(chunks)
-    if not ok then return false, nil, nil, body end
+    if not ok then return false, nil, nil, (err and tostring(err) or body) end
     local data
     if body and body ~= "" then
         local ok_json_decode, decoded = pcall(json.decode, body)
@@ -217,7 +226,7 @@ end
 function Client:_rawPost(url, obj, timeout)
     local payload = json.encode(obj)
     local chunks = {}
-    local ok, code = HttpClient.request({
+    local ok, code, _, err = HttpClient.request({
         url = url, method = "POST",
         source = ltn12.source.string(payload),
         headers = {
@@ -227,7 +236,7 @@ function Client:_rawPost(url, obj, timeout)
         sink = ltn12.sink.table(chunks),
     }, timeout)
     local body = table.concat(chunks)
-    if not ok then return false, nil, nil, body end
+    if not ok then return false, nil, nil, (err and tostring(err) or body) end
     local data
     if body and body ~= "" then
         local ok_json_decode, decoded = pcall(json.decode, body)
@@ -246,7 +255,7 @@ function Client:_reauthorize()
     local ok = pcall(function()
         local res = self:httpPost(self.address .. "/reader3/login", {
             isLogin = true, username = self.username, password = self.password, code = "",
-        }, { _no_auth_retry = true })
+        }, { _no_auth_retry = true, timeout = 5 })
         assert(res and res.isSuccess, "重登失败")
         self.accessToken = res.data and res.data.accessToken
         self.secureKey = res.data and res.data.secureKey
@@ -262,16 +271,17 @@ end
 -- @return ok, code, data, raw
 function Client:_request(method, url, obj, opts)
     opts = opts or {}
-    local function once()
+    local timeout = tonumber(opts.timeout) or Client.DEFAULT_TIMEOUT
+    local function once(t)
         if method == "GET" then
-            return self:_rawGet(url, opts.timeout)
+            return self:_rawGet(url, t)
         end
-        return self:_rawPost(url, obj, opts.timeout)
+        return self:_rawPost(url, obj, t)
     end
-    local ok, code, data, raw = once()
+    local ok, code, data, raw = once(timeout)
     if ok and isAuthFailure(code, data) and not opts._no_auth_retry then
         if self:_reauthorize() then
-            ok, code, data, raw = once()   -- 只重试一次
+            ok, code, data, raw = once(timeout)   -- 只重试一次
         end
     end
     return ok, code, data, raw
@@ -297,14 +307,15 @@ end
 function Client:httpPost(url, obj, opts)
     if opts == true then opts = { retry = true } end        -- 兼容旧的布尔第三参
     opts = opts or {}
-    local ok, code, data = self:_request("POST", url, obj, opts)
+    local ok, code, data, raw = self:_request("POST", url, obj, opts)
     if not ok then
-        error("网络错误：" .. tostring(data), 0)
+        error("网络错误：" .. tostring(raw or data), 0)
     end
     code = tonumber(code)
     if code ~= 200 then
         -- 5xx 且调用方声明幂等：重试一次（_retried 防无限递归）
-        if opts.retry and code >= 500 and not opts._retried then
+        -- （code 理论上不会是 nil，但 (code or 0) 兜底，避免 nil 比较抛错）
+        if opts.retry and (code or 0) >= 500 and not opts._retried then
             return self:httpPost(url, obj, {
                 retry = true, _retried = true, timeout = opts.timeout,
             })
@@ -327,11 +338,17 @@ function Client:getBookshelf(refresh)
 end
 
 --- 获取某本书的目录（幂等读接口，允许 5xx 重试一次）
-function Client:getChapterList(book)
+-- @param opts 可选 { refresh=1|0, timeout=秒 }
+--   refresh=1 让后端重新从书源抓目录（慢，只在用户显式刷新/缓存过期后台刷新时用）；
+--   refresh=0 吃后端已有缓存（点书秒开用这个）。
+function Client:getChapterList(book, opts)
+    opts = opts or {}
+    local refresh = opts.refresh
+    if refresh == nil then refresh = 1 end
     local ok_res, res = pcall(function()
         return self:httpPost(self:apiUrl("getChapterList"), {
-            refresh = 1, url = book.bookUrl,
-        }, { retry = true })
+            refresh = refresh, url = book.bookUrl,
+        }, { retry = true, timeout = tonumber(opts.timeout) or 8 })
     end)
     if not ok_res then
         error("获取《" .. tostring(book.name or "?") .. "》目录失败：" .. tostring(res), 0)
@@ -346,7 +363,7 @@ function Client:getBookContent(chapter, book)
         chapterUrl = chapter.url or chapter.chapterUrl,
         bookSourceUrl = book.origin,
         refresh = 0,
-    }, { retry = true })
+    }, { retry = true, timeout = 10 })
     assert(res.isSuccess, "获取正文失败: " .. tostring(res.errorMsg))
     return htmlToText(res.data or "")
 end
@@ -357,7 +374,7 @@ function Client:getBookContentRaw(chapter, book)
         chapterUrl = chapter.url or chapter.chapterUrl,
         bookSourceUrl = book.origin,
         refresh = 0,
-    }, { retry = true })
+    }, { retry = true, timeout = 10 })
     assert(res.isSuccess, "获取正文失败: " .. tostring(res.errorMsg))
     return res.data or ""
 end
@@ -399,14 +416,14 @@ end
 function Client:saveBookProgress(book, index)
     local res = self:httpPost(self:apiUrl("saveBookProgress"), {
         url = book.bookUrl, index = index, name = book.name, author = book.author,
-    })
+    }, { timeout = 5 })
     return res
 end
 
 --- 获取后端版本（getVersionUpdate 的 currentVersion；失败返回 nil，不影响调用方）
 function Client:getServerVersion()
     local ok, res = pcall(function()
-        return self:httpGet(self:apiUrl("getVersionUpdate"), { timeout = 3 })
+        return self:httpGet(self:apiUrl("getVersionUpdate"), { timeout = 2.5 })
     end)
     if ok and res.isSuccess and type(res.data) == "table" then
         local v = res.data.currentVersion
@@ -419,13 +436,13 @@ end
 function Client:getShelfBookWithCacheInfo(book)
     local res = self:httpGet(self:apiUrl("getShelfBookWithCacheInfo", {
         url = book.bookUrl,
-    }))
+    }), { timeout = 6 })
     return res
 end
 
 --- 获取全部书源（legado 格式列表：bookSourceName/bookSourceUrl/bookSourceType/enabled...）
 function Client:getBookSources()
-    local res = self:httpGet(self:apiUrl("getBookSources"))
+    local res = self:httpGet(self:apiUrl("getBookSources"), { timeout = 8 })
     assert(res.isSuccess, "获取书源失败: " .. tostring(res.errorMsg))
     return res.data or {}
 end
@@ -451,7 +468,7 @@ function Client:saveBook(book)
         bookUrl = book.bookUrl,
         origin = book.origin,
         tocUrl = book.tocUrl or book.bookUrl,
-    })
+    }, { timeout = 8 })
     return res.isSuccess == true
 end
 
@@ -460,7 +477,7 @@ function Client:deleteBook(book)
     local res = self:httpPost(self:apiUrl("deleteBook"), {
         bookUrl = tostring(book.bookUrl or ""),
         cleanupCache = "true",
-    })
+    }, { timeout = 10 })
     return res.isSuccess == true
 end
 
@@ -468,7 +485,7 @@ end
 function Client:deleteBookCache(book)
     local res = self:httpPost(self:apiUrl("deleteBookCache"), {
         bookUrl = book.bookUrl,
-    })
+    }, { timeout = 10 })
     return res
 end
 

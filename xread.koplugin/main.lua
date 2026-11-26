@@ -424,6 +424,9 @@ end
 function XRead:_scheduleNetJob(delay, job, max_wait)
     local waited = 0
     local function attempt()
+        -- 后端刚被判定不可达：直接放弃这轮后台请求。
+        -- 否则首页心跳/封面重试会每 30s 把 UI 冻结一次，用户只会觉得「整机卡死」。
+        if not self:_backendUsable() then return end
         if self:_uiHasOverlay() and waited < (max_wait or 60) then
             waited = waited + 1.5
             UIManager:scheduleIn(1.5, attempt)
@@ -477,6 +480,124 @@ local function readable_error(msg)
     end
     if #s > 90 then s = s:sub(1, 90) .. "…" end
     return s
+end
+
+-- ---------- 后端可用性守卫 ----------
+-- 背景：地址填错 / 后端没起时，插件里所有 HTTP 都是 UI 线程上的同步调用。
+-- 以前点「我的首页 / 我的书架 / 测试连接 / 更新」会整机冻结十几秒到半分钟，
+-- 画面停在原处、点击毫无反应，也**不报任何错**——用户只能以为插件坏了。
+--
+-- 现在：真要发网络请求之前，先用子进程做一次 2.5s 的 TCP 探活（UI 不冻结），
+-- 失败立刻弹一条「连不上哪台机器 + 去地址管理改」的提示，并在 25s 内不再重试，
+-- 避免用户每点一次都白等一次超时。探活通过后才在主线程发正式请求。
+
+local BackendProbe = require("xread.backend_probe")
+
+-- 后端不可达后的冷却窗口（秒）
+local BACKEND_DOWN_COOLDOWN = 25
+
+--- 当前配置的后端地址（空串表示还没填）
+function XRead:backendAddress()
+    return tostring(self:getSetting("address", "") or "")
+end
+
+--- 把 http://1.2.3.4:7777/ 缩成 1.2.3.4:7777，提示里更短更好认
+local function display_address(addr)
+    local s = tostring(addr or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    s = s:gsub("^%a[%w+.-]*://", ""):gsub("/+$", "")
+    return s ~= "" and s or _("未设置")
+end
+
+--- 冷却期内返回上次失败原因，否则 nil
+function XRead:_backendDownReason()
+    local down = self._backend_down
+    if type(down) ~= "table" then return nil end
+    if os.time() - (tonumber(down.at) or 0) >= BACKEND_DOWN_COOLDOWN then
+        self._backend_down = nil
+        return nil
+    end
+    return tostring(down.reason or "")
+end
+
+--- 地址改动 / 手动重试后解除冷却
+function XRead:clearBackendDown()
+    self._backend_down = nil
+end
+
+--- 记录一次后端不可达（后台任务用：静默记录，不弹窗）
+function XRead:markBackendDown(reason)
+    self._backend_down = { at = os.time(), reason = tostring(reason or "") }
+end
+
+--- 统一的后端不可达提示：说清楚「连的是哪台、为什么、去哪改」
+function XRead:notifyBackendDown(reason, silent)
+    self:markBackendDown(reason)
+    local msg = T(_("无法连接后端 %1\n原因：%2\n\n请检查「阅读X → 地址管理」里的地址和端口，\n以及后端服务是否已启动。"),
+        display_address(self:backendAddress()), readable_error(reason))
+    logger.warn("xread backend unreachable:", self:backendAddress(), tostring(reason))
+    if os.getenv("XREAD_AUTOTEST") then
+        print("[XREAD_AUTOTEST] backend_down " .. tostring(reason))
+    end
+    if not silent then
+        self:showInfo(msg, 10)
+    end
+end
+
+--- 探活期间的不遮挡提示（toast，可以继续点击，不是模态框）
+function XRead:showConnectingToast(addr)
+    local ok, Notification = pcall(require, "ui/widget/notification")
+    if ok and Notification and Notification.notify then
+        pcall(function()
+            Notification:notify(T(_("正在连接 %1…"), display_address(addr)))
+        end)
+    end
+end
+
+--- 网络入口统一守卫：先探活，再执行 fn。
+-- @param fn     function() 探活通过后在主线程执行
+-- @param opts   { force=忽略冷却, timeout=探活秒数, silent=不显示正在连接 }
+-- @return boolean 是否已受理（false = 直接失败并已提示）
+function XRead:withBackend(fn, opts)
+    opts = opts or {}
+    local addr = self:backendAddress()
+    if addr == "" or addr:match("^%s*$") then
+        self:showInfo(_("还没有设置后端地址。\n请在「阅读X → 地址管理」里填写服务器地址和端口。"), 8)
+        return false
+    end
+
+    local cooling = self:_backendDownReason()
+    if cooling and not opts.force then
+        -- 冷却期内直接给结论，不再让用户白等一次超时
+        self:notifyBackendDown(cooling)
+        return false
+    end
+
+    if not opts.silent then self:showConnectingToast(addr) end
+
+    BackendProbe.check(addr, opts.timeout, function(ok, reason)
+        if not ok then
+            self:notifyBackendDown(reason)
+            if type(opts.on_fail) == "function" then
+                pcall(opts.on_fail, reason)
+            end
+            return
+        end
+        self:clearBackendDown()
+        local ok_fn, err = pcall(fn)
+        if not ok_fn then
+            logger.warn("xread guarded task failed:", tostring(err))
+            self:showInfo(_("出错：") .. readable_error(err), 6)
+            if type(opts.on_fail) == "function" then
+                pcall(opts.on_fail, err)
+            end
+        end
+    end)
+    return true
+end
+
+--- 后台任务用：后端已知不可达就直接跳过（不弹窗、不卡 UI）
+function XRead:_backendUsable()
+    return self:_backendDownReason() == nil
 end
 
 function XRead:runQuiet(fn)
@@ -1577,17 +1698,14 @@ end
 -- 菜单和验收脚本共用这一条路径，避免两处逻辑漂移
 function XRead:testConnection()
 
-    self:runQuiet(function()
+    local addr = display_address(self:backendAddress())
+    local t0 = now_ms()
 
-        local addr = tostring(self.client.address or "")
+    -- 先做 2.5s 的可达性探测：地址/端口不通时立刻给结论，
+    -- 不再让界面卡在同步 health 请求上等到超时。
+    self:withBackend(function()
 
-        addr = addr:gsub("^https?://", ""):gsub("/+$", "")
-
-        if addr == "" then addr = _("未设置") end
-
-        local t0 = now_ms()
-
-        local ok, res = pcall(function() return self.client:health() end)
+        local ok, res = pcall(function() return self.client:health({ timeout = 3 }) end)
 
         local ms = math.floor(now_ms() - t0 + 0.5)
 
@@ -1599,6 +1717,8 @@ function XRead:testConnection()
 
             -- 成功也给回执：结论 + 地址 + 耗时，能判断是否连错了机器
             self:showInfo(T(_("连接成功\n%1\n耗时 %2 ms"), addr, tostring(ms)), 6)
+
+            if os.getenv("XREAD_AUTOTEST") then print("[XREAD_AUTOTEST] health_ok") end
 
             return
 
@@ -1618,11 +1738,15 @@ function XRead:testConnection()
 
         logger.warn("xread health failed:", reason)
 
-        self:showInfo(T(_("连接失败\n%1\n耗时 %2 ms\n原因：%3"), addr, tostring(ms), reason), 6)
+        -- 端口通了但服务不健康：也进冷却，避免反复等
+        self:markBackendDown(reason)
 
-    end)
+        self:showInfo(T(_("连接失败\n%1\n耗时 %2 ms\n原因：%3"), addr, tostring(ms), reason), 8)
+
+    end, { force = true, timeout = 2.5 })
 
 end
+
 -- ---------- 主菜单 ----------
 
 function XRead:openShelf()
@@ -1658,20 +1782,26 @@ function XRead:openShelf()
 
     end
 
-    self:runQuiet(function()
+    -- 本地没有可用书架缓存：这是唯一必须等网络的路径，
+    -- 先探活（2.5s、不冻结 UI），地址不通时直接提示，不再卡到 socket 超时。
+    self:withBackend(function()
 
-        if self:ensureLogin() then
+        self:runQuiet(function()
 
-            self:showBookshelf()
+            if self:ensureLogin() then
 
-        else
+                self:showBookshelf()
 
-            -- 书架没打开：把刚停掉的首页心跳放回去，别让首页时钟一直停着
-            local home = self._home_view
+            else
 
-            if home and not home._miu_closed then self:_startHomeTicker(home) end
+                -- 书架没打开：把刚停掉的首页心跳放回去，别让首页时钟一直停着
+                local home = self._home_view
 
-        end
+                if home and not home._miu_closed then self:_startHomeTicker(home) end
+
+            end
+
+        end)
 
     end)
 
@@ -1698,6 +1828,11 @@ function XRead:_refreshShelfInBackground()
             self.meta_cache:putShelf(books)
 
             logger.info("xread shelf refreshed in background")
+
+        elseif not ok then
+
+            -- 静默记录：后续后台任务（封面/心跳/预取）按冷却窗口自动让路
+            self:markBackendDown(tostring(books))
 
         end
 
@@ -1735,6 +1870,10 @@ function XRead:_bgFetchChapters(book, delay)
             end
 
             logger.info("xread prefetched chapters for", tostring(book.name))
+
+        elseif not ok then
+
+            self:markBackendDown(tostring(chapters))
 
         end
 
@@ -1811,9 +1950,26 @@ end
 
 function XRead:openHome()
 
-    self:runQuiet(function()
+    -- 本地已有书架缓存：直接渲染，不为了登录态先卡一次网络。
+    -- （首页的封面/进度刷新都会在后台补，登录态仅在写操作时才需要）
+    local cached = self.meta_cache:getShelf(nil)
 
-        if self:ensureLogin() then self:showHome() end
+    if cached and #cached > 0 then
+
+        self:showHome()
+
+        return
+
+    end
+
+    -- 首次使用、本地没有缓存：唯一必须联网的情况，先做 2.5s 探活
+    self:withBackend(function()
+
+        self:runQuiet(function()
+
+            if self:ensureLogin() then self:showHome() end
+
+        end)
 
     end)
 
@@ -1913,6 +2069,9 @@ end
 -- 本地进度来自 meta_cache 的书架缓存（开书/手动同步时 updateShelfProgress 写入），
 -- 只推本地比后端更新的条目，避免用旧进度覆盖服务器。
 function XRead:syncProgressFromHome()
+
+    -- 先探活：地址不通时立刻提示，不让「同步」看起来像没反应
+    self:withBackend(function()
 
     self:runQuiet(function()
 
@@ -2028,6 +2187,8 @@ function XRead:syncProgressFromHome()
 
     end)
 
+    end)
+
 end
 
 -- 搜书并加入书架：按书名搜启用书源，结果点一下即 saveBook
@@ -2056,6 +2217,8 @@ function XRead:searchAndAddBook()
                 UIManager:close(d)
 
                 if not kw or kw == "" then return end
+
+                self:withBackend(function()
 
                 self:runQuiet(function()
 
@@ -2141,6 +2304,8 @@ function XRead:searchAndAddBook()
 
                 end)
 
+                end)
+
             end },
 
         }},
@@ -2163,6 +2328,10 @@ function XRead:buildHomeActions()
             -- 拉取最新书架，写回缓存后重建整个首页。
             -- 旧首页保持到 showHome 里「数据就绪、马上建新页」时才关，
             -- 否则取书架这段同步请求期间底层文件管理器会闪出来。
+            -- 先探活：地址不对时 2.5s 内提示，不把首页冻住十几秒。
+            if os.getenv("XREAD_AUTOTEST") then print("[XREAD_AUTOTEST] refresh_tap") end
+
+            self:withBackend(function()
 
             self:runQuiet(function()
 
@@ -2180,11 +2349,15 @@ function XRead:buildHomeActions()
 
                     -- 后端拉取失败时退回原缓存重建首页，不让用户看到空白
 
+                    if not ok then self:markBackendDown(tostring(books)) end
+
                     self:showHome(self._home_shelf_page or 1)
 
                     UIManager:nextTick(function() self:showInfo(_("更新失败，显示本地缓存书架")) end)
 
                 end
+
+            end)
 
             end)
 
@@ -2289,11 +2462,35 @@ function XRead:showHome(page)
 
     if not books then
 
-        local ok, res = pcall(function() return self.client:getBookshelf() end)
+        -- 本地完全没有书架缓存（首次安装 / 清过缓存）：
+        -- 先探活再请求，地址不通时 2.5s 内给出明确提示，而不是卡到 socket 超时。
+        if self._home_loading then return end
 
-        books = ok and res or nil
+        self._home_loading = true
 
-        if books and #books > 0 then self.meta_cache:putShelf(books) end
+        local accepted = self:withBackend(function()
+
+            self._home_loading = false
+
+            local ok, res = pcall(function() return self.client:getBookshelf() end)
+
+            if ok and type(res) == "table" and #res > 0 then
+
+                self.meta_cache:putShelf(res)
+
+                self:showHome(page)
+
+            else
+
+                self:showInfo(_("首页加载失败：没有拿到书架。\n请检查后端地址、账号密码，或稍后重试。"), 8)
+
+            end
+
+        end, { on_fail = function() self._home_loading = false end })
+
+        if not accepted then self._home_loading = false end
+
+        return
 
     end
 
@@ -2583,21 +2780,35 @@ function XRead:_startHomeTicker(view)
 
         end)
 
-        if rounds % 2 == 1 and not self:_uiHasOverlay() then
+        if rounds % 2 == 1 then
 
-            -- health 走短超时（client:health 内置 3s），避免后端异常时长时间阻塞界面；
-            -- 弹层开着时跳过，别卡住点击
-            local ok_h, res = pcall(function() return self.client:health() end)
+            if not self:_backendUsable() then
 
-            local healthy = ok_h and res and res.isSuccess ~= false
+                -- 已知连不上：不再发请求（每次 2.5s 的同步 health 会把首页冻住），
+                -- 直接按「已断开」显示，等冷却窗口过去再自动重试。
+                self._health_ok = false
 
-            self._health_ok = healthy
+                pcall(function() view:updateHeader{ sync_text = _("已断开") } end)
 
-            pcall(function()
+            elseif not self:_uiHasOverlay() then
 
-                view:updateHeader{ sync_text = healthy and _("已连接") or _("已断开") }
+                -- health 走短超时（client:health 内置 2.5s），避免后端异常时长时间阻塞界面；
+                -- 弹层开着时跳过，别卡住点击
+                local ok_h, res = pcall(function() return self.client:health() end)
 
-            end)
+                local healthy = ok_h and res and res.isSuccess ~= false
+
+                self._health_ok = healthy
+
+                if not healthy then self:markBackendDown(tostring(res)) end
+
+                pcall(function()
+
+                    view:updateHeader{ sync_text = healthy and _("已连接") or _("已断开") }
+
+                end)
+
+            end
 
         end
 
@@ -2784,6 +2995,9 @@ function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view,
 
             if self._cover_generation ~= gen or view._miu_closed then return end
 
+            -- 后端不可达时整队放弃，别一张一张撞超时（每张都是同步请求，会冻 UI）
+            if not self:_backendUsable() then return end
+
             -- 弹层开着时封面下载让路，别让同步 HTTP 卡住弹层里的点击
             if self:_uiHasOverlay() then
                 UIManager:scheduleIn(1.5, function() nextOne(k) end)
@@ -2799,6 +3013,8 @@ function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view,
                     layout.cover_w, layout.cover_h)
 
             end)
+
+            if not ok then self:markBackendDown(tostring(p)) end
 
             if ok and p and miui_books[item.i] then
 
@@ -2851,6 +3067,12 @@ function XRead:_startCoverRetryLoop(view, on_cover)
 
         if not view or view._miu_closed or view._closed then return end
 
+        -- 后端不可达：整轮跳过（这一轮里全是同步请求，会让首页每轮冻结十几秒）
+        if not self:_backendUsable() then
+            UIManager:scheduleIn(ttl, round)
+            return
+        end
+
         -- 弹层开着时整轮让路（含 getBookshelf 同步请求），1.5s 后重试
         if self:_uiHasOverlay() then
             UIManager:scheduleIn(1.5, round)
@@ -2866,7 +3088,9 @@ function XRead:_startCoverRetryLoop(view, on_cover)
 
         local books = nil
 
-        pcall(function() books = self.client:getBookshelf(want_refresh) end)
+        local ok_books, err_books = pcall(function() books = self.client:getBookshelf(want_refresh) end)
+
+        if not ok_books then self:markBackendDown(tostring(err_books)) end
 
         if type(books) ~= "table" or #books == 0 then
 
@@ -3646,67 +3870,106 @@ function XRead:openBook(book)
     end)
 
     -- 记住最后一次打开的书：首页「最近阅读」卡片实时指向它（写进设置，重启后仍生效）
-
     self._last_open_book_url = tostring((book and book.bookUrl) or "")
 
     self:saveSetting("last_book_url", self._last_open_book_url)
 
-    self:runQuiet(function()
+    -- 目录：优先本地缓存。**过期也先用**——点书时为了目录新章节再等后端
+    -- 重新抓一遍目录（几秒）是进书慢的主因；目录刷新改由后台静默补。
+    local ttl = tonumber(self:getSetting("chapter_cache_ttl", "1800")) or 1800
 
-        if not self:ensureLogin() then
+    local chapters = self.meta_cache:getChapters(book, ttl)
 
-            self:_cancelOpenBook()
+    local using_stale = false
 
-            return
+    if not chapters then
 
-        end
+        chapters = self.meta_cache:getChapters(book, nil)
 
-        -- 目录优先读本地缓存（后台预取/上次打开都写缓存），未命中才走网络
-        local ttl = tonumber(self:getSetting("chapter_cache_ttl", "1800")) or 1800
+        using_stale = chapters ~= nil
 
-        local chapters = self.meta_cache:getChapters(book, ttl)
+    end
 
-        local cache_hit = chapters ~= nil
+    local start = (tonumber(book.durChapterIndex) or 0) + 1
 
-        if not cache_hit then
+    if start < 1 then start = 1 end
 
-            chapters = self.client:getChapterList(book)
+    if chapters and start > #chapters then start = #chapters end
 
-            if chapters and #chapters > 0 then self.meta_cache:putChapters(book, chapters) end
+    -- 这一章正文是否已在本地：决定「点了就能开」还是「必须联网取」
+    local cached_first = self.chapter_cache:has(book, start)
 
-        else
+    local function proceed()
 
-            if os.getenv("XREAD_AUTOTEST") then
-                print("[XREAD_AUTOTEST] chapters_cache_hit")
+        self:runQuiet(function()
+
+            if not self:ensureLogin() then
+
+                self:_cancelOpenBook()
+
+                return
+
             end
 
-        end
+            local chs = chapters
 
-        if not chapters or #chapters == 0 then
+            if not chs or #chs == 0 then
 
-            self:showInfo(_("目录为空"))
+                chs = self.client:getChapterList(book)
 
-            self:_cancelOpenBook()
+                if chs and #chs > 0 then self.meta_cache:putChapters(book, chs) end
 
-            return
+            elseif using_stale then
 
-        end
+                -- 用的旧目录：后台补一次新目录，不挡这次开书
+                self:_bgFetchChapters(book, 1)
 
-        local start = (tonumber(book.durChapterIndex) or 0) + 1
+            end
 
-        if start < 1 then start = 1 end
+            if not chs or #chs == 0 then
 
-        if start > #chapters then start = #chapters end
+                self:showInfo(_("目录为空"))
 
-        if os.getenv("XREAD_AUTOTEST") == "opentime" then
+                self:_cancelOpenBook()
 
-            print("[XREAD_AUTOTEST] opentime: chapters_ready=" .. autotest_now())
+                return
 
-        end
+            end
 
-        self:openAtChapter(book, chapters, start)
+            local st = start
 
-    end)
+            if st < 1 then st = 1 end
+
+            if st > #chs then st = #chs end
+
+            if os.getenv("XREAD_AUTOTEST") == "opentime" then
+
+                print("[XREAD_AUTOTEST] opentime: chapters_ready=" .. autotest_now())
+
+            end
+
+            self:openAtChapter(book, chs, st)
+
+        end)
+
+    end
+
+    if cached_first and chapters then
+
+        -- 本地齐活：不探活、不等网络，直接开
+        if os.getenv("XREAD_AUTOTEST") then print("[XREAD_AUTOTEST] openbook_quick") end
+
+        proceed()
+
+        return
+    end
+
+    -- 需要联网：先 2.5s 探活。地址不通时立刻提示，不再让点书毫无反应地卡半分钟。
+    self:withBackend(proceed, {
+
+        on_fail = function() self:_cancelOpenBook() end,
+
+    })
 
 end
 
@@ -6058,6 +6321,7 @@ function XRead:showMoreListPanel(title, items, opts)
             },
         }
         self[1] = self.frame
+        self.text_widget = tw   -- 供异步结果就地改文字（如后端版本）
         self.dimen = Geom:new{ w = self.width, h = self.height }
         self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
     end
@@ -6071,8 +6335,9 @@ function XRead:showMoreListPanel(title, items, opts)
     local gap = Screen:scaleBySize(12)
 
     local rows = VerticalGroup:new{ align = "left" }
+    local rows_map = {}
     for idx, item in ipairs(items) do
-        rows[#rows + 1] = MoreRow:new{
+        local row = MoreRow:new{
             text = item.label,
             width = inner_w, height = row_h,
             callback = function()
@@ -6085,6 +6350,8 @@ function XRead:showMoreListPanel(title, items, opts)
                 return true
             end,
         }
+        rows[#rows + 1] = row
+        if item.key then rows_map[item.key] = row end
         if idx < #items then
             rows[#rows + 1] = HorizontalSpan:new{ width = gap }
         end
@@ -6171,6 +6438,10 @@ function XRead:showMoreListPanel(title, items, opts)
     self._more_panel_view = dialog
 
     UIManager:show(dialog)
+
+    if opts and type(opts.on_rows_built) == "function" then
+        pcall(opts.on_rows_built, rows_map)
+    end
 
 end
 
@@ -6266,7 +6537,7 @@ end
 -- 关于本机：插件版本 / 后端版本 / 固件版本 / 检查更新
 function XRead:showAboutPanel()
 
-    -- 连点「关于本机」会起多个 Trapper 任务，每个任务都建一份同名面板叠在栈里
+    -- 连点「关于本机」会起多个任务，每个任务都建一份同名面板叠在栈里
     if self._about_panel_loading then return end
 
     self._about_panel_loading = true
@@ -6274,49 +6545,76 @@ function XRead:showAboutPanel()
     -- 兜底：任务异常时也要把标记放回去，否则「关于本机」以后都点不开
     UIManager:scheduleIn(20, function() self._about_panel_loading = false end)
 
-    self:runQuiet(function()
+    local updater = require("xread/updater"):new{ client = self.client }
 
-        local updater = require("xread/updater"):new{ client = self.client }
+    local plugin_v = updater:getLocalVersion() or _("未知")
 
-        local plugin_v = updater:getLocalVersion() or _("未知")
+    local fw = nil
 
-        local server_v = self.client:getServerVersion() or _("未知")
+    pcall(function()
 
-        local fw = nil
+        local Device = require("device")
+
+        if Device.firmwareRevision then
+
+            local rev = Device:firmwareRevision()
+
+            if rev and rev ~= "" then fw = tostring(rev) end
+
+        end
+
+    end)
+
+    if not fw then
 
         pcall(function()
 
-            local Device = require("device")
-
-            if Device.firmwareRevision then
-
-                local rev = Device:firmwareRevision()
-
-                if rev and rev ~= "" then fw = tostring(rev) end
-
-            end
+            fw = require("version"):getCurrentRevision()
 
         end)
 
-        if not fw then
+    end
+
+    -- 面板立即弹出：后端版本先显示「检测中…」，不为一个网络请求把入口卡住。
+    -- （以前是先同步取版本再建面板，地址不通时要等 3~12s 才看到界面。）
+    self._about_info = { plugin_v = plugin_v, server_v = nil, fw = fw or _("未知") }
+
+    UIManager:nextTick(function()
+
+        self._about_panel_loading = false
+
+        self:_showAboutPanel()
+
+    end)
+
+    -- 后台补后端版本：拿到后就地改那一行文字
+    if not self:_backendUsable() then return end
+
+    self:_scheduleNetJob(0.2, function()
+
+        local v = self.client:getServerVersion()
+
+        if not v then return end
+
+        self._about_info = self._about_info or {}
+
+        self._about_info.server_v = v
+
+        local row = self._about_server_row
+
+        if row and row.text_widget and not row._miu_closed then
 
             pcall(function()
 
-                fw = require("version"):getCurrentRevision()
+                row.text_widget:setText(T(_("后端版本：%1"), tostring(v)))
+
+                if self._more_panel_view then UIManager:setDirty(self._more_panel_view, "ui") end
 
             end)
 
         end
 
-        self._about_info = { plugin_v = plugin_v, server_v = server_v, fw = fw or _("未知") }
-
-        UIManager:nextTick(function()
-
-            self._about_panel_loading = false
-
-            self:_showAboutPanel()
-
-        end)
+        if os.getenv("XREAD_AUTOTEST") then print("[XREAD_AUTOTEST] about_server_version " .. tostring(v)) end
 
     end)
 
@@ -6330,13 +6628,25 @@ function XRead:_showAboutPanel()
 
         { label = T(_("插件版本：%1"), tostring(info.plugin_v or "?")) },
 
-        { label = T(_("后端版本：%1"), tostring(info.server_v or "?")) },
+        { key = "server_version",
+
+          label = T(_("后端版本：%1"), tostring(info.server_v or _("检测中…"))) },
 
         { label = T(_("固件版本：%1"), tostring(info.fw or "?")) },
 
         { label = _("检查更新"), callback = function() self:checkForUpdateInteractive() end },
 
-    }, { hint = _("先从服务端检查更新；服务端不可用或无新版时，再安装放在插件目录内的本地更新包（规范命名 zip/tar.gz/tgz）。确认后自动安装并重启 KOReader。") })
+    }, {
+
+        hint = _("先从服务端检查更新；服务端不可用或无新版时，再安装放在插件目录内的本地更新包（规范命名 zip/tar.gz/tgz）。确认后自动安装并重启 KOReader。"),
+
+        on_rows_built = function(rows_map)
+
+            self._about_server_row = rows_map and rows_map.server_version
+
+        end,
+
+    })
 
 end
 
@@ -6753,9 +7063,23 @@ function XRead:showServerManage()
         local addr = "http://" .. ip
         if port ~= "" then addr = addr .. ":" .. port end
         self:saveSetting("address", addr)
-        if addr ~= self.client.address then
+        local changed = addr ~= self.client.address
+        if changed then
             self.client.address = addr
             self.client.accessToken = nil   -- 换地址后需重登
+        end
+        -- 地址改动后：立刻解除「连不上」冷却，并异步测一次新地址
+        -- （以前要等到下一次点开页面才发现地址还是错的，且没有任何回执）
+        self:clearBackendDown()
+        if changed then
+            BackendProbe.check(addr, 2.5, function(ok, reason)
+                if ok then
+                    self:showInfo(T(_("地址已保存：%1\n连接正常"), display_address(addr)), 4)
+                else
+                    self:showInfo(T(_("地址已保存：%1\n但连接失败：%2\n\n请核对 IP、端口，以及后端服务是否已启动。"),
+                        display_address(addr), readable_error(reason)), 10)
+                end
+            end)
         end
     end
 

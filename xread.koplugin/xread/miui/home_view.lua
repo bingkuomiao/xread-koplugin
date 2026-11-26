@@ -118,7 +118,9 @@ function TapBox:onTapSelect(_, ges)
         self._hold_handled = false
         return true
     end
-    local now=os.clock()
+    -- 用墙上时钟做双击防抖（os.clock 是 CPU 时间，UI 卡住时几乎不走，
+    -- 会把之后几十秒的点击全部误判成「防抖期」吞掉）
+    local now=U.now()
     if now<(tonumber(self._miu_tap_block_until) or 0) then return true end
     self._miu_tap_block_until=now+.20
     if self.callback then self.callback(self.dimen and self.dimen:copy() or nil, ges) end
@@ -132,7 +134,7 @@ end
 function TapBox:onHoldReleaseSelect()
     if self._hold_handled then
         self._hold_handled = false
-        self._miu_tap_block_until = os.clock() + .20
+        self._miu_tap_block_until = U.now() + .20
         return true
     end
     return false
@@ -1007,7 +1009,15 @@ local function action_button(entry, width, height)
             }, TextWidget:new{text = tostring(entry.badge), face = face("smallinfofont", 9, 11), bold = true}),
         }
     end
-    return tappable(width, height, child, enabled and entry.callback or nil, enabled and entry.hold_callback or nil)
+    local cb = entry.callback
+    local wrapped = cb and function(anchor, ges)
+        if os.getenv("XREAD_AUTOTEST") then
+            print("[XREAD_AUTOTEST] action_tap " .. tostring(entry.label)
+                .. " anchor.x=" .. tostring(anchor and anchor.x or "?"))
+        end
+        cb(anchor, ges)
+    end or nil
+    return tappable(width, height, child, enabled and wrapped or nil, enabled and entry.hold_callback or nil)
 end
 
 local function action_bar(actions, width, height)
@@ -1099,7 +1109,7 @@ local HomeWidget = InputContainer:extend{
 function HomeWidget:_notify_resume_interaction(kind)
     local callback=self._miu_resume_interaction_callback
     if not callback then return end
-    local now=os.clock()
+    local now=U.now()
     if now-(tonumber(self._miu_last_interaction_at) or 0)<.06 then return end
     self._miu_last_interaction_at=now
     local first=self._miu_resume_waiting_interaction==true
