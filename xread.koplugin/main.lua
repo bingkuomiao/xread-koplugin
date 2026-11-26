@@ -44,6 +44,26 @@ local T            = require("ffi/util").template
 
 local ffiutil      = require("ffi/util")
 
+--- 回收 fork 出的子进程（waitpid），避免僵尸进程残留。
+-- ffiutil.runInSubProcess 只负责 fork，回收必须由调用方自己做；
+-- 不回收会留下两个真实后果：
+--   ① 每做一次「整本缓存 / 整本导出」就留一个 defunct 条目，直到 KOReader 退出；
+--   ② 用户点「中止」后子进程仍在后台把整本书跑完（界面说已取消，实际没取消，
+--      还在持续发请求、写文件，导出甚至会写出完整 EPUB）。
+-- kill_first=true（中止/超时）时先对进程组发 SIGKILL；terminate 之后内核不保证
+-- 立刻回收，故最多轮询 2 秒（40 × 50ms），仍未退出再补一刀。
+-- ✅ Lua 5.1 通用（ffiutil.sleep 内部是 C.Sleep，不依赖协程）
+local function reapSubProcess(pid, kill_first)
+    if not pid then return end
+    if kill_first then pcall(ffiutil.terminateSubProcess, pid) end
+    for _ = 1, 40 do
+        if ffiutil.isSubProcessDone(pid) then return end
+        ffiutil.sleep(0.05)
+    end
+    pcall(ffiutil.terminateSubProcess, pid)
+    ffiutil.isSubProcessDone(pid)
+end
+
 local Client = require("xread.client")
 
 local CoverCache = require("xread.cover_cache")
@@ -3993,18 +4013,12 @@ local function stopBg(reason)
 
     job.stopped = true
 
-    -- 收掉抓取子进程（若还在跑），并收割避免僵尸
+    -- 收掉抓取子进程（若还在跑），并真正回收（waitpid）避免僵尸。
+    -- 原来只调 terminateSubProcess 而不再 waitpid：SIGKILL 之后内核不会自动
+    -- 回收，defunct 条目会一直挂到 KOReader 退出。
     if job.proc_pid then
 
-        pcall(function()
-
-            if not ffiutil.isSubProcessDone(job.proc_pid) then
-
-                ffiutil.terminateSubProcess(job.proc_pid)
-
-            end
-
-        end)
+        pcall(reapSubProcess, job.proc_pid, true)
 
     end
 
@@ -8220,6 +8234,10 @@ function XRead:_doDownloadBook(book)
 
         Trapper:clear()
 
+        -- 轮询已结束：回收子进程。中止或超时时先杀掉，否则它会在后台把整本书
+        -- 继续写完（界面提示「已取消」但导出文件照样生成）。
+        reapSubProcess(pid, user_aborted or os.time() >= deadline)
+
         if user_aborted then
             -- 用户主动中止：子进程可能还在写，清掉进度文件，不要误报「下载失败」
             pcall(os.remove, prog_file)
@@ -8507,6 +8525,10 @@ function XRead:doCacheBook(book, count)
         end
 
         Trapper:clear()
+
+        -- 轮询已结束：回收子进程。中止或超时时先杀掉，否则它还会在后台
+        -- 按 SSE 继续把整本缓存完（可达数小时），用户却以为已经取消了。
+        reapSubProcess(pid, user_aborted or os.time() >= deadline)
 
         if user_aborted then
 
