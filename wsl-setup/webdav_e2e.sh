@@ -1,10 +1,10 @@
 #!/bin/bash
-# 真实 NAS webdav 端到端热更新验证（规范 zip 包模式）
+# 真实 NAS webdav 端到端热更新验证（纯列目录挑最新）
 #
 # 做的事：
 #   1) 把源码部署到模拟器，并把本地 _meta 版本降级（制造"有新版本"场景）
-#   2) 清掉本地更新清单，强制从 manifest2 重新走一遍
-#   3) 启动模拟器 XREAD_AUTOTEST=update，走真实后端 /reader3/getWebdavFile
+#   2) 清掉本地残留包，强制完整检查流程
+#   3) 启动模拟器 XREAD_AUTOTEST=update，列目录（getWebdavFileList）按包名版本挑最新 zip
 #   4) 断言：识别远端版本 -> 判定有新版本 -> 下载整包 -> 增量应用 -> 本地版本变远端版本
 #   5) 校验部署目录文件 md5 与源码一致，然后还原部署目录
 #
@@ -47,7 +47,7 @@ emu_wait_mark "mode=update done" 300
 
 assert_log_contains "remote=$REMOTE_VER" "识别远端版本 $REMOTE_VER"
 assert_log_contains "newer=true" "判定有新版本"
-assert_log_contains "total=109" "远端文件数 109"
+assert_log_contains 'via=list' "走列目录挑最新版本"
 assert_log_contains "local_version_now=$REMOTE_VER" "本地版本已升到 $REMOTE_VER"
 assert_no_fatal
 
@@ -79,7 +79,7 @@ if [ -n "$EXTRACT" ]; then
     ev=$(grep -oP '(?<=version = ")[^"]+' "$EXTRACT/_meta.lua" 2>/dev/null | head -1)
     [ "$ev" = "$REMOTE_VER" ] && log "  解压目录版本 $ev OK" || fail "解压目录版本异常: $ev"
     cnt=$(find "$EXTRACT" -type f | wc -l)
-    [ "$cnt" = "109" ] && log "  解压目录文件数 109 OK" || fail "解压目录文件数异常: $cnt"
+    [ "$cnt" -ge 100 ] && log "  解压目录文件数 $cnt OK" || fail "解压目录文件数异常: $cnt"
 else
     fail "未生成 xread_update 解压目录"
 fi

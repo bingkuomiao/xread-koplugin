@@ -367,18 +367,8 @@ function U.redact_url(value)
     end)
     return text
 end
-function U.free_space(path)
-    path=tostring(path or ".")
-    local pipe=io.popen("df -Pk "..U.shell_quote(path).." 2>/dev/null","r")
-    if not pipe then return nil end
-    local raw=pipe:read("*a") or ""
-    pipe:close()
-    local last
-    for line in raw:gmatch("[^\r\n]+") do last=line end
-    if not last then return nil end
-    local available=last:match("%s(%d+)%s+%d+%%?%s+[^%s]+%s*$")
-    return available and tonumber(available)*1024 or nil
-end
+-- 说明：原来的 U.free_space() 已删除。它靠 io.popen("df -Pk ...") 取剩余空间，
+-- 在 KOReader 的受限环境里不可靠（io.popen 常被禁用），而且全项目无人调用。
 local function semver_parse(value)
     local major, minor, patch, pre = tostring(value or ""):match("^v?(%d+)%.(%d+)%.(%d+)(.*)$")
     if not major then return nil end

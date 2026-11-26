@@ -357,8 +357,9 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
             or placeholder(cover_w, cover_h, book.title, book.author)
     end
     local text_w = math.max(1, inner_w - cover_w - gap)
-    local history_h = UiScale.dp(22, 20, 30)
-    local history_w = book.on_history and math.max(UiScale.dp(52, 46, 72), math.floor(text_w * .31)) or 0
+    -- 右上角刷新按钮（替代原「历史 ›」）：只占一个小图标宽度
+    local history_h = UiScale.dp(24, 22, 32)
+    local history_w = book.on_refresh and UiScale.dp(26, 22, 34) or 0
 
     local author = U.trim(tostring(book.author or ""))
     local category = U.trim(tostring(book.category or ""))
@@ -391,30 +392,45 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
         source_line = "微信读书"
     end
 
-    -- 封面右侧信息：书籍简介（多行自动换行）+ 底部加粗「上次读到第 X 章 · 共 Y 章」
+    -- 封面右侧信息，按参考图自上而下分行：
+    --   作者 · 书源 / 阅读至 N% · 时间 / 上次读到第 X 章 · 共 Y 章 / 简介（多行）
     local intro_text = U.trim(tostring(book.description or book.intro or book.summary or ""))
     if intro_text == "" then intro_text = "暂无简介" end
+    local meta_line = U.trim(tostring(book.meta_line or ""))
+    local progress_line = U.trim(tostring(book.progress_line or ""))
+    local source_line = U.trim(tostring(book.source_line or ""))
     local last_line = U.trim(tostring(book.last_read_text or ""))
     if last_line == "" then last_line = "尚未阅读" end
 
     local info_h = body_h
-    local recent_line_h = math.max(UiScale.dp(20, 18, 28), math.floor(body_h * .105))
-    local last_line_h = recent_line_h * 2   -- 两行：保证「上次读到第 X 章 · 共 Y 章」不截断
-    local intro_h = math.max(1, info_h - last_line_h)
-    -- 右上有「历史 ›」入口时，简介避开该区域宽度，避免首行文字被覆盖
-    local intro_w = history_w > 0 and math.max(1, text_w - history_w) or text_w
+    local line_h = math.max(UiScale.dp(15, 13, 20), math.floor(body_h * .088))
+    local meta_gap = math.max(1, math.floor(line_h * .12))
+    local intro_top = 0
     local info = OverlapGroup:new{dimen = Geom:new{w = text_w, h = info_h}, allow_mirroring = false}
-    info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = 0, TextBoxWidget:new{
+    local function info_line(text, y, bold, size)
+        if text == "" then return end
+        info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = y, TextBoxWidget:new{
+            text = text,
+            face = face("smallinfofont", size or (mini and 8.6 or 9.2), mini and 11.6 or 12.4, mini and 7.2 or 7.8),
+            bold = bold == true,
+            width = text_w, height = line_h, height_adjust = false,
+            height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
+        }}
+    end
+    info_line(meta_line, intro_top, false)
+    if meta_line ~= "" then intro_top = intro_top + line_h + meta_gap end
+    info_line(progress_line, intro_top, true)
+    if progress_line ~= "" then intro_top = intro_top + line_h + meta_gap end
+    info_line(source_line, intro_top, false)
+    if source_line ~= "" then intro_top = intro_top + line_h + meta_gap end
+    info_line(last_line, intro_top, true)
+    if last_line ~= "" then intro_top = intro_top + line_h + meta_gap end
+    local intro_h = math.max(1, info_h - intro_top)
+    local intro_w = history_w > 0 and math.max(1, text_w - history_w) or text_w
+    info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = intro_top, TextBoxWidget:new{
         text = intro_text,
-        face = face("smallinfofont", mini and 9.2 or 9.8, mini and 12.6 or 13.4, mini and 7.8 or 8.2),
+        face = face("smallinfofont", mini and 9.0 or 9.6, mini and 12.2 or 13.0, mini and 7.6 or 8.0),
         width = intro_w, height = intro_h, height_adjust = false,
-        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
-    }}
-    info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = intro_h, TextBoxWidget:new{
-        text = last_line,
-        face = face("smallinfofont", mini and 9.6 or 10.2, mini and 13.0 or 13.8),
-        bold = true,
-        width = text_w, height = last_line_h, height_adjust = false,
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     }}
 
@@ -487,8 +503,10 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
             x_off = frame_inset + pad + cover_w + gap + math.max(0, text_w - history_w),
             y_off = frame_inset + pad,
             tappable(history_w, history_h,
-                Ui.text("历史 ›", history_w, history_h, face("smallinfofont", 9.8, 13.5), {bold = true, fgcolor = Blitbuffer.COLOR_BLACK}),
-                function() if book.on_history then book.on_history() end end),
+                Ui.icon("↻", history_w, history_h, UiScale.dp(15, 12, 20), {
+                    icon_key = "refresh", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+                }),
+                function() if book.on_refresh then book.on_refresh() end end),
         }
     end
     layers[#layers + 1] = tappable(width, height, Widget:new{dimen = Geom:new{w = width, h = height}}, callback, function(anchor)
@@ -522,7 +540,7 @@ local function hero_card_classic(book, width, height, callback, hold_callback, s
     end
     local text_x = cover_w + gap
     local text_w = math.max(1, inner_w - text_x)
-    local history_w = book.on_history and math.max(UiScale.dp(55, 48, 80), math.floor(text_w * .15)) or 0
+    local history_w = book.on_refresh and UiScale.dp(26, 22, 34) or 0
     local title_w = math.max(1, text_w - (history_w > 0 and history_w + UiScale.dp(5, 4, 8) or 0))
     local title_h = math.min(math.floor(inner_h * .27), UiScale.dp(49, 43, 68))
     title_h = math.max(1, title_h)
@@ -598,11 +616,22 @@ local function hero_card_classic(book, width, height, callback, hold_callback, s
         height_adjust=false,height_overflow_show_ellipsis=true,fgcolor=Blitbuffer.COLOR_BLACK,
     })
     if history_w > 0 then
-        put(text_x+text_w-history_w,0,Ui.text('历史 ›',history_w,
-            math.max(UiScale.dp(22,20,30), math.floor(title_h*.58)),
-            face('smallinfofont',9.8,13.5),{bold=true,halign='right'}))
+        put(text_x+text_w-history_w,0,Ui.icon('↻',history_w,
+            math.max(UiScale.dp(22,20,30), math.floor(title_h*.58)), UiScale.dp(15,12,20),
+            {icon_key='refresh',fgcolor=Blitbuffer.COLOR_DARK_GRAY}))
     end
-    local info_lines={table.concat(meta,' · '),progress_text,table.concat(published,' · ')}
+    local info_lines={}
+    for _, value in ipairs({
+        U.trim(tostring(book.meta_line or '')),
+        U.trim(tostring(book.progress_line or progress_text)),
+        U.trim(tostring(book.source_line or '')),
+        clean(book.last_read_text),
+    }) do
+        if value ~= '' then info_lines[#info_lines + 1] = value end
+    end
+    if #info_lines == 0 then
+        info_lines={table.concat(meta,' · '),progress_text,table.concat(published,' · ')}
+    end
     for i,value in ipairs(info_lines) do
         put(text_x,title_h+(i-1)*row_h,TextBoxWidget:new{
             text=value,face=face('smallinfofont',10.5,15),bold=i==2,
@@ -709,8 +738,8 @@ local function hero_card_classic(book, width, height, callback, hold_callback, s
             local x=pos.x-anchor.x-frame_inset-pad
             local y=pos.y-anchor.y-frame_inset-pad
             if x>=0 and y>=0 and x<inner_w and y<inner_h then
-                if book.on_history and x>=text_x+text_w-history_w and y<title_h then
-                    book.on_history();return
+                if book.on_refresh and x>=text_x+text_w-history_w and y<history_h then
+                    book.on_refresh();return
                 end
                 if book.on_intro and intro_available and x>=text_x and y>=intro_y then
                     book.on_intro();return
@@ -1385,8 +1414,9 @@ local function page_footer(width, height, page, pages, on_page)
         borderless = true, font = "cfont", size = 17, maximum = 21,
         fgcolor = page > 1 and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
     }))
+    -- 页码统计不准，去掉中间页码，只保留翻页箭头（占位保持箭头在两端）
     table.insert(row, CenterContainer:new{dimen = Geom:new{w = middle_w, h = height}, TextWidget:new{
-        text = tostring(page) .. " / " .. tostring(pages),
+        text = "",
         face = face("smallinfofont", 9, 12),
         bold = true,
         fgcolor = Blitbuffer.COLOR_BLACK,

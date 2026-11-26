@@ -43,7 +43,7 @@ cp -r "$DEPLOY"/. "$PKG_ROOT/assets/plugin/staging/" \
 sed -i "s/version = \".*\"/version = \"$VER\"/" "$PKG_ROOT/assets/plugin/staging/_meta.lua"
 
 python3 - "$PKG_ROOT/assets/plugin" "$ZIP_NAME" "$VER" <<'PY'
-import hashlib, json, os, sys, zipfile
+import hashlib, json, os, sys, time, zipfile
 root, zip_name, ver = sys.argv[1], sys.argv[2], sys.argv[3]
 staging = os.path.join(root, "staging")
 picks = ["_meta.lua", "main.lua", "xread/updater.lua", "resources/icons/miuread/check.svg"]
@@ -57,13 +57,16 @@ with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
     for it in files:
         z.write(os.path.join(staging, it["path"].replace("/", os.sep)), it["path"])
 blob = open(zpath, "rb").read()
-m = {
-    "version": ver, "build": "20261124133000", "notes": "留存策略测试",
-    "package": zip_name, "package_size": len(blob), "package_md5": hashlib.md5(blob).hexdigest(),
-    "files_count": len(files), "files": files,
-}
-with open(os.path.join(root, "manifest2.json"), "w", encoding="utf-8") as fh:
-    json.dump(m, fh, ensure_ascii=False)
+md5 = hashlib.md5(blob).hexdigest()
+filelist = [{
+    "name": zip_name, "path": "/plugin/" + zip_name,
+    "size": len(blob), "lastModified": int(time.time() * 1000),
+    "md5": md5, "isDirectory": False,
+}]
+with open(os.path.join(root, "filelist.json"), "w", encoding="utf-8") as fh:
+    json.dump(filelist, fh, ensure_ascii=False)
+with open(os.path.join(root, zip_name + ".md5"), "w") as fh:
+    fh.write(md5 + "\n")
 print("retention package:", len(files), "files")
 PY
 
@@ -76,6 +79,7 @@ curl -sf "http://127.0.0.1:$SRV_PORT/assets/plugin/$ZIP_NAME" >/dev/null || fail
 export XREAD_UPDATER_URL="http://127.0.0.1:$SRV_PORT/assets/plugin/"
 emu_start "update"
 emu_wait_mark "mode=update done" 180
+assert_log_contains 'via=list' "走列目录模式"
 assert_log_contains "remote=$VER" "识别远端版本"
 assert_log_contains 'newer=true' "判定有新版本"
 assert_no_fatal

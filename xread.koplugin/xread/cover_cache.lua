@@ -1,19 +1,29 @@
 -- xread.koplugin/xread/cover_cache.lua
--- 封面缓存：下载 coverUrl -> 指定尺寸缩略图 PNG，落到本地缓存目录。
+-- 封面缓存：经后端统一接口取图 -> 指定尺寸缩略图 PNG，落到本地缓存目录。
+-- 统一接口（本地/网络书通用）：GET /reader3/cover?path=<原值>&accessToken=<token>&secureKey=<key>
+--   path 直接放 customCoverUrl || coverUrl 原值，无需区分本地/网络书：
+--   · 网络书：http(s) 封面 URL（后端不读鉴权参数，未登录也能取）
+--   · 本地 EPUB 内嵌封面：/reader3/localEpubAsset?bookUrl=<编码>&path=<编码>（需有效 token）
 -- 缓存 key 带尺寸，界面改版后不会误用旧的小图。
 
-local http = require("socket.http")
+local HttpClient = require("xread/http_client")
 local ltn12 = require("ltn12")
 
 local md5 = require("ffi/sha2").md5
 local util = require("util")
+local lfs = require("libs/libkoreader-lfs")
 
 local CoverCache = {}
 CoverCache.__index = CoverCache
 
-function CoverCache:new(cache_dir, base_url)
+--- @param client_getter function|nil 延迟返回已登录 client（封面鉴权参数 / 401 重登）
+function CoverCache:new(cache_dir, base_url, client_getter)
     util.makePath(cache_dir)
-    return setmetatable({ dir = cache_dir, base_url = base_url }, self)
+    local o = setmetatable({
+        dir = cache_dir, base_url = base_url, client_getter = client_getter,
+    }, self)
+    pcall(o.migrateLegacy, o)     -- 清掉旧命名（纯 md5）的孤儿封面，只做一次
+    return o
 end
 
 function CoverCache:keyFor(book, max_w, max_h)
@@ -26,8 +36,23 @@ function CoverCache:keyFor(book, max_w, max_h)
     return md5(seed)
 end
 
+--- 书籍指纹（DJB2）：让文件名带上「哪本书」这一维，删书时可按前缀批量清理。
+-- 只用 md5(seed) 当文件名时，删书根本找不到这些文件，covers/*.png 永久残留。
+local function bookFingerprint(book)
+    local url = tostring(book.bookUrl or "")
+    local h = 5381
+    for i = 1, #url do
+        h = (h * 33 + url:byte(i)) % 4294967296
+    end
+    return string.format("%08x", h)
+end
+
+function CoverCache:fileNameFor(book, max_w, max_h)
+    return bookFingerprint(book) .. "-" .. self:keyFor(book, max_w, max_h) .. ".png"
+end
+
 function CoverCache:pathFor(book, max_w, max_h)
-    local path = self.dir .. "/" .. self:keyFor(book, max_w, max_h) .. ".png"
+    local path = self.dir .. "/" .. self:fileNameFor(book, max_w, max_h)
     local f = io.open(path, "rb")
     if f then
         local head = f:read(4)
@@ -37,23 +62,63 @@ function CoverCache:pathFor(book, max_w, max_h)
     return nil
 end
 
+--- 删除某本书的全部封面缓存（所有尺寸变体）
+-- 新文件名为 <指纹>-<md5>.png，按前缀扫一遍即可；
+-- 老版本的纯 md5 文件名无法归属到具体书，在 migrateLegacy() 里一次性清掉。
+function CoverCache:removeBook(book)
+    if not book or not book.bookUrl then return 0 end
+    local prefix = bookFingerprint(book) .. "-"
+    local ok, iter, obj = pcall(lfs.dir, self.dir)
+    if not ok then return 0 end
+    local targets = {}
+    for name in iter, obj do
+        if name:sub(1, #prefix) == prefix and name:match("%.png$") then
+            targets[#targets + 1] = self.dir .. "/" .. name
+        end
+    end
+    for _, p in ipairs(targets) do pcall(os.remove, p) end
+    return #targets
+end
+
+--- 一次性清理旧命名（纯 md5）的孤儿封面文件
+-- 旧文件名不带书籍指纹，删书时永远清不掉，只会在磁盘上堆着。
+function CoverCache:migrateLegacy()
+    local marker = self.dir .. "/.schema2"
+    if lfs.attributes(marker, "mode") then return end
+    local ok, iter, obj = pcall(lfs.dir, self.dir)
+    if ok then
+        local targets = {}
+        for name in iter, obj do
+            if name:match("%.png$") and not name:match("^%x%x%x%x%x%x%x%x%-%x+%.png$") then
+                targets[#targets + 1] = self.dir .. "/" .. name
+            end
+        end
+        for _, p in ipairs(targets) do pcall(os.remove, p) end
+    end
+    local f = io.open(marker, "w")
+    if f then
+        f:write("2\n")
+        f:close()
+    end
+end
+
 local function fetch(url)
     local chunks = {}
-    -- 封面走懒加载队列，一张卡太久会拖累翻页交互；比接口超时更紧（临时覆盖）。
-    local saved_timeout = http.TIMEOUT
-    http.TIMEOUT = 8
+    -- 封面走懒加载队列，一张卡太久会拖累翻页交互：单张 8s。
+    -- 超时由 http_client 统一管理（结束后必定恢复全局值，原来这里手写
+    -- saved/restore，一旦 http.request 抛错就永久把全局 TIMEOUT 改成 8）。
     -- 带 Referer 绕过部分站点的防盗链
     local referer = url:match("^(%w+://[^/]+)")
-    local _, code = http.request{
+    local ok, code = HttpClient.request({
         url = url,
         sink = ltn12.sink.table(chunks),
         headers = {
             ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             ["Accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-            referer and ("Referer: " .. referer .. "\r\n") or nil,
+            ["Referer"] = referer,   -- 必须是 key-value，否则 luasocket 不会发送该头
         },
-    }
-    http.TIMEOUT = saved_timeout
+    }, 8)
+    if not ok then return nil, "network error" end
     if tonumber(code) ~= 200 then return nil, "HTTP " .. tostring(code) end
     local data = table.concat(chunks)
     if #data < 100 then return nil, "too small" end
@@ -112,10 +177,39 @@ local function urlencode(s)
     return out
 end
 
--- 走后端 /reader3/cover 代理：由后端带 Referer 抓图，绕过防盗链
-function CoverCache:fetchViaProxy(url)
+--- 构造统一封面接口 URL：后端 getCoverUrl 零判断，所有封面都带鉴权参数。
+--- 远程 URL 后端根本不读鉴权参数（无效/过期 token 不影响），本地书则必须有有效 token。
+function CoverCache:coverApiUrl(source)
     if not self.base_url or self.base_url == "" then return nil, "no base url" end
-    return fetch(self.base_url .. "/reader3/cover?path=" .. urlencode(url))
+    local url = self.base_url .. "/reader3/cover?path=" .. urlencode(source)
+    local client = self.client_getter and self.client_getter()
+    if client then
+        if client.accessToken then
+            url = url .. "&accessToken=" .. urlencode(client.accessToken)
+        end
+        if client.secureKey then
+            url = url .. "&secureKey=" .. urlencode(client.secureKey)
+        end
+        if client.userNS then
+            url = url .. "&userNS=" .. urlencode(client.userNS)
+        end
+    end
+    return url
+end
+
+--- 统一封面接口取图；本地书 401（token 过期）时重登一次并重试。
+function CoverCache:fetchViaProxy(url, _retried)
+    local api_url, err = self:coverApiUrl(url)
+    if not api_url then return nil, err end
+    local data, ferr = fetch(api_url)
+    if not data and ferr == "HTTP 401" and not _retried then
+        local client = self.client_getter and self.client_getter()
+        if client and client.username and client.password then
+            local ok = pcall(function() client:login(client.username, client.password) end)
+            if ok then return self:fetchViaProxy(url, true) end
+        end
+    end
+    return data, ferr
 end
 
 -- KOReader 能解码的图片格式预检：后端 cover 代理可能返回 AVIF（不支持），
@@ -132,27 +226,39 @@ local function isSupportedImage(data)
     return false
 end
 
+-- 正在下载的封面 key：两套封面队列（prepareCovers 与封面重试循环）会同时
+-- 请求同一张图，重复请求白耗流量，两路同时 writePNG 还可能写出坏图。
+local inflight = {}
+
 function CoverCache:fetchAndStore(book, url, max_w, max_h)
     local existing = self:pathFor(book, max_w, max_h)
     if existing then return existing end
-    -- WebUI 同款优先级：用户自定义封面 > 书源封面
-    url = url or book.customCoverUrl or book.coverUrl
-    if not url or url == "" then return nil, "no url" end
-    local data, err
-    if url:sub(1, 4):lower() == "http" then
-        data, err = fetch(url)
-        if not data and self.base_url then
-            -- 直连失败（防盗链/超时）：回退后端代理（代理可能转 AVIF，后面预检会拦）
-            data, err = self:fetchViaProxy(url)
+
+    local key = self:keyFor(book, max_w, max_h)
+    if inflight[key] then return nil, "inflight" end
+    inflight[key] = true
+
+    local ok, path, err = pcall(function()
+        -- WebUI 同款优先级：用户自定义封面 > 调用方给的封面 > 书源封面。
+        -- 调用点传的是 book.coverUrl，这里让 customCoverUrl 优先，
+        -- 否则本地书匹配到的网络封面（写进 customCoverUrl）会被内嵌封面路径盖掉。
+        local source = book.customCoverUrl or url or book.coverUrl
+        if not source or source == "" then return nil, "no url" end
+        -- 统一走后端 /reader3/cover：本地书由后端鉴权读包内封面，网络书由后端代理抓取并缓存。
+        local data, ferr = self:fetchViaProxy(source)
+        -- 网络书兜底：后端代理不可用时直连原 URL（本地相对路径无法直连）。
+        if not data and source:sub(1, 4):lower() == "http" then
+            data, ferr = fetch(source)
         end
-    else
-        -- 相对路径（如 /reader3/localEpubAsset...）：拼后端地址
-        if not self.base_url or self.base_url == "" then return nil, "no base url" end
-        data, err = fetch(self.base_url .. url)
-    end
-    if not data then return nil, err end
-    if not isSupportedImage(data) then return nil, "unsupported image format" end
-    return self:storeFromData(book, data, max_w, max_h)
+        if not data then return nil, ferr end
+        if not isSupportedImage(data) then return nil, "unsupported image format" end
+        return self:storeFromData(book, data, max_w, max_h)
+    end)
+
+    inflight[key] = nil
+
+    if not ok then return nil, tostring(path) end
+    return path, err
 end
 
 return CoverCache

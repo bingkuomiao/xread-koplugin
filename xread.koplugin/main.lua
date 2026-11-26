@@ -33,7 +33,8 @@ local util         = require("util")
 
 local lfs          = require("libs/libkoreader-lfs")
 
-local http         = require("socket.http")
+-- 不再直接 require("socket.http")：所有请求都经 xread/client 与 xread/http_client，
+-- 那里给每个请求单独设超时并保证恢复全局值，绝不在插件里改写 http.TIMEOUT。
 
 local logger       = require("logger")
 
@@ -66,13 +67,30 @@ local QuickPanel = require("xread.quick_panel")
 
 local ReadingStats = require("xread.reading_stats")
 
+local UICommon = require("xread.ui_common")
+local BookExport = require("xread.book_export")
+
+--- 插件版本：唯一来源是插件根目录的 _meta.lua
+-- 原来这里硬编码 "0.6.10"，升级到 0.6.13 后关于页/更新提示仍显示旧版本，
+-- 两个版本号迟早会再次对不上，所以直接读 _meta.lua。
+local function readPluginVersion()
+    local src = debug.getinfo(1, "S").source or ""
+    if src:sub(1, 1) == "@" then src = src:sub(2) end
+    local root = src:match("^(.*[/\\])") or ""
+    local ok, meta = pcall(dofile, root .. "_meta.lua")
+    if ok and type(meta) == "table" and meta.version then
+        return tostring(meta.version)
+    end
+    return "0.0.0"
+end
+
 local XRead = WidgetContainer:extend{
 
     name = "xread",
 
     is_doc_only = false,
 
-    version = "0.5.0",
+    version = readPluginVersion(),
 
 }
 
@@ -180,6 +198,71 @@ local function safeFileName(name)
 
 end
 
+--- 本地整本缓存的文件名主干：书名 + bookUrl 指纹
+-- 只用书名时，不同书源的**同名书**会共用同一个 .html/.cbz 文件：
+-- 后台缓存 A 书会覆盖 B 书的文件，打开时读到的是另一本书的正文。
+-- 指纹用 DJB2（与 chapter_cache 一致），保证同名不同源互不干扰。
+local function bookCacheStem(book)
+
+    local url = tostring(book.bookUrl or book.origin or "")
+
+    local h = 5381
+
+    for i = 1, #url do
+
+        h = (h * 33 + url:byte(i)) % 4294967296
+
+    end
+
+    return safeFileName(book.name) .. "_" .. string.format("%08x", h)
+
+end
+
+--- 删除某本书在 BOOK_DIR 下的整本缓存文件（.html / .cbz）
+-- 删书时原来只清了章节分片和目录缓存，整本缓存的 html/cbz 会一直留在磁盘上。
+-- 同时兼容旧命名（只有书名），避免历史文件变成永久孤儿。
+local function removeBookCacheFiles(book)
+
+    local prefixes = {
+
+        bookCacheStem(book) .. "_",
+
+        safeFileName(book.name) .. "_",
+
+    }
+
+    local ok, iter, obj = pcall(lfs.dir, BOOK_DIR)
+
+    if not ok then return 0 end
+
+    local targets = {}
+
+    for name in iter, obj do
+
+        if name:match("%.html$") or name:match("%.cbz$") then
+
+            for _, p in ipairs(prefixes) do
+
+                if name:sub(1, #p) == p then
+
+                    targets[#targets + 1] = BOOK_DIR .. "/" .. name
+
+                    break
+
+                end
+
+            end
+
+        end
+
+    end
+
+    for _, f in ipairs(targets) do pcall(os.remove, f) end
+
+    return #targets
+
+end
+
 local function fileSize(path)
 
     if not path then return 0 end
@@ -245,6 +328,21 @@ local function restoreEndPopup()
 
 end
 
+-- 丢掉已经排队的重绘请求。热加载/换文档会「先关旧文档、再开新文档」，
+-- 中间若有重绘，就会把底下的书架/首页画出来（真机表现为正文翻到本批末尾闪一下书架）。
+-- 清掉脏区让墨水屏保持上一页，等新文档 show 时自己重绘。
+local function drop_pending_repaint()
+
+    pcall(function()
+
+        UIManager._dirty = {}
+
+        UIManager._refresh_func_stack = {}
+
+    end)
+
+end
+
 -- 热加载同一个文件（追加了新章节后用），要避免把它当成“退出书籍”而中断后台缓存
 local function hotReload(ui, path)
 
@@ -252,59 +350,115 @@ local function hotReload(ui, path)
 
     SHARED.reloading = true
 
-    local ok, err = pcall(function() ui:reloadDocument(nil, true) end)
+    -- 加载期间屏蔽触摸，避免连点把这一下算到新文档上
+    if Device.input and Device.input.inhibitInputUntil then
+
+        Device.input:inhibitInputUntil(1.0)
+
+    end
+
+    local ok, err = pcall(function()
+
+        -- after_close_callback 在旧文档关掉、新文档加载前执行：在这里清重绘
+        ui:reloadDocument(function() drop_pending_repaint() end, true)
+
+    end)
 
     SHARED.reloading = false
 
-    if not ok then logger.warn("xread hot reload failed:", tostring(err)) end
+    if not ok then
+
+        logger.warn("xread hot reload failed:", tostring(err))
+
+        -- 失败兜底：保证最终能刷回来，不要停在旧画面
+        UIManager:scheduleIn(0.2, function()
+
+            if UIManager._exit_code == nil then UIManager:setDirty("all", "full") end
+
+        end)
+
+    end
 
 end
 -- ---------- UI 辅助 ----------
 
-function XRead:showInfo(text)
+-- 统一提示：默认 4s 自动消失；需要用户读的内容（如连接回执、更新完成）可传更长超时
+function XRead:showInfo(text, timeout)
 
-    UIManager:show(InfoMessage:new{ text = text, timeout = 4 })
+    UIManager:show(InfoMessage:new{ text = text, timeout = timeout or 4 })
 
 end
 
-function XRead:runOnline(label, fn)
+-- 后台同步网络任务是否该让路：首页/书架之上盖了弹层（更多/设置/账号等）时，
+-- 同步 HTTP 会卡住 UI 线程，导致弹层里的点击要等十几秒才有反应。
+-- 判定方式：栈顶可见 widget 不是首页/书架视图本身，就认为有弹层，后台任务改期。
+function XRead:_uiHasOverlay()
+    local top = UIManager:getTopmostVisibleWidget()
+    if not top then return false end
+    if top == self._home_view or top == self._shelf_view then return false end
+    return true
+end
 
-    local UI = require("ui/trapper")
-
-    Trapper:wrap(function()
-
-        UI:info(label)
-
-        local ok, err = pcall(fn)
-
-        UI:clear()
-
-        if not ok then
-
-            local msg = tostring(err)
-
-            logger.warn("xread runOnline error:", msg)
-
-            -- 脱敏：异常里可能带 URL/token，只保留最后一段可读信息
-
-            if msg:find("后端返回", 1, true) then
-
-                msg = msg:match("(后端返回[^|]+)") or msg
-
-            end
-
-            self:showInfo(_("出错：") .. msg)
-
+-- 同步网络后台任务：弹层打开期间改期再跑（每 1.5s 重试，最多等 60s 就放弃）。
+-- 这些请求阻塞 UI 线程，若在弹层里触发，点选项会卡到请求结束才响应。
+function XRead:_scheduleNetJob(delay, job, max_wait)
+    local waited = 0
+    local function attempt()
+        if self:_uiHasOverlay() and waited < (max_wait or 60) then
+            waited = waited + 1.5
+            UIManager:scheduleIn(1.5, attempt)
+            return
         end
-
-    end)
-
+        job()
+    end
+    UIManager:scheduleIn(delay or 0, attempt)
 end
 
--- 静默版 runOnline：不弹"加载中"模态框，出错才提示。
--- 用于书架/首页/开书/目录等浏览类操作——弹窗会吞掉用户点击并触发
--- Trapper 的 Paused 确认框；静默模式下任务期间点击只是排队，
--- 任务结束后立即生效，不再被弹窗挡住。
+-- 统一的后台执行入口：一律静默，只有失败才弹一次错误提示。
+-- 不弹「加载中/正在…」模态框——弹窗会吞掉用户点击并触发 Trapper 的
+-- Paused 确认框；静默模式下任务期间的点击只是排队，任务结束后立即生效。
+-- 验收用高精度时间戳（socket 可用时到毫秒，否则退到秒）
+local function autotest_now()
+    local ok, socket = pcall(require, "socket")
+    if ok and socket and socket.gettime then
+        return string.format("%.3f", socket.gettime())
+    end
+    return tostring(os.time())
+end
+
+-- 毫秒时间戳：测连接耗时、更新进度节流都用它（socket 不可用时退到秒级）
+local function now_ms()
+    local ok, socket = pcall(require, "socket")
+    if ok and socket and socket.gettime then
+        return socket.gettime() * 1000
+    end
+    return os.time() * 1000
+end
+
+-- 把底层异常洗成人话：去掉 client.lua:141: 这类源码位置、URL，
+-- 常见网络错误映射成中文；其余保留原文并截断
+local function readable_error(msg)
+    local s = tostring(msg or "")
+    s = s:gsub("[%w_%-%./]+%.lua:%d+:%s*", "")
+    s = s:gsub("https?://%S+", _("（服务器地址）"))
+    s = s:gsub("%s+", " ")
+    local low = s:lower()
+    if low:find("endpoint is not connected", 1, true)
+            or low:find("connection refused", 1, true)
+            or low:find("connect failed", 1, true) then
+        return _("无法连接服务器（地址或端口不通）")
+    elseif low:find("timed out", 1, true) or low:find("timeout", 1, true) then
+        return _("连接超时（服务器无响应）")
+    elseif low:find("name or service not known", 1, true)
+            or low:find("host not found", 1, true) then
+        return _("服务器地址无法解析")
+    elseif low:find("network is unreachable", 1, true) then
+        return _("网络不可达（检查 Wi-Fi）")
+    end
+    if #s > 90 then s = s:sub(1, 90) .. "…" end
+    return s
+end
+
 function XRead:runQuiet(fn)
 
     Trapper:wrap(function()
@@ -325,6 +479,8 @@ function XRead:runQuiet(fn)
 
             end
 
+            msg = readable_error(msg)
+
             self:showInfo(_("出错：") .. msg)
 
         end
@@ -336,11 +492,27 @@ end
 
 function XRead:ensureLogin()
 
-    if self.client.accessToken then return true end
-
     local user = self:getSetting("username", "")
 
     local pass = self:getSetting("password", "")
+
+    local address = tostring(self:getSetting("address", "") or "")
+
+    -- token 必须属于「当前地址 + 当前账号」。原来只判 token 非空：
+    -- 换后端地址后仍带着旧服务器的 token → 全部接口 401 → 插件看起来"书架为空/目录为空"，
+    -- 必须改一次设置或重启才恢复。
+    local token_valid = self.client.accessToken ~= nil
+        and self._token_addr == address
+        and self._token_user == tostring(user)
+
+    if token_valid then return true end
+
+    if self.client.accessToken ~= nil then
+        -- 归属不符：作废旧 token，走重新登录
+        self.client.accessToken = nil
+        self.client.secureKey = nil
+        self.client.userNS = nil
+    end
 
     if user == "" or pass == "" then
 
@@ -350,17 +522,99 @@ function XRead:ensureLogin()
 
     end
 
+    self.client.address = address
+
     local ok, err = pcall(function() self.client:login(user, pass) end)
 
     if not ok then
 
-        self:showInfo(_("登录失败：") .. tostring(err))
+        self:showInfo(_("登录失败：") .. readable_error(err))
 
         return false
 
     end
 
+    self._token_addr = address
+
+    self._token_user = tostring(user)
+
     return true
+
+end
+
+-- 账号管理/设置页保存后统一同步登录态：
+-- 用户名、密码或地址变了就清掉旧 token 并用新账号重登，换账号同时清掉旧书架缓存，
+-- 否则首页/地址管理/封面下载/更新检查仍会带着上一个账号的 token 和用户名。
+-- defer_login=true 时把 login 推迟到下一个事件循环：saveAndClose 里同步登录
+-- （最长 12s）会让「点空白关闭设置页」看起来像假死。
+function XRead:_syncCredentials(old_username, old_password, old_address, defer_login)
+
+    local username = tostring(self:getSetting("username", "") or "")
+
+    local password = tostring(self:getSetting("password", "") or "")
+
+    local address = tostring(self:getSetting("address", "") or "")
+
+    local changed = username ~= tostring(old_username or "")
+
+        or password ~= tostring(old_password or "")
+
+        or address ~= tostring(old_address or "")
+
+    if not changed then return end
+
+    self.client.address = address
+
+    self.client.username = username
+
+    self.client.password = password
+
+    self.client.accessToken = nil
+
+    self.client.secureKey = nil
+
+    self.client.userNS = nil
+
+    self._token_addr = nil
+
+    self._token_user = nil
+
+    -- 换账号**或换服务器地址**都要清书架缓存：
+    -- 只清用户名的情况，改地址后会继续显示上一个服务器的书架。
+    if username ~= tostring(old_username or "") or address ~= tostring(old_address or "") then
+
+        pcall(function() self.meta_cache:clearShelf() end)
+
+    end
+
+    local function doLogin()
+
+        local ok, err = pcall(function() self.client:login(username, password) end)
+
+        if not ok then
+
+            self:showInfo(_("账号已保存，但重新登录失败：") .. readable_error(err))
+
+        else
+
+            self._token_addr = address
+
+            self._token_user = username
+
+        end
+
+    end
+
+    if defer_login then
+
+        -- 先让设置页关掉、界面重绘完，再去登录
+        UIManager:scheduleIn(0.3, function() pcall(doLogin) end)
+
+    else
+
+        doLogin()
+
+    end
 
 end
 -- ---------- 菜单排序：把“阅读X”挪到微信读书下面 ----------
@@ -436,14 +690,6 @@ function XRead:hookMenuOrder()
 
         pcall(moveItemAfter, m.tab_item_table, "xread", "weread")
 
-        -- 阅读界面里的两个入口提到导航页最上面，省得翻页找
-
-        pcall(moveItemAfter, m.tab_item_table, "xread_reader_catalog", "table_of_contents")
-
-        pcall(moveItemAfter, m.tab_item_table, "xread_reader_shelf", "xread_reader_catalog")
-
-        pcall(moveItemAfter, m.tab_item_table, "xread_reader_stats", "xread_reader_shelf")
-
     end
 
 end
@@ -455,9 +701,13 @@ function XRead:init()
 
     util.makePath(BOOK_DIR)
 
+    -- 第三个参数是延迟 client getter：封面鉴权参数在本地书取图时才需要，
+    -- 此时 SHARED.client 已由下面的 init 流程创建并登录。
     self.cover_cache = CoverCache:new(BOOK_DIR .. "/covers",
 
-        self:getSetting("address", "http://192.168.31.51:7777"))
+        self:getSetting("address", "http://192.168.31.51:7777"),
+
+        function() return SHARED.client end)
 
     self.chapter_cache = ChapterCache:new(BOOK_DIR .. "/chapters")
 
@@ -498,6 +748,26 @@ function XRead:init()
         -- 仅验收用：XREAD_AUTOTEST_FLOW=panel|shelf|catalog，进书后自动跑一遍
 
         local flow = os.getenv("XREAD_AUTOTEST_FLOW")
+
+        -- 跳章会重建 ReaderUI（插件 init 会再跑一遍）：验收 flow 只允许执行一次，
+        -- 否则 catalog_jump 会无限跳章。生产环境没有该环境变量，不受影响。
+        if flow and flow ~= "" and os.getenv("XREAD_AUTOTEST_ONCE") == "1" then
+
+            local flow_flag = "/tmp/xread_flow_once"
+
+            if lfs.attributes(flow_flag, "mode") == "file" then
+
+                flow = nil
+
+            else
+
+                local fh = io.open(flow_flag, "w")
+
+                if fh then fh:write("1"); fh:close() end
+
+            end
+
+        end
 
         -- 验收标记：仅供 tests/ 下的自动测试判定动作是否真的执行完
         local autotest_mark = function(tag)
@@ -618,16 +888,6 @@ function XRead:init()
 
             end)
 
-        elseif flow == "more_cache" then
-
-            UIManager:scheduleIn(4, function()
-
-                self:showCacheManage()
-
-                autotest_mark("flow=more_cache done")
-
-            end)
-
         elseif flow == "more_page" then
 
             UIManager:scheduleIn(4, function()
@@ -645,6 +905,90 @@ function XRead:init()
                 self:showAboutPanel()
 
                 autotest_mark("flow=more_about done")
+
+            end)
+
+        elseif flow == "home_btn" then
+
+            -- 验收：正文工具栏「首页」按钮（closeBookToHome），而不是原生文件管理器
+            UIManager:scheduleIn(16, function()
+
+                self:closeBookToHome()
+
+                autotest_mark("flow=home_btn done")
+
+            end)
+
+        elseif flow == "update_spam" then
+
+            -- 验收：连点「检查更新」不应叠出多个确认框
+            UIManager:scheduleIn(4, function()
+
+                self:showAboutPanel()
+
+                UIManager:scheduleIn(3, function()
+
+                    for k = 1, 4 do
+
+                        UIManager:scheduleIn(k * 0.3, function()
+
+                            self:checkForUpdateInteractive()
+
+                        end)
+
+                    end
+
+                    autotest_mark("flow=update_spam done")
+
+                end)
+
+            end)
+
+        elseif flow == "confirm_native" then
+
+            -- 验收：原生 ConfirmBox 在夜间模式下的背景是否不透字（对照用）
+            UIManager:scheduleIn(6, function()
+
+                UIManager:show(ConfirmBox:new{ text = "native confirm background test", ok_text = "OK" })
+
+                autotest_mark("flow=confirm_native done")
+
+            end)
+
+        elseif flow == "reload" then
+
+            -- 验收：热加载（追加章节后 reload）期间不得露出书架/首页
+            UIManager:scheduleIn(16, function()
+
+                hotReload(self.ui, SHARED.txt_path)
+
+                autotest_mark("flow=reload done")
+
+            end)
+
+        elseif flow == "catalog_jump" then
+
+            -- 验收：目录点章节（目录保持到新文档就绪）
+            UIManager:scheduleIn(4, function()
+
+                self:showReaderCatalog()
+
+                UIManager:scheduleIn(2, function()
+
+                    local book, chapters = SHARED.book, SHARED.chapters
+
+                    local idx = math.min((SHARED.index or 1) + 1,
+                        chapters and #chapters or 1)
+
+                    if self._catalog_view then
+
+                        self:jumpToChapterFromCatalog(self._catalog_view, book, chapters, idx)
+
+                    end
+
+                    autotest_mark("flow=catalog_jump done")
+
+                end)
 
             end)
 
@@ -728,9 +1072,26 @@ function XRead:init()
 
     end
 
+    -- 验收脚本可延后几秒再自动进入：启动瞬间进入会被 FileManager 的首帧盖住
+    local autotest_delay = tonumber(os.getenv("XREAD_AUTOTEST_DELAY") or "0") or 0
+
+    local function autotest_go(fn)
+
+        if autotest_delay > 0 then
+
+            UIManager:scheduleIn(autotest_delay, fn)
+
+        else
+
+            UIManager:nextTick(fn)
+
+        end
+
+    end
+
     if autotest == "home" then
 
-        UIManager:nextTick(function()
+        autotest_go(function()
 
             self:openHome()
 
@@ -741,9 +1102,9 @@ function XRead:init()
     elseif autotest == "update" then
 
         -- 在线热更新全流程验收：依赖 XREAD_UPDATER_URL 指向测试更新服务
-        -- （fetch manifest -> diff -> apply -> 校验本地版本 -> 退出）
+        -- （列目录挑最新 zip -> 下载 -> 解压增量替换 -> 校验本地版本 -> 退出）
 
-        UIManager:nextTick(function()
+        autotest_go(function()
 
             Trapper:wrap(function()
 
@@ -792,7 +1153,9 @@ function XRead:init()
 
                     .. " total=" .. tostring(info.total)
 
-                    .. " skipped=" .. tostring(info.skipped))
+                    .. " skipped=" .. tostring(info.skipped)
+
+                    .. " via=" .. tostring(info.via))
 
                 local changed, skipped = 0, info.skipped
 
@@ -838,9 +1201,203 @@ function XRead:init()
 
         end)
 
+    elseif autotest == "localupdate" then
+
+        -- 本地包热更新验收：把规范命名的 zip/tar.gz/tgz 放到插件目录内，
+        -- checkLocal 自动发现并安装（不联网）
+
+        autotest_go(function()
+
+            self:runQuiet(function()
+
+                local updater = require("xread/updater"):new{ client = self.client }
+
+                local manifest, info = updater:checkLocal()
+
+                if not manifest then
+
+                    print("[XREAD_AUTOTEST] localupdate: no newer local package")
+
+                    UIManager:quit()
+
+                    return
+
+                end
+
+                print("[XREAD_AUTOTEST] localupdate check: local=" .. tostring(info.local_version)
+
+                    .. " remote=" .. tostring(info.remote_version)
+
+                    .. " newer=" .. tostring(info.newer)
+
+                    .. " via=" .. tostring(info.via))
+
+                local ok_apply, changed, skipped = pcall(function()
+
+                    return updater:applyLocalPackage(manifest, function() end)
+
+                end)
+
+                if not ok_apply then
+
+                    print("[XREAD_AUTOTEST] localupdate apply failed: " .. tostring(changed))
+
+                    UIManager:quit()
+
+                    return
+
+                end
+
+                print("[XREAD_AUTOTEST] localupdate applied: changed=" .. tostring(changed)
+
+                    .. " skipped=" .. tostring(skipped)
+
+                    .. " local_version_now=" .. tostring(updater:getLocalVersion()))
+
+                print("[XREAD_AUTOTEST] mode=localupdate done")
+
+                UIManager:quit()
+
+            end)
+
+        end)
+
+    elseif autotest == "updateui" then
+
+        -- UI 链路验收：检查更新 → 唯一确认框（更新并重启）→ 安装进度 → 自动重启
+        -- 前置：插件目录内放一个更高版本的本地包；确认框由测试脚本点击
+
+        autotest_go(function()
+
+            print("[XREAD_AUTOTEST] mode=updateui start")
+
+            self:checkForUpdateInteractive()
+
+        end)
+
+    elseif autotest == "healthui" then
+
+        -- UI 验收：测试连接的成功/失败回执长什么样
+
+        autotest_go(function()
+
+            print("[XREAD_AUTOTEST] mode=healthui start")
+
+            self:testConnection()
+
+        end)
+
+    elseif autotest == "shelfback" then
+
+        -- 验收：首页 → 书架 → 点返回，是否真的回到首页（且首页只有一份）
+        autotest_go(function()
+
+            self:runQuiet(function()
+
+                if not self:ensureLogin() then return end
+
+                local books = self.client:getBookshelf()
+
+                if not books or #books == 0 then return end
+
+                self:showHome(1)
+
+                UIManager:scheduleIn(3, function()
+
+                    self:openShelf()
+
+                    UIManager:scheduleIn(4, function()
+
+                        local shelf = SHARED.shelf_view
+
+                        print("[XREAD_AUTOTEST] shelfback: shelf_open="
+
+                            .. tostring(shelf ~= nil and not shelf._miu_closed))
+
+                        if shelf then pcall(function() shelf:_back() end) end
+
+                        UIManager:scheduleIn(3, function()
+
+                            local home = self._home_view
+
+                            print("[XREAD_AUTOTEST] shelfback: home_alive="
+
+                                .. tostring(home ~= nil and not home._miu_closed)
+
+                                .. " shelf_closed=" .. tostring(SHARED.shelf_view == nil))
+
+                            print("[XREAD_AUTOTEST] mode=shelfback done")
+
+                        end)
+
+                    end)
+
+                end)
+
+            end)
+
+        end)
+
+    elseif autotest == "opentime" then
+
+        -- 验收：开书耗时（XREAD_AUTOTEST_ENTRY=home|shelf），用于对比两个入口
+        autotest_go(function()
+
+            self:runQuiet(function()
+
+                if not self:ensureLogin() then return end
+
+                local books = self.client:getBookshelf()
+
+                if not books or #books == 0 then return end
+
+                books = BookFilter.filterReadable(books)
+
+                local want = os.getenv("XREAD_AUTOTEST_BOOK")
+
+                local pick = books[1]
+
+                for _i, b in ipairs(books) do
+
+                    if want and want ~= "" and tostring(b.name or ""):find(want, 1, true) then
+
+                        pick = b
+
+                        break
+
+                    end
+
+                end
+
+                local entry = os.getenv("XREAD_AUTOTEST_ENTRY") or "shelf"
+
+                if entry == "home" then
+
+                    self:showHome(1)
+
+                else
+
+                    self:showBookshelf(1, books)
+
+                end
+
+                UIManager:scheduleIn(4, function()
+
+                    print("[XREAD_AUTOTEST] opentime: entry=" .. entry
+
+                        .. " book=" .. tostring(pick.name) .. " t0=" .. autotest_now())
+
+                    self:openBook(pick)
+
+                end)
+
+            end)
+
+        end)
+
     elseif autotest == "shelf" or autotest == "open" then
 
-        UIManager:nextTick(function()
+        autotest_go(function()
 
             self:runQuiet(function()
 
@@ -928,6 +1485,9 @@ function XRead:init()
     end
 
 end
+-- ---------- 主菜单 ----------
+
+-- ---------- 主菜单 ----------
 function XRead:addToMainMenu(menu_items)
 
     -- 只保留一个「阅读X」入口：点开直接弹功能页（与原「阅读X · 更多」一致），不再单列「更多」
@@ -975,17 +1535,7 @@ function XRead:addToMainMenu(menu_items)
 
                 text = _("测试连接"),
 
-                callback = function()
-
-                    self:runOnline(_("正在测试连接…"), function()
-
-                        local res = self.client:health()
-
-                        self:showInfo(res and res.isSuccess and _("连接成功") or _("连接失败"))
-
-                    end)
-
-                end,
+                callback = function() self:testConnection() end,
 
             },
 
@@ -1001,36 +1551,65 @@ function XRead:addToMainMenu(menu_items)
 
     }
 
-    -- 阅读界面里的入口：放在第一页“导航”里，少翻几层
+end
 
-    if self.ui.document then
+-- 测试连接：成功回报「地址 + 耗时」，失败回报原因（脱敏截断）
+-- 菜单和验收脚本共用这一条路径，避免两处逻辑漂移
+function XRead:testConnection()
 
-        menu_items.xread_reader_catalog = {
+    self:runQuiet(function()
 
-            text = _("阅读X · 目录 / 跳章"),
+        local addr = tostring(self.client.address or "")
 
-            sorting_hint = "navi",
+        addr = addr:gsub("^https?://", ""):gsub("/+$", "")
 
-            callback = function() self:showReaderCatalog() end,
+        if addr == "" then addr = _("未设置") end
 
-        }
+        local t0 = now_ms()
 
-        menu_items.xread_reader_shelf = {
+        local ok, res = pcall(function() return self.client:health() end)
 
-            text = _("阅读X · 书架"),
+        local ms = math.floor(now_ms() - t0 + 0.5)
 
-            sorting_hint = "navi",
+        local good = ok and type(res) == "table" and res.isSuccess ~= false
 
-            callback = function() self:openShelf() end,
+        if good then
 
-        }
+            logger.info("xread health ok", ms, "ms")
 
-    end
+            -- 成功也给回执：结论 + 地址 + 耗时，能判断是否连错了机器
+            self:showInfo(T(_("连接成功\n%1\n耗时 %2 ms"), addr, tostring(ms)), 6)
+
+            return
+
+        end
+
+        local reason
+        if not ok then
+            reason = tostring(res)
+        elseif type(res) == "table" then
+            reason = tostring(res.errorMsg or "")
+        else
+            reason = ""
+        end
+        if reason == "" then reason = _("后端无响应") end
+
+        reason = readable_error(reason)
+
+        logger.warn("xread health failed:", reason)
+
+        self:showInfo(T(_("连接失败\n%1\n耗时 %2 ms\n原因：%3"), addr, tostring(ms), reason), 6)
+
+    end)
 
 end
 -- ---------- 主菜单 ----------
 
 function XRead:openShelf()
+
+    -- 书架会盖在首页上面（返回时能瞬间回家）：先停首页心跳，
+    -- 否则它每 30s 发一次 health（同步阻塞，最长 3s）会拖慢书架上的点书
+    self:_stopHomeTicker()
 
     -- 缓存优先：本地书架先秒开，网络刷新放到后台，不阻塞界面
     local ttl = tonumber(self:getSetting("shelf_cache_ttl", "300")) or 300
@@ -1043,7 +1622,17 @@ function XRead:openShelf()
 
         self:showBookshelf(self._shelf_page or 1, cached)
 
-        self:_refreshShelfInBackground()
+        -- 节流：缓存仍在 TTL 内时不必每次进书架都打一次全量 getBookshelf。
+        -- 反复进出会排队多个同步请求（每个 12s 超时），点书就变慢。
+        local last = self._shelf_refresh_at or 0
+
+        if os.time() - last >= 60 then
+
+            self._shelf_refresh_at = os.time()
+
+            self:_refreshShelfInBackground()
+
+        end
 
         return
 
@@ -1051,7 +1640,18 @@ function XRead:openShelf()
 
     self:runQuiet(function()
 
-        if self:ensureLogin() then self:showBookshelf() end
+        if self:ensureLogin() then
+
+            self:showBookshelf()
+
+        else
+
+            -- 书架没打开：把刚停掉的首页心跳放回去，别让首页时钟一直停着
+            local home = self._home_view
+
+            if home and not home._miu_closed then self:_startHomeTicker(home) end
+
+        end
 
     end)
 
@@ -1060,10 +1660,16 @@ end
 -- 后台静默刷新书架元数据：只写缓存，不重建当前界面（避免点书/翻页时被闪掉）
 function XRead:_refreshShelfInBackground()
 
-    -- 错峰：书架刚显示时用户可能马上点书，刷新延后 2s 且受 http.TIMEOUT 限制
-    UIManager:scheduleIn(2, function()
+    -- 错峰：书架刚显示时用户可能马上点书，刷新延后 2s；
+    -- 超时由 xread/http_client 统一给（默认 12s），不再动全局 http.TIMEOUT
+    self:_scheduleNetJob(2, function()
 
         if not self.client.accessToken then return end
+
+        -- 已经在开书就别抢网络：开书用的也是同步请求，会互相等
+        if self._opening_book or SHARED.open_path then return end
+
+        if self:_uiHasOverlay() then return end
 
         local ok, books = pcall(function() return self.client:getBookshelf() end)
 
@@ -1079,50 +1685,105 @@ function XRead:_refreshShelfInBackground()
 
 end
 
--- 书架/首页显示后预取「最近在读那本」的章节目录，下次点它可秒开
-function XRead:_prefetchRecentChapters(books)
+-- 后台取一本书的章节目录并写缓存（错峰调度用；失败无声，下次再补）
+function XRead:_bgFetchChapters(book, delay)
 
-    if os.getenv("XREAD_NO_PREFETCH") == "1" then return end
+    -- 记下排队时的代次：开书/重建页面会 +1，排队的预取自动作废，
+    -- 不再和「开书」抢网络（这些请求是同步阻塞 UI 线程的）
+    local gen = self._prefetch_generation or 0
 
-    local target
+    self:_scheduleNetJob(delay, function()
 
-    for _, b in ipairs(books) do
+        if (self._prefetch_generation or 0) ~= gen then return end
 
-        local dur = tonumber(b.durChapterIndex) or 0
-
-        if dur > 0 and (not target or dur > (tonumber(target.durChapterIndex) or 0)) then
-
-            target = b
-
-        end
-
-    end
-
-    if not target or self.meta_cache:getChapters(target) then
-
-        self:quietUpdateCheck(10)
-
-        return
-
-    end
-
-    UIManager:scheduleIn(5, function()
+        if SHARED.open_path or self._opening_book then return end
 
         if not self.client.accessToken then return end
 
-        local ok, chapters = pcall(function() return self.client:getChapterList(target) end)
+        -- 弹层正开着（更多/设置/账号等）时再确认一次，避免改期期间刚好好打开
+        if self:_uiHasOverlay() then return end
+
+        local ok, chapters = pcall(function() return self.client:getChapterList(book) end)
 
         if ok and chapters and #chapters > 0 then
 
-            self.meta_cache:putChapters(target, chapters)
+            self.meta_cache:putChapters(book, chapters)
 
-            print("[XREAD_AUTOTEST] prefetch chapters done")
+            -- 验收标记只在自动测试时输出：原来这行在生产环境也会打，白白污染日志
+            if os.getenv("XREAD_AUTOTEST") then
+                print("[XREAD_AUTOTEST] prefetch chapters done")
+            end
 
-            logger.info("xread prefetched chapters for", tostring(target.name))
+            logger.info("xread prefetched chapters for", tostring(book.name))
 
         end
 
     end)
+
+end
+
+-- 书架/首页显示后预取当前页书籍的章节目录，点书秒开：
+-- 最近在读那本立即取；同页其余书籍错峰补（目录缓存过期也刷新）
+function XRead:_prefetchRecentChapters(books, visible)
+
+    if os.getenv("XREAD_NO_PREFETCH") == "1" then return end
+
+    -- 新一代预取：上一轮排队中但还没发的请求全部作废（页面已换）
+    self._prefetch_generation = (self._prefetch_generation or 0) + 1
+
+    local target
+
+    -- 挑「最近在读」的书预取目录：按最后阅读时间，而不是章节号。
+    -- 用章节号会把读到很后面但早已弃掉的书当成优先目标。
+    for _, b in ipairs(books) do
+
+        local dur = tonumber(b.durChapterIndex) or 0
+
+        if dur > 0 then
+
+            local bt = tonumber(b.durChapterTime) or 0
+
+            local tt = tonumber(target and target.durChapterTime) or 0
+
+            if not target or bt > tt
+
+                or (bt == tt and dur > (tonumber(target.durChapterIndex) or 0)) then
+
+                target = b
+
+            end
+
+        end
+
+    end
+
+    local ttl = tonumber(self:getSetting("chapter_cache_ttl", "1800")) or 1800
+
+    if target and not self.meta_cache:getChapters(target, ttl) then
+
+        self:_bgFetchChapters(target, 0.5)
+
+    end
+
+    -- 其余可见书籍错峰预取目录（限制数量，避免一次进页面拉太多）
+    local n = 0
+
+    for _, b in ipairs(visible or {}) do
+
+        -- 最多补 6 本、间隔 2s：这些请求是同步阻塞的，排太多会和「点书开书」抢线程
+        if b ~= target and n < 6 then
+
+            n = n + 1
+
+            if not self.meta_cache:getChapters(b, ttl) then
+
+                self:_bgFetchChapters(b, 1.5 + n * 2)
+
+            end
+
+        end
+
+    end
 
 end
 
@@ -1136,6 +1797,69 @@ function XRead:openHome()
 
     end)
 
+end
+
+-- 首页顶栏信息（昵称等）保存后，若首页正开着就立即重建（实时生效）
+function XRead:_refreshHomeIfOpen()
+
+    if self._home_view and not self._home_view._miu_closed then
+
+        self:_stopHomeTicker()
+
+        UIManager:close(self._home_view)
+
+        self._home_view = nil
+
+        pcall(function() self:showHome(self._home_shelf_page or 1) end)
+
+    end
+
+end
+
+-- 最近阅读卡片右上角刷新：只更新 hero 一张卡，不重建整页、不打断心跳/封面循环。
+-- 与现有「更新」按钮（整页重建）和 30s 心跳（只刷时间/连接）职责分离；
+-- 为避免和后台封面重试的 getBookshelf/putShelf 竞态，刷新期间停掉封面循环，结束再恢复。
+function XRead:refreshRecentBook()
+    if not MiuiHome.is_shown() then return end
+    if self._opening_book or SHARED.open_path then return end
+
+    self:runQuiet(function()
+        local ok, books = pcall(function() return self.client:getBookshelf(true) end)
+        if not ok or type(books) ~= "table" or #books == 0 then
+            UIManager:nextTick(function() self:showInfo(_("刷新最近阅读失败，请检查服务端")) end)
+            return
+        end
+
+        pcall(function() self.meta_cache:putShelf(books) end)
+
+        -- 选书规则与 showHome 保持一致：按最后阅读时间，时间相同才比章节号
+        local hero_book = books[1]
+        for _b, b in ipairs(books) do
+            local bt = tonumber(b.durChapterTime) or 0
+            local ht = tonumber(hero_book.durChapterTime) or 0
+            if bt > ht then
+                hero_book = b
+            elseif bt == ht
+                and (tonumber(b.durChapterIndex) or 0) > (tonumber(hero_book.durChapterIndex) or 0) then
+                hero_book = b
+            end
+        end
+        local last_url = self._last_open_book_url or self:getSetting("last_book_url", "")
+        if last_url ~= "" then
+            for _b, b in ipairs(books) do
+                if tostring(b.bookUrl or "") == tostring(last_url) then hero_book = b break end
+            end
+        end
+
+        local layout = GridShelf.computeLayout(1)
+        local cover_paths = self:prepareCovers({ hero_book }, 1, 1, layout, true)
+        local hero = self:_makeHeroInfo(hero_book, cover_paths)
+        local updated = MiuiHome.update_hero(hero)
+        if not updated then
+            -- 几何变化导致局部刷新失败：退回整页重建兜底
+            pcall(function() self:_refreshHomeIfOpen() end)
+        end
+    end)
 end
 
 -- 首页点左上角标题：呼出 KOReader 菜单（阅读X 入口所在）；无菜单上下文时退回更多面板
@@ -1165,34 +1889,122 @@ function XRead:openReaderMenuFromHome()
 
 end
 
--- 手动把当前在读书的进度同步到服务端
+-- 首页「同步」：把插件本地记录的书籍进度推到后端。
+-- 本地进度来自 meta_cache 的书架缓存（开书/手动同步时 updateShelfProgress 写入），
+-- 只推本地比后端更新的条目，避免用旧进度覆盖服务器。
 function XRead:syncProgressFromHome()
-
-    local b, idx = SHARED.book, SHARED.index
-
-    if not b then
-
-        self:showInfo(_("当前没有正在读的书"))
-
-        return
-
-    end
 
     self:runQuiet(function()
 
-        local ok = pcall(function() self.client:saveBookProgress(b, (idx or 1) - 1) end)
+        if not self:ensureLogin() then return end
 
-        pcall(function()
+        local local_books = self.meta_cache:getShelf(nil) or {}
 
-            self.meta_cache:updateShelfProgress(b.bookUrl or b.name, (idx or 1) - 1)
+        local ok_remote, remote = pcall(function() return self.client:getBookshelf() end)
 
-        end)
+        if not ok_remote or type(remote) ~= "table" then
 
-        UIManager:nextTick(function()
+            self:showInfo(_("同步失败，请检查服务端"))
 
-            self:showInfo(ok and _("进度已同步到服务端") or _("同步失败，请检查服务端"))
+            return
 
-        end)
+        end
+
+        local remote_index = {}
+
+        for _, b in ipairs(remote) do
+
+            remote_index[tostring(b.bookUrl or "")] = {
+
+                index = tonumber(b.durChapterIndex) or 0,
+
+                time = tonumber(b.durChapterTime) or 0,
+
+            }
+
+        end
+
+        local failed, pushed, skipped_old = 0, 0, 0
+
+        local n_local = #local_books
+
+        for n, b in ipairs(local_books) do
+
+            local key = tostring(b.bookUrl or b.name or "")
+
+            local li = tonumber(b.durChapterIndex)
+
+            local lt = tonumber(b.durChapterTime) or 0
+
+            local r = remote_index[key]
+
+            local ri = r and r.index
+
+            local rt = (r and r.time) or 0
+
+            -- 只推「本地确实更新」的条目：章节更靠后，且本地进度时间不比服务器旧。
+            -- 原来只比章节号，会把几周前的旧本地进度推上去，覆盖其它设备的新进度。
+            local newer = li ~= nil and (ri == nil or li > ri)
+
+            if newer and lt > 0 and rt > 0 and lt < rt then
+
+                newer = false
+
+                skipped_old = skipped_old + 1
+
+            end
+
+            if key ~= "" and newer then
+
+                local ok = pcall(function()
+
+                    return self.client:saveBookProgress(b, li)
+
+                end)
+
+                if ok then
+
+                    pushed = pushed + 1
+
+                else
+
+                    failed = failed + 1
+
+                end
+
+            end
+
+            -- 每推几本让出一次时间片：50 本串行 POST 时界面不会完全冻结
+            if n % 5 == 0 and n < n_local then
+
+                pcall(function()
+                    Trapper:info(T(_("正在同步 %1/%2"), tostring(n), tostring(n_local)))
+                end)
+
+            end
+
+        end
+
+        -- 同步完拉一次最新书架写回缓存，首页进度与后端一致
+        local ok_fresh, fresh = pcall(function() return self.client:getBookshelf() end)
+
+        if ok_fresh and type(fresh) == "table" and #fresh > 0 then
+
+            pcall(function() self.meta_cache:putShelf(fresh) end)
+
+        end
+
+        if failed > 0 then
+
+            self:showInfo(T(_("同步失败 %1 本，请检查服务端"), tostring(failed)))
+
+        elseif pushed > 0 then
+
+            logger.info("xread synced", pushed, "book progress entries")
+
+        end
+
+        pcall(function() self:_refreshHomeIfOpen() end)
 
     end)
 
@@ -1235,11 +2047,7 @@ function XRead:searchAndAddBook()
 
                     if ok_s and type(sources) == "table" then
 
-                        -- 单源短超时，坏源不拖死搜索
-
-                        local old_timeout = http.TIMEOUT
-
-                        http.TIMEOUT = 8
+                        -- 单源短超时，坏源不拖死搜索（超时随请求传入，不碰全局 http.TIMEOUT）
 
                         for _si, s in ipairs(sources) do
 
@@ -1247,7 +2055,7 @@ function XRead:searchAndAddBook()
 
                                 local ok_r, res = pcall(function()
 
-                                    return self.client:searchBook(kw, s.bookSourceUrl)
+                                    return self.client:searchBook(kw, s.bookSourceUrl, 8)
 
                                 end)
 
@@ -1262,8 +2070,6 @@ function XRead:searchAndAddBook()
                             end
 
                         end
-
-                        http.TIMEOUT = old_timeout or 12
 
                     end
 
@@ -1295,9 +2101,7 @@ function XRead:searchAndAddBook()
 
                                         UIManager:nextTick(function()
 
-                                            self:showInfo(ok_save and (_("已加入书架：") .. tostring(r.name))
-
-                                                or _("加入书架失败"))
+                                            if not ok_save then self:showInfo(_("加入书架失败")) end
 
                                         end)
 
@@ -1329,38 +2133,44 @@ function XRead:searchAndAddBook()
 
 end
 
--- 首页中部功能按钮排（参考 miuread：更新/搜索/下载/同步/休眠/设置）
+-- 首页中部功能按钮排（参考 miuread：更新/搜索/同步/夜晚/设置）
 function XRead:buildHomeActions()
 
     return {
 
         { icon_key = "refresh", label = _("更新"), callback = function()
 
-            -- 强制拉最新书架并重建首页
-
-            self:_stopHomeTicker()
-
-            if self._home_view and not self._home_view._miu_closed then
-
-                UIManager:close(self._home_view)
-
-            end
-
-            self._home_view = nil
+            -- 拉取最新书架，写回缓存后重建整个首页。
+            -- 旧首页保持到 showHome 里「数据就绪、马上建新页」时才关，
+            -- 否则取书架这段同步请求期间底层文件管理器会闪出来。
 
             self:runQuiet(function()
 
-                pcall(function() self.meta_cache:clearShelf() end)
+                if not self:ensureLogin() then return end
 
-                if self:ensureLogin() then self:showHome(1) end
+                local ok, books = pcall(function() return self.client:getBookshelf(true) end)
+
+                if ok and type(books) == "table" and #books > 0 then
+
+                    pcall(function() self.meta_cache:putShelf(books) end)
+
+                    self:showHome(self._home_shelf_page or 1)
+
+                else
+
+                    -- 后端拉取失败时退回原缓存重建首页，不让用户看到空白
+
+                    self:showHome(self._home_shelf_page or 1)
+
+                    UIManager:nextTick(function() self:showInfo(_("更新失败，显示本地缓存书架")) end)
+
+                end
 
             end)
 
         end },
 
         { icon_key = "search", label = _("搜索"), callback = function() self:searchAndAddBook() end },
-
-        { icon_key = "download", label = _("下载"), callback = function() self:showCacheManage() end },
 
         { icon_key = "sync", label = _("同步"), callback = function() self:syncProgressFromHome() end },
 
@@ -1406,9 +2216,56 @@ end
 
 function XRead:showHome(page)
 
+    -- 注意：单实例收尾放在「数据已经准备好、马上要建新首页」处（见下方 MiuiHome.show 前），
+    -- 不能一进函数就关旧首页——否则中途取书架失败会只剩空白/底层视图可看。
+
     local ttl = tonumber(self:getSetting("shelf_cache_ttl", "300")) or 300
 
     local books = self.meta_cache:getShelf(ttl)
+
+    if not books then
+
+        -- 缓存过期时先用旧缓存渲染（进度可能略旧），后台再静默刷新；
+        -- 避免从书架点返回时卡在同步网络请求上（真机表现为「返回没反应」）
+        books = self.meta_cache:getShelf(nil)
+
+        if books then
+
+            -- 去重 + 节流：反复进出首页原来会叠出多个 1s 后的同步 getBookshelf。
+            -- 只保留一个待执行的刷新，且 60s 内不重复拉。
+            local last = self._home_refresh_at or 0
+
+            if not self._home_refresh_pending and os.time() - last >= 60 then
+
+                self._home_refresh_pending = true
+
+                UIManager:scheduleIn(1, function()
+
+                    self._home_refresh_pending = false
+
+                    self._home_refresh_at = os.time()
+
+                    -- 用户可能已经点书或进书架了：别和开书/书架上的点击抢网络
+
+                    if self._opening_book or SHARED.open_path then return end
+
+                    local shelf = SHARED.shelf_view
+
+                    if shelf and not shelf._miu_closed then return end
+
+                    if not self.client.accessToken then return end
+
+                    local ok, fresh = pcall(function() return self.client:getBookshelf() end)
+
+                    if ok and fresh and #fresh > 0 then self.meta_cache:putShelf(fresh) end
+
+                end)
+
+            end
+
+        end
+
+    end
 
     if not books then
 
@@ -1433,8 +2290,6 @@ function XRead:showHome(page)
     end
 
     self._shelf_books = books
-
-    self:_prefetchRecentChapters(books)
 
     -- 首页书架分页：每页 8 本，真正翻页（下一页仍是填满书籍的常规书架网格）
 
@@ -1464,17 +2319,31 @@ function XRead:showHome(page)
 
     local show_n = #page_books
 
+    -- 预取本页书籍的章节目录（hero 最近在读优先），点书秒开
+    self:_prefetchRecentChapters(books, page_books)
+
     local cover_paths = self:prepareCovers(page_books, 1, show_n, layout, true)
 
     local miui_books = self:_toMiuiBooks(page_books, cover_paths)
 
-    -- hero = 最近读的书：本会话最后打开的书优先（实时），否则 durChapterIndex 最大者
-
+    -- hero = 最近读的书：按最后阅读时间（durChapterTime）挑，没有时间信息的老数据
+    -- 才回退到章节号。用章节号时，上月读到第 500 章的书会一直霸占首页卡片，
+    -- 而昨天读到第 3 章的根本不会出现。
     local hero_book = books[1]
 
     for _hb, b in ipairs(books) do
 
-        if (tonumber(b.durChapterIndex) or 0) > (tonumber(hero_book.durChapterIndex) or 0) then
+        local bt = tonumber(b.durChapterTime) or 0
+
+        local ht = tonumber(hero_book.durChapterTime) or 0
+
+        if bt > ht then
+
+            hero_book = b
+
+        elseif bt == ht
+
+            and (tonumber(b.durChapterIndex) or 0) > (tonumber(hero_book.durChapterIndex) or 0) then
 
             hero_book = b
 
@@ -1482,11 +2351,14 @@ function XRead:showHome(page)
 
     end
 
-    if self._last_open_book_url then
+    -- 本会话最后打开的书优先；重启后回退到设置里持久化的最近打开书
+    local last_url = self._last_open_book_url or self:getSetting("last_book_url", "")
+
+    if last_url ~= "" then
 
         for _hb, b in ipairs(books) do
 
-            if tostring(b.bookUrl or "") == tostring(self._last_open_book_url) then hero_book = b break end
+            if tostring(b.bookUrl or "") == tostring(last_url) then hero_book = b break end
 
         end
 
@@ -1500,26 +2372,7 @@ function XRead:showHome(page)
 
     end
 
-    local hero = self:_toMiuiBooks({ hero_book }, cover_paths)[1]
-
-    hero.subtitle = _("继续阅读")
-
-    -- 封面右侧：书籍简介 + 上次读到第 X 章 · 共 Y 章
-    local hero_total = tonumber(hero_book.totalChapterNum) or 0
-
-    local hero_dur = tonumber(hero_book.durChapterIndex) or 0
-
-    hero.last_read_text = _("上次读到第 ") .. tostring(hero_dur + 1) .. _(" 章 · 共 ")
-
-        .. tostring(hero_total) .. _(" 章")
-
-    hero.description = tostring(hero_book.intro or "")
-
-    hero.on_tap = function() self:openBook(hero_book) end
-
-    -- 右上角「历史 ›」入口：点击进入阅读记录页（默认日统计）
-
-    hero.on_history = function() self:showReadingStats() end
+    local hero = self:_makeHeroInfo(hero_book, cover_paths)
 
     -- 右侧区域：上面时钟，下面本周阅读记录（每天打卡）
     local week_stats = {}
@@ -1585,17 +2438,8 @@ function XRead:showHome(page)
         on_shelf_page = function(delta)
 
             -- 向后翻：进「我的书架」页（4 排书那页）
+            -- 不在取数据前关首页：关掉后底层文件管理器会露出一帧
             if (tonumber(delta) or 0) > 0 then
-
-                self:_stopHomeTicker()
-
-                if self._home_view and not self._home_view._miu_closed then
-
-                    UIManager:close(self._home_view)
-
-                end
-
-                self._home_view = nil
 
                 self:showBookshelf(1)
 
@@ -1603,17 +2447,7 @@ function XRead:showHome(page)
 
             end
 
-            -- 向前翻：首页内回上一页
-            self:_stopHomeTicker()
-
-            if self._home_view and not self._home_view._miu_closed then
-
-                UIManager:close(self._home_view)
-
-            end
-
-            self._home_view = nil
-
+            -- 向前翻：首页内回上一页；showHome 内部在数据就绪后才换页
             self:showHome((self._home_shelf_page or 1) + delta)
 
         end,
@@ -1626,11 +2460,36 @@ function XRead:showHome(page)
 
         on_header_title = function() self:openReaderMenuFromHome() end,
 
+        -- 点昵称区域 → 账号管理；点 Wi-Fi 后的连接状态区域 → 地址管理
+
+        on_account = function() self:showAccountManage() end,
+
+        on_sync = function() self:showServerManage() end,
+
     }
+
+    -- 单实例：数据已就绪，建新首页前先收掉旧首页。
+    -- 反复「首页 → 书架 → 返回」会把旧首页留在窗口栈里叠出多份，
+    -- 多份首页各自带时钟/连接检测/封面重试，越用越卡，且返回时会看到旧帧。
+    if self._home_view and not self._home_view._miu_closed then
+
+        self:_stopHomeTicker()
+
+        pcall(function() UIManager:close(self._home_view) end)
+
+    end
+
+    -- 只关 _home_view 不够：HomeView 内部 live_widget 可能指向另一个仍在栈里的
+    -- 首页实例，show 会原地更新它并返回；若它被文件管理器盖住，首页就永远出不来。
+    pcall(function() MiuiHome.close() end)
+
+    self._home_view = nil
 
     local view = MiuiHome.show(opts)
 
     self._home_view = view
+
+    SHARED.home_view = view
 
     self:_queueMissingCovers(page_books, 1, show_n, layout, miui_books, view,
 
@@ -1649,6 +2508,22 @@ function XRead:showHome(page)
         pcall(function() view:updateBook(tostring(b.bookUrl)) end)
 
     end)
+
+    -- 自动检查更新：首页起来后错峰查一次，发现新版才提示（失败无声）
+    self:quietUpdateCheck(10)
+
+    -- 看书时攒下的「发现新版本」提示，回到首页再补一次
+    if self._update_pending_notice then
+
+        self._update_pending_notice = nil
+
+        UIManager:scheduleIn(1.5, function()
+
+            if self._home_view == view then self:notifyUpdateAvailable() end
+
+        end)
+
+    end
 
 end
 
@@ -1688,16 +2563,11 @@ function XRead:_startHomeTicker(view)
 
         end)
 
-        if rounds % 2 == 1 then
+        if rounds % 2 == 1 and not self:_uiHasOverlay() then
 
-            -- health 走短超时，避免后端异常时长时间阻塞界面
-            local old_timeout = http.TIMEOUT
-
-            http.TIMEOUT = 3
-
+            -- health 走短超时（client:health 内置 3s），避免后端异常时长时间阻塞界面；
+            -- 弹层开着时跳过，别卡住点击
             local ok_h, res = pcall(function() return self.client:health() end)
-
-            http.TIMEOUT = old_timeout or 12
 
             local healthy = ok_h and res and res.isSuccess ~= false
 
@@ -1750,7 +2620,18 @@ function XRead:showBookshelf(page, cached_books)
 
     end
 
-    if not ok then self:showInfo(_("获取书架失败：") .. tostring(books)); return end
+    if not ok then
+
+        self:showInfo(_("获取书架失败：") .. tostring(books))
+
+        -- 书架没开起来：恢复首页心跳（openShelf 开头为让路停掉了它）
+        local home = self._home_view
+
+        if home and not home._miu_closed then self:_startHomeTicker(home) end
+
+        return
+
+    end
 
     books = books or {}
 
@@ -1763,9 +2644,6 @@ function XRead:showBookshelf(page, cached_books)
     if not cached_books then self.meta_cache:putShelf(books) end
 
     self._shelf_books = books
-
-    -- 显示后预取最近在读的书，下次点开直接命中缓存
-    self:_prefetchRecentChapters(books)
 
     local layout = GridShelf.computeLayout(#books)
 
@@ -1781,7 +2659,14 @@ function XRead:showBookshelf(page, cached_books)
 
     local last = math.min(#books, first + layout.page_size - 1)
 
-    -- 本函数已在 runOnline 的 Trapper 协程里，不能再套 Trapper:wrap
+    -- 显示后预取本页书籍的章节目录（最近在读优先），下次点开直接命中缓存
+    local visible = {}
+
+    for _vi = first, last do visible[#visible + 1] = books[_vi] end
+
+    self:_prefetchRecentChapters(books, visible)
+
+    -- 本函数已在 runQuiet 的 Trapper 协程里，不能再套 Trapper:wrap
 
     local cover_paths = self:prepareCovers(books, first, last, layout, true)
 
@@ -1819,7 +2704,7 @@ function XRead:prepareCovers(books, first, last, layout, skip_download)
 
             done = done + 1
 
-            UI:info(T(_("加载封面 %1/%2…"), tostring(done), tostring(total)))
+            logger.dbg("xread cover fetch", tostring(done), "/", tostring(total))
 
             local ok, p = pcall(function()
 
@@ -1879,6 +2764,12 @@ function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view,
 
             if self._cover_generation ~= gen or view._miu_closed then return end
 
+            -- 弹层开着时封面下载让路，别让同步 HTTP 卡住弹层里的点击
+            if self:_uiHasOverlay() then
+                UIManager:scheduleIn(1.5, function() nextOne(k) end)
+                return
+            end
+
             local item = queue[k]
 
             local ok, p = pcall(function()
@@ -1932,16 +2823,30 @@ function XRead:_startCoverRetryLoop(view, on_cover)
 
     self._cover_retry_generation = generation
 
+    local rounds = 0
+
     local function round()
 
         if generation ~= self._cover_retry_generation then return end
 
         if not view or view._miu_closed or view._closed then return end
 
+        -- 弹层开着时整轮让路（含 getBookshelf 同步请求），1.5s 后重试
+        if self:_uiHasOverlay() then
+            UIManager:scheduleIn(1.5, round)
+            return
+        end
+
         -- 1) 静默刷新书架元数据，拿最新封面地址
+        -- refresh=true 会让后端重扫书源，是最重的一次调用：只在首轮和每 12 轮
+        -- （默认约 1 小时）做一次；原实现每 5 分钟一次，首页常驻时既压后端又阻塞 UI。
+        rounds = rounds + 1
+
+        local want_refresh = (rounds == 1) or (rounds % 12 == 0)
+
         local books = nil
 
-        pcall(function() books = self.client:getBookshelf(true) end)
+        pcall(function() books = self.client:getBookshelf(want_refresh) end)
 
         if type(books) ~= "table" or #books == 0 then
 
@@ -1993,6 +2898,11 @@ function XRead:_startCoverRetryLoop(view, on_cover)
             UIManager:scheduleIn(1.0, function()
 
                 if generation ~= self._cover_retry_generation then return end
+
+                if self:_uiHasOverlay() then
+                    UIManager:scheduleIn(1.5, function() nextOne(k, added) end)
+                    return
+                end
 
                 local ok, p = pcall(function()
 
@@ -2087,6 +2997,8 @@ function XRead:showShelfGrid(books, page, cover_paths)
 
     self._shelf_view = view
 
+    SHARED.shelf_view = view
+
     UIManager:show(view)
 
 end
@@ -2134,6 +3046,48 @@ function XRead:_toMiuiBooks(books, cover_paths)
 
     return out
 
+end
+
+-- 把「最近在读」的书组装成首页 hero 数据。
+-- 封面右侧信息按微信读书样式分行：作者·来源 / 阅读进度·上次时间 / 分类·章数 / 简介
+-- 供 showHome 与「刷新最近阅读」局部刷新共用，避免两处格式漂移。
+function XRead:_makeHeroInfo(hero_book, cover_paths)
+    local hero = self:_toMiuiBooks({ hero_book }, cover_paths)[1]
+    hero.subtitle = _("继续阅读")
+
+    local total = tonumber(hero_book.totalChapterNum) or 0
+    local dur = tonumber(hero_book.durChapterIndex) or 0
+    local read_time = tonumber(hero_book.durChapterTime) or 0
+
+    hero.last_read_text = _("上次读到第 ") .. tostring(dur + 1) .. _(" 章 · 共 ")
+        .. tostring(total) .. _(" 章")
+    hero.description = tostring(hero_book.intro or "")
+
+    -- 附件1格式：作者 · 书源（originName 作为来源/分类展示）
+    local author = tostring(hero_book.author or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local origin = tostring(hero_book.originName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local meta_bits = {}
+    if author ~= "" then meta_bits[#meta_bits + 1] = author end
+    if origin ~= "" then meta_bits[#meta_bits + 1] = origin end
+    hero.meta_line = table.concat(meta_bits, " · ")
+
+    -- 阅读进度行：阅读至 N% · 上次阅读时间（HH:MM 或 M月D日）
+    local progress_text = _("阅读至 ") .. tostring(hero.progress or 0) .. "%"
+    if read_time > 0 then
+        local hour = os.date("%H:%M", read_time)
+        local today = os.date("%Y%m%d")
+        hero.when_text = os.date("%Y%m%d", read_time) == today
+            and _("今天 ") .. hour or os.date("%m月%d日 ", read_time) .. hour
+    end
+    hero.progress_line = progress_text .. (hero.when_text and (" · " .. hero.when_text) or "")
+
+    -- 底部来源/分类行：微信读书风格「来源 · 共 N 章」
+    hero.source_line = _("阅读X") .. (total > 0 and (" · " .. T(_("共 %1 章"), tostring(total))) or "")
+
+    hero.on_tap = function() self:openBook(hero_book) end
+    -- 右上角改为「刷新最近阅读」按钮
+    hero.on_refresh = function() self:refreshRecentBook() end
+    return hero
 end
 
 function XRead:showMiuiShelfGrid(books, page, cover_paths)
@@ -2205,15 +3159,59 @@ function XRead:showMiuiShelfGrid(books, page, cover_paths)
         on_back = function()
 
             -- 书架第一页点返回：回「我的首页」
-            if self._shelf_view and not self._shelf_view._miu_closed then
-
-                UIManager:close(self._shelf_view)
-
-            end
+            local shelf = self._shelf_view
 
             self._shelf_view = nil
 
-            self:showHome(1)
+            SHARED.shelf_view = nil
+
+            local home = self._home_view
+
+            if home and not home._miu_closed then
+
+                -- 首页还在栈里：关书架后直接唤醒它，瞬间回首页。
+                -- 不做 setDirty("all","full")：那会把栈底的文件管理器一起
+                -- 标脏并触发整屏刷新，真机上就是「闪一下 KOReader 页面」。
+                if shelf and not shelf._miu_closed then
+
+                    pcall(function() UIManager:close(shelf) end)
+
+                end
+
+                pcall(function() self:_startHomeTicker(home) end)
+
+                UIManager:setDirty(home, "ui")
+
+                -- 略后再按最新进度重建一次（静默，读者可能已经翻过章）
+                UIManager:scheduleIn(1.2, function()
+
+                    if self._opening_book or SHARED.open_path then return end
+
+                    if self._home_view ~= home or home._miu_closed then return end
+
+                    pcall(function() self:_refreshHomeIfOpen() end)
+
+                end)
+
+            else
+
+                -- 首页已不在栈里：先建好新首页（新页压在书架之上），
+                -- 再收掉书架；中间不留 repaint 空档。
+                local ok, err = pcall(function() self:showHome(self._home_shelf_page or 1) end)
+
+                if not ok then
+
+                    logger.warn("xread back to home failed:", tostring(err))
+
+                    self:showInfo(_("返回首页失败：") .. readable_error(err))
+
+                elseif shelf and not shelf._miu_closed then
+
+                    pcall(function() UIManager:close(shelf) end)
+
+                end
+
+            end
 
         end,
 
@@ -2221,11 +3219,21 @@ function XRead:showMiuiShelfGrid(books, page, cover_paths)
 
             self._shelf_view = nil
 
+            -- 书架以任何方式关掉（返回键/开书/系统关闭）后，首页心跳要接回来；
+            -- 开书中（_opening_book）由 openBook 自己管，别在这里抢
+            if self._opening_book or SHARED.open_path then return end
+
+            local home = self._home_view
+
+            if home and not home._miu_closed then self:_startHomeTicker(home) end
+
         end,
 
     }
 
     self._shelf_view = view
+
+    SHARED.shelf_view = view
 
     -- 首屏未缓存的封面走后台补，不阻塞书架显示
     local layout = GridShelf.computeLayout(#books)
@@ -2251,17 +3259,25 @@ function XRead:showBookCatalog(book, cover_path, page)
 
         cover_path = self.cover_cache:pathFor(book, layout.cover_w, layout.cover_h)
 
+        -- 不在打开目录前同步下载封面：没有本地缓存的书要先卡 8~16s 才出目录。
+        -- 先渲染占位块，目录出来后再在空闲时补一张（下次打开就直接命中）。
         if not cover_path and book.coverUrl and book.coverUrl ~= "" then
 
-            local ok, p = pcall(function()
+            UIManager:scheduleIn(1.5, function()
 
-                return self.cover_cache:fetchAndStore(book, book.coverUrl,
+                if self._opening_book or SHARED.open_path then return end
 
-                    layout.cover_w, layout.cover_h)
+                if self:_uiHasOverlay() then return end
+
+                pcall(function()
+
+                    self.cover_cache:fetchAndStore(book, book.coverUrl,
+
+                        layout.cover_w, layout.cover_h)
+
+                end)
 
             end)
-
-            if ok and p then cover_path = p end
 
         end
 
@@ -2386,18 +3402,7 @@ function XRead:showReaderCatalog(page)
 
         on_select = function(i)
 
-            UIManager:close(view)
-
-            self._catalog_view = nil
-
-            -- 目录页是整屏覆盖层，关闭后强制全刷一次，避免按钮残影留在正文上
-            UIManager:forceRePaint()
-
-            self:runQuiet(function()
-
-                self:openAtChapter(book, chapters, i)
-
-            end)
+            self:jumpToChapterFromCatalog(view, book, chapters, i)
 
         end,
 
@@ -2407,7 +3412,12 @@ function XRead:showReaderCatalog(page)
 
             self._catalog_view = nil
 
-            UIManager:forceRePaint()
+            -- 用户没等跳章完成就返回：撤销「等新文档就绪再关目录」的挂起状态
+            if self._switch_overlay == view then self._switch_overlay = nil end
+
+            -- close() 会排队一个局部刷新，forceRePaint 只重绘帧缓冲不触发物理全刷，
+            -- 残留的是局部刷新外的旧像素（点一下屏幕才消失）：改为显式全量刷新
+            UIManager:setDirty("all", "full")
 
         end,
 
@@ -2451,6 +3461,44 @@ function XRead:chapterCacheState(book, i)
     return nil
 
 end
+-- 从目录点章节：目录先留着盖住底层书架，等新文档真正就绪（onReaderReady）再关。
+-- 之前是「关目录 + 立即全刷 + switchDocument」，中间空档会把书架画出来，
+-- 真机表现为点章节先闪一下书架再进正文。
+function XRead:jumpToChapterFromCatalog(view, book, chapters, i)
+
+    if self._switch_overlay and self._switch_overlay ~= view then
+
+        pcall(function() UIManager:close(self._switch_overlay) end)
+
+    end
+
+    self._switch_overlay = view
+
+    self._catalog_view = nil
+
+    -- 兜底：新文档一直没就绪（网络失败/文件坏）也不能把目录永久留在屏幕上
+    UIManager:scheduleIn(15, function()
+
+        if self._switch_overlay == view then
+
+            self._switch_overlay = nil
+
+            pcall(function() UIManager:close(view) end)
+
+            UIManager:setDirty("all", "full")
+
+        end
+
+    end)
+
+    self:runQuiet(function()
+
+        self:openAtChapter(book, chapters, i)
+
+    end)
+
+end
+
 function XRead:showCatalog(book, chapters, dur_index, page, cover_path)
 
     if self._catalog_view then
@@ -2477,17 +3525,8 @@ function XRead:showCatalog(book, chapters, dur_index, page, cover_path)
 
         on_select = function(i)
 
-            UIManager:close(view)
-
-            self._catalog_view = nil
-
-            UIManager:forceRePaint()
-
-            self:runQuiet(function()
-
-                self:openAtChapter(book, chapters, i)
-
-            end)
+            -- 同阅读器内目录：目录盖到新文档就绪再关，避免中间空档闪出书架/首页
+            self:jumpToChapterFromCatalog(view, book, chapters, i)
 
         end,
 
@@ -2534,15 +3573,73 @@ end
 
 -- ---------- 开书：1 章即开 ----------
 
+-- 开书没走成（未登录 / 目录为空）时的收尾：解除开书标记，
+-- 并把 openBook 开头为「让路」而停掉的首页定时任务放回去，
+-- 否则首页时钟与连接状态会一直停在点书那一刻，封面也不再重试。
+function XRead:_cancelOpenBook()
+
+    self._opening_book = false
+
+    local home = self._home_view
+
+    if home and not home._miu_closed then
+
+        self:_startHomeTicker(home)
+
+        self:_startCoverRetryLoop(home, function(b)
+
+            pcall(function() home:updateBook(tostring(b.bookUrl)) end)
+
+        end)
+
+    end
+
+end
+
 function XRead:openBook(book)
 
-    -- 记住最后一次打开的书：首页「最近阅读」卡片实时指向它
+    -- 开书优先：先把「抢网络/抢 UI 线程」的后台任务全部停掉，再走网络取章节。
+    -- 之前从书架点书慢，就是因为书架显示后还有一串目录预取、封面下载和
+    -- health 心跳排队（都是同步阻塞请求），和开书互相等。
+    self._opening_book = true
+
+    self._prefetch_generation = (self._prefetch_generation or 0) + 1
+
+    self._cover_generation = (self._cover_generation or 0) + 1
+
+    self:_stopHomeTicker()
+
+    self:_stopCoverRetryLoop()
+
+    -- 8s 兜底复位必须带代次：8s 内又点开第二本书时，
+    -- 第一本的定时器会把第二本的守卫提前解除，导致后台任务插队抢网络。
+    self._open_generation = (self._open_generation or 0) + 1
+
+    local open_gen = self._open_generation
+
+    UIManager:scheduleIn(8, function()
+
+        if self._open_generation ~= open_gen then return end
+
+        self._opening_book = false
+
+    end)
+
+    -- 记住最后一次打开的书：首页「最近阅读」卡片实时指向它（写进设置，重启后仍生效）
 
     self._last_open_book_url = tostring((book and book.bookUrl) or "")
 
+    self:saveSetting("last_book_url", self._last_open_book_url)
+
     self:runQuiet(function()
 
-        if not self:ensureLogin() then return end
+        if not self:ensureLogin() then
+
+            self:_cancelOpenBook()
+
+            return
+
+        end
 
         -- 目录优先读本地缓存（后台预取/上次打开都写缓存），未命中才走网络
         local ttl = tonumber(self:getSetting("chapter_cache_ttl", "1800")) or 1800
@@ -2559,13 +3656,17 @@ function XRead:openBook(book)
 
         else
 
-            print("[XREAD_AUTOTEST] chapters_cache_hit")
+            if os.getenv("XREAD_AUTOTEST") then
+                print("[XREAD_AUTOTEST] chapters_cache_hit")
+            end
 
         end
 
         if not chapters or #chapters == 0 then
 
             self:showInfo(_("目录为空"))
+
+            self:_cancelOpenBook()
 
             return
 
@@ -2576,6 +3677,12 @@ function XRead:openBook(book)
         if start < 1 then start = 1 end
 
         if start > #chapters then start = #chapters end
+
+        if os.getenv("XREAD_AUTOTEST") == "opentime" then
+
+            print("[XREAD_AUTOTEST] opentime: chapters_ready=" .. autotest_now())
+
+        end
 
         self:openAtChapter(book, chapters, start)
 
@@ -2638,6 +3745,17 @@ function XRead:openAtChapter(book, chapters, index)
 
         self:showInfo(_("没有获取到正文"))
 
+        -- 正文没拿到：把等着的目录收掉，别让兜底计时器 15s 后再关
+        local overlay = self._switch_overlay
+
+        if overlay then
+
+            self._switch_overlay = nil
+
+            pcall(function() UIManager:close(overlay) end)
+
+        end
+
         return
 
     end
@@ -2668,19 +3786,63 @@ function XRead:openAtChapter(book, chapters, index)
 
     end
 
-    local path = BOOK_DIR .. "/" .. safeFileName(book.name) .. "_" .. index .. ".html"
+    local path = BOOK_DIR .. "/" .. bookCacheStem(book) .. "_" .. index .. ".html"
 
     local f = io.open(path, "w")
 
-    if not f then self:showInfo(_("无法写入缓存文件")); return end
+    if not f then
 
-    f:write(table.concat(parts))
+        self:showInfo(_("无法写入缓存文件"))
+
+        local overlay = self._switch_overlay
+
+        if overlay then
+
+            self._switch_overlay = nil
+
+            pcall(function() UIManager:close(overlay) end)
+
+        end
+
+        return
+
+    end
+
+    local wrote = f:write(table.concat(parts))
 
     f:close()
+
+    -- 写入失败（磁盘满/只读）时若不检查返回值，会留下 0 字节文件，
+    -- 随后"打开"就是一本空书，而且看起来一切正常。
+    if not wrote then
+
+        pcall(os.remove, path)
+
+        self:showInfo(_("写入缓存失败（可能磁盘已满）"))
+
+        local overlay2 = self._switch_overlay
+
+        if overlay2 then
+
+            self._switch_overlay = nil
+
+            pcall(function() UIManager:close(overlay2) end)
+
+        end
+
+        return
+
+    end
 
     SHARED.book, SHARED.chapters, SHARED.index = book, chapters, index
 
     SHARED.txt_path, SHARED.txt_size = path, fileSize(path)
+
+    if os.getenv("XREAD_AUTOTEST") == "opentime" then
+
+        print("[XREAD_AUTOTEST] opentime: html_written=" .. autotest_now())
+
+    end
 
     -- 进度上报异步化：不让它阻塞文档打开（失败也不影响阅读）
     UIManager:scheduleIn(0.5, function()
@@ -2690,10 +3852,11 @@ function XRead:openAtChapter(book, chapters, index)
             self.client:saveBookProgress(book, index - 1)
 
             -- 同步写进书架缓存，首页「最近阅读」立即指向本书的最新进度
+            -- 同时记下时间戳：首页排序与进度同步都靠它判断"谁更新"
 
             pcall(function()
 
-                self.meta_cache:updateShelfProgress(book.bookUrl or book.name, index - 1)
+                self.meta_cache:updateShelfProgress(book.bookUrl or book.name, index - 1, os.time())
 
             end)
 
@@ -2731,18 +3894,76 @@ function XRead:openAtChapter(book, chapters, index)
 
     end
 
+    -- 首页/书架保留在窗口栈里当底衬：ReaderUI 是 covers_fullscreen 的，
+    -- 盖上去后它们不会被画出来；反过来若在这里先关掉，KOReader 的
+    -- 文件管理器会露出一帧（真机表现为点书闪一下 xread_books 目录）。
+    -- 返回首页/书架时会直接复用，也不需要重新取书架。
+    -- 取消还在排队的封面下载：让开书前的网络/事件循环不被封面任务占着
+    self._cover_generation = (self._cover_generation or 0) + 1
     -- 静默打开：传 seamless 避开 KOReader 的「正在打开文件」提示框
     UIManager:nextTick(function()
 
-        if self.ui.document then
+        local ReaderUI = require("apps/reader/readerui")
 
-            self.ui:switchDocument(path, true)
+        local tries = 0
 
-        else
+        local function doOpen()
 
-            require("apps/reader/readerui"):showReader(path, nil, true)
+            tries = tries + 1
+
+            if self.ui and self.ui.document then
+
+                self._opening_book = false
+
+                -- 同一路径重复打开时 KOReader/crengine 可能认为"文件没变"而不真正重载，
+                -- 表现就是点同一本书同一章「没反应」。touch 一下 mtime 强制失效。
+                if self.ui.document.file == path then
+
+                    local tf = io.open(path, "a")
+
+                    if tf then tf:close() end
+
+                end
+
+                self.ui:switchDocument(path, true)
+
+                if os.getenv("XREAD_AUTOTEST") == "opentime" then
+
+                    print("[XREAD_AUTOTEST] opentime: reader_shown="
+
+                        .. autotest_now())
+
+                end
+
+                return
+
+            end
+
+            -- 刚从阅读返回时旧 ReaderUI 可能还在拆除中，立即 showReader 会静默失败
+            -- （表现为返回后点同一本书没反应、过一会儿才行）：等拆完再开，最多等 2s
+            if ReaderUI.instance ~= nil and tries < 20 then
+
+                UIManager:scheduleIn(0.1, doOpen)
+
+                return
+
+            end
+
+            self._opening_book = false
+
+            pcall(function() ReaderUI:showReader(path, nil, true) end)
+
+            if os.getenv("XREAD_AUTOTEST") == "opentime" then
+
+                print("[XREAD_AUTOTEST] opentime: reader_shown="
+
+                    .. autotest_now())
+
+            end
 
         end
+
+        doOpen()
 
     end)
 end
@@ -2763,7 +3984,10 @@ local function stopBg(reason)
 
     SHARED.cache_visual = nil
 
-    restoreEndPopup()
+    -- 阅读中后台缓存跑完也不能恢复「文档结束」动作：
+    -- 否则读到本批末尾（3 章）时 KOReader 会执行原生结束动作，
+    -- 真机表现为连续点下一页突然闪回书架/文件管理器。
+    -- 只有真正退出书籍（onCloseDocument / closed book）才恢复。
 
     if not job then return end
 
@@ -2971,25 +4195,11 @@ bgStep = function()
 
         if job.next > job.last then
 
-            local same = SHARED.open_path == job.path
-
-            local n = job.ok or 0
-
             if job.on_done then pcall(job.on_done, job) end
 
             stopBg("done")
 
-            if same and n > 0 and not job.manual then
-
-                UIManager:show(InfoMessage:new{
-
-                    text = T(_("《%1》后续 %2 章已在后台缓存完成"), job.book.name or "", n),
-
-                    timeout = 3,
-
-                })
-
-            end
+            -- 后台缓存完成不再弹窗打扰阅读（目录页高亮已足够提示）
 
             return
 
@@ -3087,25 +4297,11 @@ bgStep = function()
 
     if done or job.next > job.last then
 
-        local same = SHARED.open_path == job.path
-
-        local n = job.ok or 0
-
         if job.on_done then pcall(job.on_done, job) end
 
         stopBg("done")
 
-        if same and n > 0 and not job.manual then
-
-            UIManager:show(InfoMessage:new{
-
-                text = T(_("《%1》后续 %2 章已在后台缓存完成"), job.book.name or "", n),
-
-                timeout = 3,
-
-            })
-
-        end
+        -- 后台缓存完成不再弹窗打扰阅读（目录页高亮已足够提示）
 
         return
 
@@ -3236,20 +4432,33 @@ function XRead:cacheHintText(book, chapters, index)
 
     local remain = #chapters - index + 1
 
-    if cached >= remain then return _("全部已缓存") end
+    -- 两件事必须分清，否则用户会以为"缓存"= 下载到本机：
+    --   ① 本地已预取到设备的章节数（countCachedAhead，只 stat）
+    --   ② 点这个按钮做的是「把整本缓存到服务器」（cacheBookSSE）
+    if cached >= remain then return _("本地已全部缓存 · 点按同步整本到服务器") end
 
-    return T(_("已缓存 %1 章"), cached)
+    return T(_("本地已缓存 %1/%2 章 · 点按同步整本到服务器"), tostring(cached), tostring(remain))
 
 end
 
 -- 面板里点“缓存后续章节”：从当前章往后补 N 章，进度实时回显在面板上
+-- 只做存在性检查（has，一次 stat），不读正文（get 会把整章读进内存）。
+-- 这个函数每次打开工具栏、每次缓存进度回调都会跑，原来用 get 时
+-- 已缓存 200 章 = 读 200 个文件 + 200 次目录 hash，是工具栏"点一下才出来"的主因。
+-- 另加扫描上限：整本都已缓存时不必真的数完 3000 章。
+local COUNT_CACHED_MAX_SCAN = 500
+
 function XRead:countCachedAhead(book, chapters, index)
 
     local n = 0
 
-    for i = index, #chapters do
+    if not self.chapter_cache then return 0 end
 
-        if self.chapter_cache:get(book, i) then n = n + 1 else break end
+    local last = math.min(#chapters, index + COUNT_CACHED_MAX_SCAN - 1)
+
+    for i = index, last do
+
+        if self.chapter_cache:has(book, i) then n = n + 1 else break end
 
     end
 
@@ -3342,7 +4551,7 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
             sync_callback = function() self:syncProgress() end,
 
-            home_callback = function() self:closeBookToShelf() end,
+            home_callback = function() self:closeBookToHome() end,
 
             more_callback = function() self:showMorePanel() end,
 
@@ -3358,32 +4567,33 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
             { icon = "toc", label = _("目录"), callback = function() self:showReaderCatalog() end },
 
+            -- 「缓存」= 让后端把整本书缓存到服务器（cacheBookSSE, count=0）；
+            -- 长按才换书。本地后续章节的预取仍由开书后的后台任务负责。
             { icon = "cache", label = _("缓存"), value = self:cacheHintText(book, chapters, index),
 
                 callback = function()
 
-                    local max_chapters = tonumber(self:getSetting("max_chapters", "3")) or 3
+                    UIManager:show(ConfirmBox:new{
 
-                    if max_chapters < 1 then max_chapters = 1 end
+                        text = T(_("让服务器缓存「%1」全部章节？\n缓存后阅读秒开，失败会提示。"),
 
-                    local ok_c, msg_c = self:startCacheMore(max_chapters)
+                            book.name or ""),
 
-                    if not ok_c then
+                        ok_text = _("开始缓存"),
 
-                        self:showInfo(tostring(msg_c or _("当前书无法缓存")))
+                        ok_callback = function() self:doCacheBook(book) end,
 
-                    else
-
-                        -- 工具栏已收起，给个轻提示避免「点了没反应」
-                        self:showInfo(T(_("已开始预缓存后续 %1 章"), tostring(max_chapters)))
-
-                    end
+                    })
 
                 end,
 
                 hold_callback = function() self:chooseBookToCache() end },
 
-            { icon = "trash", label = _("删除"), callback = function() self:removeBookFlow() end },
+            -- 「下载」= 把整本书导出 EPUB 到 Kindle/KOReader 本地文档目录
+            { icon = "download", label = _("下载"), callback = function() self:downloadBookToDevice(book) end },
+
+            -- 正文里的「删除」= 删除当前这本书（后端书架 + 本地缓存）
+            { icon = "trash", label = _("删除"), callback = function() self:removeBookFlow(book) end },
 
             { icon = "library", label = _("书架"), callback = function() self:closeBookToShelf() end },
 
@@ -3415,7 +4625,14 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
         device_actions = {
 
-            { icon = "night", label = _("夜间"), callback = function() self:toggleNightMode() end },
+            -- 夜间开关与首页一致：月亮=当前日间（点击进夜间），太阳=当前夜间（点击回日间）
+            { icon = (function()
+
+                local ok_n, Scr = pcall(function() return require("device").screen end)
+
+                return (ok_n and Scr and Scr.night_mode) and "sun" or "night"
+
+            end)(), label = _("夜间"), callback = function() self:toggleNightMode() end },
 
             { icon = "refresh", label = _("刷新"), callback = function() UIManager:setDirty("all", "full") end },
 
@@ -3480,22 +4697,25 @@ function XRead:showMiuiToolbar()
 
     end
 
-    -- 打开后探测一次连接状态，动态刷新顶栏（与首页一致）
+    -- 打开后只回显已知连接状态，不在 UI 线程重新探测。
+    -- 原来这里每呼出一次工具栏就同步打 2 个请求（各 3s 超时，最坏阻塞 6s），
+    -- 表现就是「点正文中央，工具栏好几秒才响应」。状态由首页心跳维护（60s 一次），
+    -- 只有从未探测过（nil）时才在后台补一次。
     UIManager:scheduleIn(0.5, function()
 
         if not panel or panel.closed then return end
 
-        local old_timeout = http.TIMEOUT
+        local healthy = self._health_ok
 
-        http.TIMEOUT = 3
+        if healthy == nil then
 
-        local ok_h, res = pcall(function() return self.client:health() end)
+            local ok_h, res = pcall(function() return self.client:health() end)
 
-        http.TIMEOUT = old_timeout or 12
+            healthy = ok_h and res and res.isSuccess ~= false
 
-        local healthy = ok_h and res and res.isSuccess ~= false
+            self._health_ok = healthy
 
-        self._health_ok = healthy
+        end
 
         local header = panel.opts and panel.opts.header
 
@@ -3527,6 +4747,14 @@ function XRead:showMiuiToolbar()
             -- 它内部会把 self.closed 置回 false，把已收起的工具栏“复活”，
             -- 结果是后台缓存期间面板反复拦截点击（表现为点了没反应）。
             if panel.closed then return end
+
+            -- 节流：缓存进度每完成一章就回调一次，逐章都整块重排 + 区域重绘
+            -- 会让工具栏在后台缓存期间反复闪。1s 内只刷一次足够。
+            local now = os.time()
+
+            if panel._hint_last_t == now then return end
+
+            panel._hint_last_t = now
 
             pcall(function()
 
@@ -3770,7 +4998,7 @@ function XRead:syncProgress()
 
     end)
 
-    self:showInfo(ok and _("进度已同步") or _("同步失败"))
+    if not ok then self:showInfo(_("同步失败")) end
 
 end
 
@@ -3848,11 +5076,7 @@ function XRead:switchBookSource()
 
         end
 
-        -- 单源短超时，坏源不拖死整个切换
-
-        local old_timeout = http.TIMEOUT
-
-        http.TIMEOUT = 8
+        -- 单源短超时，坏源不拖死整个切换（超时随请求传入，不碰全局 http.TIMEOUT）
 
         local found_book, found_source, tried = nil, nil, 0
 
@@ -3866,7 +5090,7 @@ function XRead:switchBookSource()
 
             tried = tried + 1
 
-            local candidates = self.client:searchBook(book.name, s.bookSourceUrl)
+            local candidates = self.client:searchBook(book.name, s.bookSourceUrl, 8)
 
             for _, cand in ipairs(candidates) do
 
@@ -3883,8 +5107,6 @@ function XRead:switchBookSource()
             if found_book then break end
 
         end
-
-        http.TIMEOUT = old_timeout or 12
 
         if not found_book then
 
@@ -3938,8 +5160,6 @@ function XRead:switchBookSource()
 
         found_book.durChapterIndex = new_index - 1
 
-        self:showInfo(T(_("已切换书源：%1"), tostring(found_source.bookSourceName or "")))
-
         self:openAtChapter(found_book, new_chapters, new_index)
 
     end)
@@ -3951,9 +5171,22 @@ function XRead:onReaderReady()
 
     local doc = self.ui and self.ui.document
 
+    -- 跳章（switchDocument）会先关旧文档：onCloseDocument 把 SHARED.txt_path 清成 nil，
+    -- 新文档就绪时若 SHARED.book 仍在（说明是从阅读X打开的书），必须把 txt_path 指回当前文件。
+    -- 否则 onReaderTapZone 的 doc.file == SHARED.txt_path 判定失败，点正文中央呼不出工具栏。
+    if doc and doc.file and not SHARED.txt_path and SHARED.book then
+
+        SHARED.txt_path, SHARED.txt_size = doc.file, fileSize(doc.file)
+
+    end
+
     if doc and doc.file and SHARED.txt_path == doc.file then
 
         SHARED.read_start = os.time()
+
+        -- 跳章会先关旧文档（onCloseDocument 恢复了结束动作），新文档就绪后必须重新关掉；
+        -- 否则读到本批末尾仍会执行 KOReader 原生结束动作，闪回书架/文件管理器。
+        disableEndPopup()
 
     end
 
@@ -3962,6 +5195,23 @@ function XRead:onReaderReady()
 
     -- 后台扫描正文 "== 章节标题 ==" 注入 TOC，章节名随翻页自动更新
     self:_injectTocFromText()
+
+    -- 跳章/换文档（switchDocument）会重建阅读器触摸分区，插件注册的 xread_tap_* 丢失：
+    -- 必须在文档就绪后重新注册，否则跳章后点正文中央无法呼出工具栏、回不了书架。
+    -- onReaderReady 在文档加载完成后触发，是补注册的正确时机。
+    self:setupCenterTap()
+
+    -- 目录跳章：目录一直盖在正文上，等新文档就绪才收起来。
+    -- 这样「关目录 → switchDocument 关旧文档」的中间空档不会露出底层书架。
+    local overlay = self._switch_overlay
+
+    if overlay then
+
+        self._switch_overlay = nil
+
+        pcall(function() UIManager:close(overlay) end)
+
+    end
 
 end
 
@@ -3990,11 +5240,36 @@ do
 
                 if type(toc) == "table" and #toc > 0 then
 
+                    -- 二分查找「最后一个起始页 <= 当前页」的章节。
+                    -- 原来是 1..3000 线性扫描并且每次 footer 重绘都跑一遍，
+                    -- 3000 章的目录每翻一页要比较约 3000 次。toc 已按 page 升序。
                     local idx = 0
 
-                    for i = 1, #toc do
+                    local lo, hi = 1, #toc
 
-                        if (tonumber(toc[i].page) or 0) <= pageno then idx = i else break end
+                    while lo <= hi do
+
+                        local mid = math.floor((lo + hi) / 2)
+
+                        if (tonumber(toc[mid].page) or 0) <= pageno then
+
+                            idx = mid
+
+                            lo = mid + 1
+
+                        else
+
+                            hi = mid - 1
+
+                        end
+
+                    end
+
+                    -- 兜底修正：目录里若混入 page 缺失/乱序条目，二分可能偏一格，
+                    -- 在命中点附近做一次小范围修正（代价恒定）。
+                    for i = math.max(1, idx - 2), math.min(#toc, idx + 3) do
+
+                        if (tonumber(toc[i].page) or 0) <= pageno then idx = i end
 
                     end
 
@@ -4041,13 +5316,59 @@ do
 end
 
 -- 底部状态栏改为：左对齐当前章节名 + 右对齐页码（1/11），不再显示进度条
+-- 浅拷贝：footer.settings 是 G_reader_settings 内部表的引用，直接改字段等于改用户全局配置
+local function shallowCopyTable(t)
+    local o = {}
+    if type(t) == "table" then
+        for k, v in pairs(t) do o[k] = v end
+    end
+    return o
+end
+
+--- 恢复被本插件改写的 footer 设置（关闭 xread 书时调用）
+-- 因为不再写 G_reader_settings，恢复只是把实例字段换回原表，
+-- 防止同一 ReaderUI 实例复用（reloadDocument 等）时残留定制样式。
+function XRead:_restoreReaderFooter()
+
+    local orig = self._footer_orig_settings
+
+    if not orig then return end
+
+    self._footer_orig_settings = nil
+
+    local footer = self.ui and self.ui.view and self.ui.view.footer
+
+    if not footer then return end
+
+    pcall(function()
+
+        footer.settings = orig
+
+        if footer.set_mode_index then footer:set_mode_index() end
+
+        if footer.updateFooterTextGenerator then footer:updateFooterTextGenerator() end
+
+        if footer.updateFooterContainer then footer:updateFooterContainer() end
+
+        if footer.resetLayout then footer:resetLayout(true) end
+
+        if footer.updateFooterText then footer:updateFooterText(true) end
+
+    end)
+
+end
+
 function XRead:_applyReaderFooter()
 
     local footer = self.ui and self.ui.view and self.ui.view.footer
 
     if not footer or not footer.settings then
 
-        print("[XREAD_AUTOTEST] footer apply: no footer")
+        if os.getenv("XREAD_AUTOTEST") then
+
+            print("[XREAD_AUTOTEST] footer apply: no footer")
+
+        end
 
         return
 
@@ -4055,7 +5376,20 @@ function XRead:_applyReaderFooter()
 
     local ok, err = pcall(function()
 
-        local s = footer.settings
+        -- 备份原始设置（只在第一次进入时），再在副本上改。
+        -- 原实现直接把 footer.settings（即 G_reader_settings 里的表）改掉并
+        -- saveSetting + flush() 落盘：读一本 xread 的书之后，再打开任何原生
+        -- EPUB/TXT，底部栏也被改成「章节名+页码」、时间/电量/百分比全部消失，
+        -- 且不会自动恢复（用户原配置已被覆盖）。
+        if not self._footer_orig_settings then
+
+            self._footer_orig_settings = shallowCopyTable(footer.settings)
+
+        end
+
+        local s = shallowCopyTable(footer.settings)
+
+        footer.settings = s
 
         s.disable_progress_bar = true          -- 去掉进度条
 
@@ -4096,9 +5430,8 @@ function XRead:_applyReaderFooter()
 
         end)
 
-        G_reader_settings:saveSetting("footer", s)
-
-        G_reader_settings:flush()
+        -- 注意：这里**不再** G_reader_settings:saveSetting("footer", s) + flush()。
+        -- 那两行会把定制永久写进用户全局配置，影响之后打开的所有原生书。
 
     end)
 
@@ -4268,7 +5601,15 @@ function XRead:onCloseDocument()
 
     end
 
-    local path = self.document and self.document.file
+    -- 文档路径：优先当前阅读器的 ui.document，其次插件实例快照的 self.document。
+    -- self.document 是插件实例创建时传入的快照，reloadDocument 之后它会指向
+    -- 已关闭的旧对象；只认它会让下面的清理（open_path / txt_path / 首页时钟）全部失效。
+    local doc = self.ui and self.ui.document
+
+    local path = (doc and doc.file) or (self.document and self.document.file)
+
+    -- 恢复被 _applyReaderFooter 改写的底栏定制（只影响本实例，不动全局设置）
+    self:_restoreReaderFooter()
 
     if not path then return end
 
@@ -4309,6 +5650,11 @@ function XRead:onEndOfBook()
 
     if SHARED.txt_path ~= path then return end
 
+    -- 读到末尾前再兜一次：任何路径把 end_document_action 恢复成别的值时，
+    -- KOReader 会在最后一页执行原生结束动作（打开文件管理器/下一本），
+    -- 真机表现就是连续翻页突然闪回书架。
+    disableEndPopup()
+
     local size = fileSize(path)
 
     logger.dbg("xread EndOfBook", path, "size", tostring(size), "loaded", tostring(SHARED.txt_size))
@@ -4329,11 +5675,37 @@ function XRead:onEndOfBook()
 
         job.want_reload = true
 
-        self:showInfo(_("正在获取后续章节…"))
+        -- 静默等后续章节：补齐后 auto-reload 会自动接上，不弹提示打断阅读
+
+        logger.info("xread end of book, waiting for next chunks")
 
         return true
 
     end
+
+    -- 本批章节已读完（后台也补完了）：同样吞掉事件。
+    -- 不能让 KOReader 落回自带的「文档结束」动作（可能配置成打开文件管理器/下一本），
+    -- 否则正文里连续点下一页会突然闪回书架。退出请走工具栏「书架 / 首页」。
+    -- 但完全静默会让人误以为"翻页失灵/卡死"，所以第一次到底给一次轻提示。
+    if self._end_notified_path ~= path then
+
+        self._end_notified_path = path
+
+        UIManager:nextTick(function()
+
+            pcall(function()
+
+                self:showInfo(_("已到本书最后。可从工具栏切换章节或返回书架"))
+
+            end)
+
+        end)
+
+    end
+
+    logger.info("xread end of book, no more chunks; swallow end action")
+
+    return true
 
 end
 -- 返回书架：先退出书籍，回到文件管理器，再把书架弹出来
@@ -4359,8 +5731,27 @@ function XRead:closeBookToShelf()
 
     UIManager:nextTick(function()
 
-        -- 先把 xread 书架盖到最上层，再关书；
-        -- 否则关书露出的 KOReader 文件管理器会闪现在书架之前
+        -- 关书与重建书架必须在同一个 UI tick 内完成。
+        -- 之前先盖书架 → 延时 0.15s 关书 → 再延时 0.4s 补书架，
+        -- 中间两次 repaint 会把 KOReader 文件管理器露出来（闪现 xread_books）。
+        -- onHome 会关书并重新拉起文件管理器；只 close 的话整个 UI 会一起退出。
+
+        if ui and ui.document then
+
+            if ui.onHome then
+
+                ui:onHome()
+
+            else
+
+                ui:onClose()
+
+            end
+
+        end
+
+        -- 关书后立刻盖书架：同一 tick 内入窗，
+        -- UIManager 下一次 repaint 直接画书架，不再经过文件管理器那一帧
 
         local fm = SHARED.fm
 
@@ -4368,41 +5759,84 @@ function XRead:closeBookToShelf()
 
             pcall(function() fm:openShelf() end)
 
+        else
+
+            pcall(function() self:openShelf() end)
+
         end
 
-        UIManager:scheduleIn(0.15, function()
+    end)
 
-            -- onHome 会关书并重新拉起文件管理器；只 close 的话整个 UI 会一起退出
+end
 
-            if ui and ui.document then
+-- 返回我的首页：与 closeBookToShelf 同思路——先把首页盖到最上层，再关书，
+-- 避免关书露出文件管理器闪现。供正文工具栏顶部「首页」按钮使用。
+function XRead:closeBookToHome()
 
-                if ui.onHome then
+    if Device.input and Device.input.inhibitInputUntil then
 
-                    ui:onHome()
+        Device.input:inhibitInputUntil(0.8)
 
-                else
+    end
 
-                    ui:onClose()
+    UIManager:nextTick(function()
 
-                end
+        local ui = self.ui
+
+        -- 先把遗留首页收干净。HomeView 内部还留着 live_widget 时，
+        -- show 会走「原地更新」并返回那个旧实例；旧实例若在文件管理器下面，
+        -- 真机就表现为点首页没反应 / 只闪一下别的页面。
+        self:_stopHomeTicker()
+
+        if self._home_view and not self._home_view._miu_closed then
+
+            pcall(function() UIManager:close(self._home_view) end)
+
+        end
+
+        pcall(function() MiuiHome.close() end)
+
+        self._home_view = nil
+
+        SHARED.home_view = nil
+
+        -- 先在 ReaderUI 还盖满屏幕时把新首页建好（此刻入栈但看不见），
+        -- 再关书：同一 tick 内只会有一次重绘，直接落在新首页上。
+        pcall(function() self:showHome(self._home_shelf_page or 1) end)
+
+        if ui and ui.document then
+
+            if ui.onHome then
+
+                ui:onHome()
+
+            else
+
+                ui:onClose()
 
             end
 
-            -- 书架可能在关书过程中被重建，再补一次确保盖在最上层
+        end
 
-            UIManager:scheduleIn(0.4, function()
+        -- onHome 会拉起文件管理器并可能把它放到栈顶，盖住刚建好的首页
+        local FM = nil
 
-                local fm2 = SHARED.fm
+        pcall(function() FM = require("apps/filemanager/filemanager") end)
 
-                if fm2 and fm2.ui and not fm2.ui.document then
+        if FM and FM.instance and UIManager:isWidgetShown(FM.instance) then
 
-                    pcall(function() fm2:openShelf() end)
+            pcall(function() UIManager:close(FM.instance) end)
 
-                end
+        end
 
-            end)
+        -- 首页若被意外挤下去（仍存活），重新置顶
+        local view = self._home_view
 
-        end)
+        if view and not view._miu_closed and not UIManager:isWidgetShown(view) then
+
+            pcall(function() UIManager:show(view) end)
+
+        end
 
     end)
 
@@ -4496,9 +5930,16 @@ function XRead:onReaderTapZone(ges, act)
 
     if not doc or not doc.file then return false end
 
-    if SHARED.txt_path ~= doc.file then return false end
+    -- 只认领阅读X打开的书（正文文件都在 BOOK_DIR 下）；非 xread 书不拦截
+    if not SHARED.book or not doc.file:find(BOOK_DIR, 1, true) then return false end
 
-    -- 工具栏面板开着时不抢点击（面板自己处理关闭按钮）
+    -- 自愈：跳章/重开等瞬间 txt_path 可能短暂错位，直接认领并修复，
+    -- 绝不把点击泄漏给 KOReader 原生菜单/设置面板（表现为正文里弹出双栏/屏幕方向设置）
+    if SHARED.txt_path ~= doc.file then
+
+        SHARED.txt_path, SHARED.txt_size = doc.file, fileSize(doc.file)
+
+    end
 
     if act == 0 then
 
@@ -4514,11 +5955,10 @@ function XRead:onReaderTapZone(ges, act)
 
         pager:onGotoViewRel(act)
 
-        return true
-
     end
 
-    return false
+    -- 无论翻页是否成功都吞掉事件，防止落回原生 readerconfigmenu/readermenu 分区
+    return true
 
 end
 -- ---------- 设置读写 ----------
@@ -4547,7 +5987,17 @@ end
 -- 通用：标题 + 一列功能行 + 点空白/返回键关闭的全屏浮层
 function XRead:showMoreListPanel(title, items, opts)
 
+    -- 连续点开（更多/搜索结果等）时先关掉上一个，避免弹层叠住“无法取消”
+    if self._more_panel_view then
+
+        pcall(function() UIManager:close(self._more_panel_view) end)
+
+        self._more_panel_view = nil
+
+    end
+
     local VerticalGroup = require("ui/widget/verticalgroup")
+    local HorizontalGroup = require("ui/widget/horizontalgroup")
     local HorizontalSpan = require("ui/widget/horizontalspan")
     local FrameContainer = require("ui/widget/container/framecontainer")
     local CenterContainer = require("ui/widget/container/centercontainer")
@@ -4615,6 +6065,7 @@ function XRead:showMoreListPanel(title, items, opts)
                 -- callback 为空的行是纯信息展示（如版本号），点击无动作
                 if item.callback then
                     UIManager:close(dialog)
+                    if self._more_panel_view == dialog then self._more_panel_view = nil end
                     item.callback()
                 end
                 return true
@@ -4627,10 +6078,21 @@ function XRead:showMoreListPanel(title, items, opts)
 
     local card = VerticalGroup:new{ align = "left" }
 
-    card[#card + 1] = TextBoxWidget:new{
+    -- 标题行右侧统一放「✕」关闭按钮（右上角），与账号/地址/书籍设置面板一致
+    local title_tw = TextWidget:new{
         text = title, face = face_title, bold = true,
-        width = inner_w, fgcolor = Blitbuffer.COLOR_BLACK,
+        fgcolor = Blitbuffer.COLOR_BLACK,
     }
+    local close_w = Screen:scaleBySize(44)
+    local title_stretch = inner_w - title_tw:getSize().w - close_w
+    if title_stretch < 0 then title_stretch = 0 end
+    card[#card + 1] = HorizontalGroup:new{ align = "center",
+        title_tw, HorizontalSpan:new{ width = title_stretch },
+        UICommon.closeButtonAtEdge(function()
+            if dialog then UIManager:close(dialog) end
+            if self._more_panel_view == dialog then self._more_panel_view = nil end
+            UIManager:setDirty("all", "full")
+        end, pad, close_w) }
     card[#card + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(14) }
     card[#card + 1] = LineWidget:new{
         dimen = Geom:new{ w = inner_w, h = 1 },
@@ -4671,12 +6133,14 @@ function XRead:showMoreListPanel(title, items, opts)
 
     function Overlay:onTap()
         UIManager:close(dialog)
+        if self._owner and self._owner._more_panel_view == dialog then self._owner._more_panel_view = nil end
         UIManager:setDirty("all", "full")   -- 整屏重绘，防残影
         return true
     end
 
     function Overlay:onClose()
         UIManager:close(dialog)
+        if self._owner and self._owner._more_panel_view == dialog then self._owner._more_panel_view = nil end
         UIManager:setDirty("all", "full")
         return true
     end
@@ -4688,6 +6152,10 @@ function XRead:showMoreListPanel(title, items, opts)
 
     dialog = Overlay:new{}
 
+    dialog._owner = self
+
+    self._more_panel_view = dialog
+
     UIManager:show(dialog)
 
 end
@@ -4695,14 +6163,10 @@ end
 function XRead:showMorePanel()
 
     self:showMoreListPanel(_("更多"), {
-        { label = _("我的首页"), callback = function() self:openHome() end },
         { label = _("我的书架"), callback = function() self:openShelf() end },
         { label = _("地址管理"), callback = function() self:showServerManage() end },
         { label = _("账号管理"), callback = function() self:showAccountManage() end },
-        { label = _("书架管理"), callback = function() self:showShelfManage() end },
-        { label = _("缓存管理"), callback = function() self:showCacheManage() end },
         { label = _("翻页管理"), callback = function() self:showPageManage() end },
-        { label = _("阅读记录"), callback = function() self:showReadingStats() end },
         { label = _("关于本机"), callback = function() self:showAboutPanel() end },
     }, { hint = _("点击条目进入；点空白处返回。") })
 
@@ -4710,10 +6174,27 @@ end
 
 -- ---------- 在线热更新 ----------
 
+-- 自动检查发现新版本时的提示（同一版本只提示一次，由 _update_notified 去重）
+-- 只做通知不做确认：安装入口仍是「更多 → 关于本机 → 检查更新」，那里只有一个确认框
+function XRead:notifyUpdateAvailable()
+
+    local info = self._update_info
+
+    if not info or not info.newer then return end
+
+    self:showInfo(_("发现可用新版本，请检查更新"), 6)
+
+end
+
 -- 书架/首页显示后错峰静默检查新版本（失败完全无声，仅首次发现时提示一次）
 function XRead:quietUpdateCheck(delay)
 
     if os.getenv("XREAD_NO_UPDATER") == "1" then return end
+
+    -- 一次会话只查一次：首页会反复重建，别每次都发一遍列目录请求
+    if self._update_checked then return end
+
+    self._update_checked = true
 
     UIManager:scheduleIn(delay or 10, function()
 
@@ -4725,12 +6206,20 @@ function XRead:quietUpdateCheck(delay)
 
             if not ok then Trapper:clear() return end
 
-            local ok_check, manifest, info = pcall(function() return updater:check() end)
+            local ok_check, manifest, info = pcall(function() return self:checkUpdateBest(updater) end)
 
             Trapper:clear()
 
-            if ok_check and manifest and info and info.newer
-                    and self._update_notified ~= info.remote_version then
+            if not ok_check or not manifest or not info then
+
+                -- 静默失败，但留下可查的痕迹（离线/没登录是常态，不打扰用户）
+                logger.warn("xread quiet update check failed:", tostring(ok_check and "no manifest" or manifest))
+
+                return
+
+            end
+
+            if info.newer and self._update_notified ~= info.remote_version then
 
                 self._update_notified = info.remote_version
 
@@ -4738,8 +6227,19 @@ function XRead:quietUpdateCheck(delay)
 
                 self._update_info = info
 
-                self:showInfo(T(_("发现新版本 %1 → %2\n请到 更多 → 关于本机 → 检查更新 安装"),
-                    tostring(info.local_version), tostring(info.remote_version)))
+                logger.info("xread update available",
+                    tostring(info.local_version), "->", tostring(info.remote_version))
+
+                -- 正在看书就先攒着，回首页再提示，避免糊在正文上
+                if SHARED.open_path or self._opening_book then
+
+                    self._update_pending_notice = true
+
+                else
+
+                    UIManager:nextTick(function() self:notifyUpdateAvailable() end)
+
+                end
 
             end
 
@@ -4751,6 +6251,14 @@ end
 
 -- 关于本机：插件版本 / 后端版本 / 固件版本 / 检查更新
 function XRead:showAboutPanel()
+
+    -- 连点「关于本机」会起多个 Trapper 任务，每个任务都建一份同名面板叠在栈里
+    if self._about_panel_loading then return end
+
+    self._about_panel_loading = true
+
+    -- 兜底：任务异常时也要把标记放回去，否则「关于本机」以后都点不开
+    UIManager:scheduleIn(20, function() self._about_panel_loading = false end)
 
     self:runQuiet(function()
 
@@ -4788,7 +6296,13 @@ function XRead:showAboutPanel()
 
         self._about_info = { plugin_v = plugin_v, server_v = server_v, fw = fw or _("未知") }
 
-        UIManager:nextTick(function() self:_showAboutPanel() end)
+        UIManager:nextTick(function()
+
+            self._about_panel_loading = false
+
+            self:_showAboutPanel()
+
+        end)
 
     end)
 
@@ -4808,26 +6322,130 @@ function XRead:_showAboutPanel()
 
         { label = _("检查更新"), callback = function() self:checkForUpdateInteractive() end },
 
-    }, { hint = _("检查更新会从服务端下载新版插件并安装，需重启 KOReader 生效。") })
+    }, { hint = _("先从服务端检查更新；服务端不可用或无新版时，再安装放在插件目录内的本地更新包（规范命名 zip/tar.gz/tgz）。确认后自动安装并重启 KOReader。") })
+
+end
+
+-- 检查更新：先走服务端列目录；服务端失败或没有更高版本时，
+-- 再找插件目录内的本地更新包（规范命名 zip/tar.gz/tgz）；返回 manifest + info
+function XRead:checkUpdateBest(updater)
+
+    local ok_r, rmanifest, rinfo = pcall(function() return updater:check() end)
+
+    if ok_r and rmanifest then
+
+        return rmanifest, rinfo
+
+    end
+
+    local ok_l, lmanifest, linfo = pcall(function() return updater:checkLocal() end)
+
+    if ok_l and lmanifest then
+
+        return lmanifest, linfo
+
+    end
+
+    -- 两者都没有：把远端错误抛出去（本地无包时保持原报错语义）
+
+    if not ok_r then error(rmanifest, 0) end
+
+    return nil
 
 end
 
 -- 手动检查更新（关于本机 → 检查更新）
 function XRead:checkForUpdateInteractive()
 
+    -- 单实例：连点「检查更新」会并发出多个 Trapper 任务，每个任务各自弹一次
+    -- 确认框；框叠框 + 旧帧没刷掉，看起来就是画面残留甚至卡死。
+    if self._update_checking then
+
+        logger.info("xread update check ignored: already running")
+
+        return
+
+    end
+
+    self._update_checking = true
+
+    local done = function() self._update_checking = false end
+
+    -- 兜底：网络异常/协程被中断时也要解锁，否则以后点「检查更新」毫无反应
+    UIManager:scheduleIn(30, done)
+
     self:runQuiet(function()
 
-        local updater = require("xread/updater"):new{ client = self.client }
+        local pending_confirm = false
 
-        local manifest, info = updater:check()
+        local ok_task, err_task = pcall(function()
 
-        self._update_manifest = manifest
+            -- 列 webdav 目录要 token；没登录先登（未填账号会自己提示）
+            if not self:ensureLogin() then return end
 
-        self._update_info = info
+            local updater = require("xread/updater"):new{ client = self.client }
 
-        self._update_notified = info.newer and info.remote_version or self._update_notified
+            local ok, manifest, info = pcall(function() return self:checkUpdateBest(updater) end)
 
-        UIManager:nextTick(function() self:confirmUpdate() end)
+            -- 两边都没拿到包才算失败（失败才弹窗）；原因洗净后给一行
+            if not ok or not manifest or not info then
+
+                local reason = ok and _("服务端与插件目录内都没有可用的更新包")
+                    or readable_error(manifest)
+
+                logger.warn("xread update check failed:", tostring(reason))
+
+                self:showInfo(T(_("检查更新失败\n原因：%1"), reason), 6)
+
+                return
+
+            end
+
+            self._update_manifest = manifest
+
+            self._update_info = info
+
+            -- 用户是主动点的「检查更新」，已经看到结果了，不再重复自动提示
+            self._update_pending_notice = nil
+
+            if not info.newer then
+
+                -- 非失败但需要回执：不然点了没反应像卡住
+                self:showInfo(T(_("当前 %1 已是最新版本"), tostring(info.local_version)))
+
+                return
+
+            end
+
+            self._update_notified = info.remote_version
+
+            pending_confirm = true
+
+        end)
+
+        if pending_confirm and ok_task then
+
+            -- 确认框交给下一个 tick：既避开面板关闭的刷新，也把「检查中」标记
+            -- 一直压到框真正弹出来，防止两次点击各弹一个框。
+            UIManager:nextTick(function()
+
+                self:confirmUpdate()
+
+                done()
+
+            end)
+
+        else
+
+            done()
+
+        end
+
+        if not ok_task then
+
+            logger.warn("xread update check task error:", tostring(err_task))
+
+        end
 
     end)
 
@@ -4841,75 +6459,169 @@ function XRead:confirmUpdate()
 
     if not info.newer then
 
-        self:showInfo(T(_("已是最新版本 %1"), tostring(info.local_version)))
-
         return
+
+    end
+
+    -- 已经有一个确认框在屏幕上：绝不再叠第二个
+    local existing = self._update_confirm_box
+
+    if existing then
+
+        if UIManager:isWidgetShown(existing) then return end
+
+        self._update_confirm_box = nil
+
+    end
+
+    -- 收掉底层「关于本机」面板：确认框独占一屏，避免两层文字互相透出像残影
+    if self._more_panel_view then
+
+        local panel = self._more_panel_view
+
+        self._more_panel_view = nil
+
+        pcall(function() UIManager:close(panel) end)
+
+        if os.getenv("XREAD_AUTOTEST") then
+
+            print("[XREAD_AUTOTEST] confirm_closed_about_panel")
+
+        end
+
+        -- 面板比确认框大：面板关掉后必须整屏重刷，否则它露在框外的边缘会留成残影
+        UIManager:setDirty("all", "full")
 
     end
 
     local notes = manifest.notes or ""
 
+    if #notes > 300 then notes = notes:sub(1, 300) .. "…" end
+
     if notes ~= "" then notes = "\n\n更新内容：" .. notes end
 
-    UIManager:show(ConfirmBox:new{
+    -- 本地包直接安装；远端包下载整包后文件级差异在下载后判定
+    local src_line = info.via == "local" and "\n（本地更新包，无需联网）" or ""
 
-        text = T(_("发现新版本 %1 → %2\n需要下载 %3 个文件（%4 个可跳过）%5\n\n现在更新吗？\n安装后需重启 KOReader 生效。"),
-            tostring(info.local_version), tostring(info.remote_version),
-            tostring(info.total - info.skipped), tostring(info.skipped), notes),
+    -- 唯一确认框：更新 + 重启合并成一次询问，装完不再二次确认
+    local body = T(_("新版本 %1 已就绪，请尽快更新%2%3\n\n点「更新并重启」后立即安装，装完自动重启 KOReader 生效。"),
+        tostring(info.remote_version), src_line, notes)
 
-        ok_text = _("更新"),
+    local owner = self
 
-        ok_callback = function() self:applyUpdateFlow(manifest) end,
+    local box
 
-    })
+    box = ConfirmBox:new{
+
+        text = body,
+
+        ok_text = _("更新并重启"),
+
+        cancel_text = _("取消"),
+
+        -- 不再允许点空白随手关掉：那一下只刷半个屏幕，旧框会留在墨水屏上
+        dismissable = false,
+
+        ok_callback = function()
+
+            if owner._update_confirm_box == box then owner._update_confirm_box = nil end
+
+            self:applyUpdateFlow(manifest)
+
+        end,
+
+        cancel_callback = function()
+
+            if owner._update_confirm_box == box then owner._update_confirm_box = nil end
+
+        end,
+
+    }
+
+    -- 确认框关掉时强制整屏重刷一次，清掉叠层留下的残影
+    local base_on_close = box.onCloseWidget
+
+    box.onCloseWidget = function(w)
+
+        if base_on_close then base_on_close(w) end
+
+        if owner._update_confirm_box == w then owner._update_confirm_box = nil end
+
+        UIManager:setDirty("all", "full")
+
+    end
+
+    self._update_confirm_box = box
+
+    if os.getenv("XREAD_AUTOTEST") then
+
+        print("[XREAD_AUTOTEST] update_confirm_shown")
+
+    end
+
+    UIManager:show(box)
 
 end
 
--- 下载并替换文件；完成后提示重启
+-- 安装更新：本地包直接解压；远端包下载并替换文件。
+-- 全程只有一次确认（已在确认框里说明会重启），装完自动重启，不再二次询问。
 function XRead:applyUpdateFlow(manifest)
 
     self:runQuiet(function()
 
         local updater = require("xread/updater"):new{ client = self.client }
 
-        local changed, skipped = updater:apply(manifest, function(done, total, path)
+        -- 进度提示：按时间节流（150ms），边写盘边刷屏反而更慢；
+        -- 第三参数跳过 Trapper 的「点击已关掉提示」检测，避免每次刷新都让出 0.1s
+        local last_t = 0
 
-            Trapper:info(T(_("正在更新 %1/%2：%3"), tostring(done), tostring(total), tostring(path)), true)
+        local on_progress = function(done, total, path)
+            local cnt = tonumber(total) or 0
+            local pct = cnt > 0 and math.floor((tonumber(done) or 0) * 100 / cnt) or 0
+            local t = now_ms()
+            if t - last_t < 150 then return end
+            last_t = t
+            local name = tostring(path or ""):match("[^/]+$") or tostring(path or "")
+            Trapper:info(T(_("正在更新 %1%（%2/%3） %4"),
+                tostring(pct), tostring(done), tostring(cnt), name), true, true)
+        end
 
-        end)
+        Trapper:info(manifest.local_file and _("正在安装本地更新包…") or _("正在下载更新包…"), true, true)
+
+        local changed, skipped
+
+        if manifest.local_file then
+
+            changed, skipped = updater:applyLocalPackage(manifest, on_progress)
+
+        else
+
+            changed, skipped = updater:apply(manifest, on_progress)
+
+        end
+
+        Trapper:clear()
 
         self._update_manifest = nil
 
         self._update_info = nil
 
-        -- 更新包与解压目录同名同级留存，提示用户可在哪找到本次安装的包
-        local pkg_line = ""
-        if updater.getLastPackage then
-            local _pkg_file, pkg_dir = updater:getLastPackage()
-            if pkg_dir then
-                pkg_line = "\n" .. T(_("更新包已留存：xread_update/%1/"),
-                    tostring(pkg_dir:match("[^/]+$") or pkg_dir))
+        logger.info("xread update installed:",
+            tostring(changed), "changed,", tostring(skipped), "skipped")
+
+        self:showInfo(T(_("更新完成（变更 %1 个文件，跳过 %2 个未变更）\n正在重启 KOReader…"),
+            tostring(changed), tostring(skipped)), 8)
+
+        -- 确认框已包含「会重启」，这里直接重启；真重启不了才提示手动重启
+        UIManager:scheduleIn(3, function()
+
+            local ok = pcall(function() UIManager:restartKOReader() end)
+
+            if not ok then
+
+                self:showInfo(_("自动重启失败，请手动重启 KOReader 使更新生效"))
+
             end
-        end
-
-        UIManager:nextTick(function()
-
-            UIManager:show(ConfirmBox:new{
-
-                text = T(_("更新完成（变更 %1 个文件，跳过 %2 个未变更）。%3\n需要重启 KOReader 生效，现在重启吗？"),
-                    tostring(changed), tostring(skipped), pkg_line),
-
-                ok_text = _("重启"),
-
-                ok_callback = function()
-
-                    UIManager:restartKOReader()
-
-                end,
-
-                cancel_text = _("稍后手动重启"),
-
-            })
 
         end)
 
@@ -4962,8 +6674,6 @@ function XRead:showPageManage()
             callback = function()
 
                 self:saveSetting("page_mode", it.key)
-
-                self:showInfo(T(_("已选择：%1"), it.desc))
 
                 pcall(function() self:setupCenterTap() end)   -- 阅读中即时生效
 
@@ -5040,12 +6750,12 @@ function XRead:showServerManage()
         self._server_draft = nil
         if dialog then UIManager:close(dialog) end
         UIManager:setDirty("all", "full")   -- 整屏重绘，防残影
-        self:showInfo(_("服务器设置已保存"))
     end
 
     local function refreshDialog()
         if dialog then UIManager:close(dialog) end
-        UIManager:setDirty("all", "full")
+        -- 只换波形、不整屏深刷：原来每改一个字段就全屏黑白闪一次
+        UIManager:setDirty("all", "ui")
         self:showServerManage()
     end
 
@@ -5149,21 +6859,12 @@ function XRead:showServerManage()
         text = _("地址管理"), face = face_title, bold = true,
         fgcolor = Blitbuffer.COLOR_BLACK,
     }
-    local close_w = Screen:scaleBySize(48)
-    local CloseBtn = InputContainer:extend{}
-    function CloseBtn:init()
-        self.dimen = Geom:new{ w = close_w, h = Screen:scaleBySize(36) }
-        self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
-        self[1] = TextWidget:new{
-            text = "✕", face = face_title, bold = true,
-            fgcolor = Blitbuffer.COLOR_GRAY_D,
-        }
-    end
-    function CloseBtn:onTap() saveAndClose() return true end
+    local close_w = Screen:scaleBySize(44)
     local stretch = inner_w - title_tw:getSize().w - close_w
     if stretch < 0 then stretch = 0 end
     card[#card + 1] = HorizontalGroup:new{ align = "center",
-        title_tw, HorizontalSpan:new{ width = stretch }, CloseBtn:new{} }
+        title_tw, HorizontalSpan:new{ width = stretch },
+        UICommon.closeButtonAtEdge(saveAndClose, pad, close_w) }
     card[#card + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(14) }
     card[#card + 1] = LineWidget:new{
         dimen = Geom:new{ w = inner_w, h = 1 },
@@ -5253,22 +6954,28 @@ function XRead:showAccountManage()
     local dialog  -- forward
 
     local function saveDraft()
+        local old_username = self:getSetting("username", "")
+        local old_password = self:getSetting("password", "")
+        local old_address = self:getSetting("address", "")
         self:saveSetting("nickname", draft.nickname)
         self:saveSetting("username", draft.username)
         self:saveSetting("password", draft.password)
+        -- 用户名/密码改了：登录态与所有用到用户名的地方一起切过去
+        -- 延迟登录：让设置页/账号页先关掉，再在后台走登录（最长 12s，不能卡住关闭动作）
+        self:_syncCredentials(old_username, old_password, old_address, true)
     end
 
     local function saveAndClose()
         saveDraft()
         self._account_draft = nil
         if dialog then UIManager:close(dialog) end
+        self:_refreshHomeIfOpen()   -- 昵称改动实时反映到首页
         UIManager:setDirty("all", "full")   -- 整屏重绘，防残影
-        self:showInfo(_("账号设置已保存"))
     end
 
     local function refreshDialog()
         if dialog then UIManager:close(dialog) end
-        UIManager:setDirty("all", "full")
+        UIManager:setDirty("all", "ui")
         self:showAccountManage()
     end
 
@@ -5357,10 +7064,10 @@ function XRead:showAccountManage()
     }
     rows[#rows + 1] = HorizontalSpan:new{ width = gap }
     rows[#rows + 1] = FieldRow:new{
-        label = _("用户名"),
+        label = _("账号"),
         value = shownValue("username"),
         width = inner_w, height = row_h,
-        callback = function() editField("username", _("用户名")) end,
+        callback = function() editField("username", _("账号")) end,
     }
     rows[#rows + 1] = HorizontalSpan:new{ width = gap }
     rows[#rows + 1] = FieldRow:new{
@@ -5382,21 +7089,12 @@ function XRead:showAccountManage()
         text = _("账号管理"), face = face_title, bold = true,
         fgcolor = Blitbuffer.COLOR_BLACK,
     }
-    local close_w = Screen:scaleBySize(48)
-    local CloseBtn = InputContainer:extend{}
-    function CloseBtn:init()
-        self.dimen = Geom:new{ w = close_w, h = Screen:scaleBySize(36) }
-        self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
-        self[1] = TextWidget:new{
-            text = "✕", face = face_title, bold = true,
-            fgcolor = Blitbuffer.COLOR_GRAY_D,
-        }
-    end
-    function CloseBtn:onTap() saveAndClose() return true end
+    local close_w = Screen:scaleBySize(44)
     local stretch = inner_w - title_tw:getSize().w - close_w
     if stretch < 0 then stretch = 0 end
     card[#card + 1] = HorizontalGroup:new{ align = "center",
-        title_tw, HorizontalSpan:new{ width = stretch }, CloseBtn:new{} }
+        title_tw, HorizontalSpan:new{ width = stretch },
+        UICommon.closeButtonAtEdge(saveAndClose, pad, close_w) }
     card[#card + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(14) }
     card[#card + 1] = LineWidget:new{
         dimen = Geom:new{ w = inner_w, h = 1 },
@@ -5450,7 +7148,7 @@ end
 -- 书架管理：多选书籍 → 批量删除 / 移动分组
 function XRead:showShelfManage()
 
-    self:runOnline(_("正在加载书架…"), function()
+    self:runQuiet(function()
 
         if not self:ensureLogin() then return end
 
@@ -5598,7 +7296,7 @@ function XRead:_showShelfManageDialog(books, selected, page)
                         if okd then ok_n = ok_n + 1 else fail_n = fail_n + 1 end
                     end
                     Trapper:clear()
-                    self:showInfo(T(_("已删除 %1 本（失败 %2 本）"), ok_n, fail_n))
+                    if fail_n > 0 then self:showInfo(T(_("删除失败 %1 本"), fail_n)) end
                     -- 重开时重新拉书架
                     self:showShelfManage()
                 end)
@@ -5615,7 +7313,7 @@ function XRead:_showShelfManageDialog(books, selected, page)
             if selected[url] then targets[#targets + 1] = book end
         end
         if #targets == 0 then self:showInfo(_("先勾选要移动的书")); return end
-        self:runOnline(_("正在获取分组…"), function()
+        self:runQuiet(function()
             if not self:ensureLogin() then return end
             local okg, groups = pcall(function() return self.client:getBookGroups() end)
             if not okg or type(groups) ~= "table" then
@@ -5643,7 +7341,7 @@ function XRead:_showShelfManageDialog(books, selected, page)
                             if okm then ok_n = ok_n + 1 else fail_n = fail_n + 1 end
                         end
                         Trapper:clear()
-                        self:showInfo(T(_("已移动 %1 本（失败 %2 本）"), ok_n, fail_n))
+                        if fail_n > 0 then self:showInfo(T(_("移动失败 %1 本"), fail_n)) end
                     end)
                 end
             end
@@ -5740,14 +7438,20 @@ function XRead:_showShelfManageDialog(books, selected, page)
         function DialogClass:init()
             self.dimen = Geom:new{ w = sw, h = sh }
             self.key_events = { Close = { { Device.input.group.Back } } }
-            self.ges_events = { TapSelect = { GestureRange:new{ ges = "tap", range = Geom:new{ w = sw, h = sh } } } }
+            self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = Geom:new{ w = sw, h = sh } } } }
             self[1] = CenterContainer:new{ dimen = Geom:new{ w = sw, h = sh }, frame }
         end
         function DialogClass:onClose()
             UIManager:close(self)
+            UIManager:setDirty("all", "full")
             return true
         end
-        function DialogClass:onTapSelect() return true end
+        -- 子控件（书行/按钮）的 Tap 会先被消费；点卡片外空白冒泡到这里 → 关闭
+        function DialogClass:onTap()
+            UIManager:close(self)
+            UIManager:setDirty("all", "full")
+            return true
+        end
         dialog = DialogClass:new{}
     else
         dialog = CenterContainer:new{ dimen = Geom:new{ w = sw, h = sh }, frame }
@@ -5755,93 +7459,8 @@ function XRead:_showShelfManageDialog(books, selected, page)
 
     UIManager:show(dialog)
 
-    -- runOnline 的 UI:clear() 会在弹窗 show 之后重绘进度框区域，
-    -- 局部刷新会把弹窗区刷回底层正文（残影）；这里强制全屏刷新兜底
+    -- 任务统一静默执行（不再有进度框），show 之后整体重绘一次，避免残影
     UIManager:setDirty(dialog, "full")
-
-end
-
--- 缓存管理：选书 → 选档位（10/50/100/全部）
-function XRead:showCacheManage()
-
-    self:runOnline(_("正在加载书架…"), function()
-
-        if not self:ensureLogin() then return end
-
-        local ok, books = pcall(function() return self.client:getBookshelf() end)
-
-        if not ok or type(books) ~= "table" or #books == 0 then
-
-            self:showInfo(_("书架为空"))
-
-            return
-
-        end
-
-        local items = {}
-
-        for _bi, book in ipairs(books) do
-
-            items[#items + 1] = {
-
-                text = (book.name or "?") .. "　" .. (book.author or ""),
-
-                callback = function() self:showCacheLevels(book) end,
-
-            }
-
-        end
-
-        UIManager:show(Menu:new{
-
-            title = _("缓存管理 · 选择书籍"),
-
-            item_table = items,
-
-            width = Screen:getWidth(),
-
-            height = Screen:getHeight(),
-
-        })
-
-    end)
-
-end
-
-function XRead:showCacheLevels(book)
-
-    local levels = {
-        { label = _("缓存 10 章"), count = 10 },
-        { label = _("缓存 50 章"), count = 50 },
-        { label = _("缓存 100 章"), count = 100 },
-        { label = _("缓存全部章节"), count = 0 },
-    }
-
-    local items = {}
-
-    for _li, lv in ipairs(levels) do
-
-        items[#items + 1] = {
-
-            text = lv.label,
-
-            callback = function() self:doCacheBook(book, lv.count) end,
-
-        }
-
-    end
-
-    UIManager:show(Menu:new{
-
-        title = T(_("缓存管理 · %1"), tostring(book.name or "")),
-
-        item_table = items,
-
-        width = Screen:getWidth(),
-
-        height = Screen:getHeight(),
-
-    })
 
 end
 
@@ -5887,28 +7506,30 @@ function XRead:showSettings()
 
     -- 统一提交草稿到配置（关闭即保存）
     local function saveDraft()
+        local old_username = self:getSetting("username", "")
+        local old_password = self:getSetting("password", "")
+        local old_address = self:getSetting("address", "")
         self:saveSetting("address", draft.address)
         self:saveSetting("username", draft.username)
         self:saveSetting("password", draft.password)
         self:saveSetting("nickname", draft.nickname)
         self:saveSetting("max_chapters", tostring(draft.max_chapters))
-        if draft.address ~= self.client.address then
-            self.client.address = draft.address
-            self.client.accessToken = nil   -- 换地址后需重登
-        end
+        -- 地址/账号/密码任一变更：清旧 token、按新账号重登、换账号清旧书架缓存
+        -- 延迟登录：让设置页/账号页先关掉，再在后台走登录（最长 12s，不能卡住关闭动作）
+        self:_syncCredentials(old_username, old_password, old_address, true)
     end
 
     local function saveAndClose()
         saveDraft()
         self._settings_draft = nil
         if dialog then UIManager:close(dialog) end
+        self:_refreshHomeIfOpen()   -- 昵称改动实时反映到首页
         UIManager:setDirty("all", "full")   -- 整屏重绘，防残影
-        self:showInfo(_("设置已保存"))
     end
 
     local function refreshDialog()
         if dialog then UIManager:close(dialog) end
-        UIManager:setDirty("all", "full")
+        UIManager:setDirty("all", "ui")
         self:showSettings()   -- 重建读 self._settings_draft
     end
 
@@ -5962,32 +7583,41 @@ function XRead:showSettings()
 
     local value_widget  -- 步进器数值，点 ± 后就地刷新文本
     local function stepperRow()
+        -- 就地更新数值，不重建整个对话框。
+        -- 原来每次按 ± 都 close + 整屏深刷 + 重建，e-ink 上按一下闪一下。
+        local function bump(delta)
+            draft.max_chapters = math.max(1, math.min(200,
+                (tonumber(draft.max_chapters) or 3) + delta))
+            if value_widget and value_widget.setText then
+                pcall(function()
+                    value_widget:setText(tostring(draft.max_chapters))
+                    value_widget:getSize()          -- free() 后重算尺寸
+                    UIManager:setDirty(dialog or "all", "ui")
+                end)
+            else
+                refreshDialog()
+            end
+        end
         local minus = Button:new{
             text = "－",
             text_font_face = "cfont", text_font_size = 20,
             bordersize = 1, radius = 6,
             width = Screen:scaleBySize(72),
-            callback = function()
-                draft.max_chapters = math.max(1, (tonumber(draft.max_chapters) or 30) - 1)
-                refreshDialog()
-            end,
+            callback = function() bump(-1) end,
         }
         local plus = Button:new{
             text = "＋",
             text_font_face = "cfont", text_font_size = 20,
             bordersize = 1, radius = 6,
             width = Screen:scaleBySize(72),
-            callback = function()
-                draft.max_chapters = math.min(200, (tonumber(draft.max_chapters) or 30) + 1)
-                refreshDialog()
-            end,
+            callback = function() bump(1) end,
         }
         value_widget = TextWidget:new{
             text = tostring(draft.max_chapters),
             face = face_row, bold = true,
         }
         local label = TextWidget:new{
-            text = _("自动缓存章数"),
+            text = _("默认缓存章数"),
             face = face_row, bold = true,
         }
         local row = HorizontalGroup:new{ align = "center",
@@ -6027,7 +7657,7 @@ function XRead:showSettings()
         HorizontalSpan:new{ width = gap_small },
         fieldRow(_("后端地址"), "address", false, _("后端地址"), "http://192.168.31.51:7777"),
         HorizontalSpan:new{ width = gap_small },
-        fieldRow(_("用户名"), "username", false, _("用户名"), ""),
+        fieldRow(_("账号"), "username", false, _("账号"), ""),
         HorizontalSpan:new{ width = gap_small },
         fieldRow(_("密码"), "password", true, _("密码"), ""),
         HorizontalSpan:new{ width = gap_mid },
@@ -6038,8 +7668,6 @@ function XRead:showSettings()
         groupLabel(_("阅读偏好")),
         HorizontalSpan:new{ width = gap_small },
         stepperRow(),
-        HorizontalSpan:new{ width = gap_small },
-        hintLine(_("每次自动缓存的章节数，范围 1-200。打开书后会后台静默补满。")),
         HorizontalSpan:new{ width = gap_mid },
         separator(),
         HorizontalSpan:new{ width = gap_small },
@@ -6098,6 +7726,15 @@ end
 
 function XRead:showBookSettingsPanel()
 
+    -- 防重叠：已有面板开着先关掉（选字体/字号后会重建面板）
+    if self._book_settings_dialog then
+
+        pcall(function() UIManager:close(self._book_settings_dialog) end)
+
+        self._book_settings_dialog = nil
+
+    end
+
     local VerticalGroup = require("ui/widget/verticalgroup")
     local HorizontalGroup = require("ui/widget/horizontalgroup")
     local HorizontalSpan = require("ui/widget/horizontalspan")
@@ -6116,7 +7753,7 @@ function XRead:showBookSettingsPanel()
 
     local function refreshDialog()
         if dialog then UIManager:close(dialog) end
-        UIManager:setDirty("all", "full")
+        UIManager:setDirty("all", "ui")
         self:showBookSettingsPanel()
     end
 
@@ -6175,10 +7812,10 @@ function XRead:showBookSettingsPanel()
         }
     end
 
-    -- 行1：自动缓存章数
+    -- 行1：默认缓存章数（进书时先拼这么多章立即打开）
     local chapter_row = HorizontalGroup:new{ align = "center",
         LeftContainer:new{ dimen = Geom:new{ w = inner_w - 220, h = row_h },
-            labelRow(_("自动缓存章数")) },
+            labelRow(_("默认缓存章数")) },
         stepBtn("－", function()
             local v = (tonumber(self:getSetting("max_chapters", "3")) or 3) - 1
             if v < 1 then v = 1 end
@@ -6196,20 +7833,107 @@ function XRead:showBookSettingsPanel()
         end),
     }
 
-    -- 行2：字号
-    local font_row = HorizontalGroup:new{ align = "center",
+    -- 下拉框按钮：右侧显示当前值 + ▾，点击弹出选择列表
+    local function dropdownBtn(shown_text, on_open)
+        local btn = InputContainer:extend{}
+        function btn:init()
+            self.dimen = Geom:new{ w = Screen:scaleBySize(210), h = row_h }
+            self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
+            self[1] = TextWidget:new{
+                text = tostring(shown_text) .. " ▾", face = face_row, bold = true,
+                fgcolor = Blitbuffer.COLOR_BLACK,
+                max_width = Screen:scaleBySize(200),
+            }
+        end
+        function btn:onTap() on_open(); return true end
+        return btn:new{}
+    end
+
+    local function pickFromList(title, items)
+        local entries = {}
+        for _, it in ipairs(items) do
+            entries[#entries + 1] = {
+                label = (it.current and "● " or "○ ") .. tostring(it.label),
+                callback = function()
+                    it.on_pick()
+                    UIManager:setDirty("all", "ui")
+                    self:showBookSettingsPanel()   -- 重建面板回显新值
+                end,
+            }
+        end
+        self:showMoreListPanel(title, entries, { hint = _("点击选择；点空白处返回。") })
+    end
+
+    local function currentFontFace()
+        local v = nil
+        pcall(function() v = self.ui and self.ui.font and self.ui.font.font_face end)
+        return tostring(v or "")
+    end
+
+    -- 行2：设置字体（下拉选择正文字体，即选即生效）
+    local font_face_row = HorizontalGroup:new{ align = "center",
         LeftContainer:new{ dimen = Geom:new{ w = inner_w - 220, h = row_h },
-            labelRow(_("字号")) },
-        stepBtn("－", function()
-            self:changeFontSize(-1)
-            refreshDialog()
+            labelRow(_("设置字体")) },
+        dropdownBtn(currentFontFace() ~= "" and currentFontFace() or _("系统默认"), function()
+            local items = {}
+            local ok_f, faces = pcall(function()
+                -- engineInit 返回 cre 库本体；字体列表是库级函数，必须点号调用
+                -- （readerfont.lua 同款用法）；冒号调用传错参数会拿不到列表
+                local cre = require("document/credocument"):engineInit()
+                return cre and cre.getFontFaces()
+            end)
+            local cur = currentFontFace()
+            if ok_f and type(faces) == "table" then
+                for _, f in ipairs(faces) do
+                    items[#items + 1] = {
+                        label = tostring(f),
+                        current = tostring(f) == cur,
+                        on_pick = function()
+                            pcall(function()
+                                local fo = self.ui and self.ui.font
+                                if fo then
+                                    fo.font_face = tostring(f)
+                                    self.ui.document:setFontFace(tostring(f))
+                                    local Event = require("ui/event")
+                                    self.ui:handleEvent(Event:new("UpdatePos"))
+                                end
+                            end)
+                        end,
+                    }
+                end
+            end
+            if #items == 0 then
+                items[#items + 1] = { label = _("无法获取字体列表"), on_pick = function() end }
+            end
+            pickFromList(_("设置字体"), items)
         end),
-        HorizontalSpan:new{ width = Screen:scaleBySize(8) },
-        valueText(currentFontSize()),
-        HorizontalSpan:new{ width = Screen:scaleBySize(8) },
-        stepBtn("＋", function()
-            self:changeFontSize(1)
-            refreshDialog()
+    }
+
+    -- 行3：提高字体（下拉选择字号，即选即生效）
+    local font_size_row = HorizontalGroup:new{ align = "center",
+        LeftContainer:new{ dimen = Geom:new{ w = inner_w - 220, h = row_h },
+            labelRow(_("提高字体")) },
+        dropdownBtn((currentFontSize()) .. "px", function()
+            local items = {}
+            local cur = tonumber(currentFontSize()) or 22
+            for _, s in ipairs({16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38}) do
+                items[#items + 1] = {
+                    label = tostring(s),
+                    current = s == cur,
+                    on_pick = function()
+                        pcall(function()
+                            local fo = self.ui and self.ui.font
+                            if fo then
+                                fo.configurable.font_size = s
+                                self.ui.document:setFontSize(Screen:scaleBySize(s))
+                                local Event = require("ui/event")
+                                self.ui:handleEvent(Event:new("UpdatePos"))
+                            end
+                        end)
+                    end,
+                }
+            end
+            pickFromList(_("提高字体"), items)
         end),
     }
 
@@ -6221,10 +7945,12 @@ function XRead:showBookSettingsPanel()
         face = face_hint, width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
     }
     rows[#rows + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(20) }
-    rows[#rows + 1] = font_row
+    rows[#rows + 1] = font_face_row
+    rows[#rows + 1] = HorizontalSpan:new{ width = gap }
+    rows[#rows + 1] = font_size_row
     rows[#rows + 1] = HorizontalSpan:new{ width = gap }
     rows[#rows + 1] = TextWidget:new{
-        text = _("字号立即生效；预加载越多开书越快，但占用存储也越多"),
+        text = _("字体与字号即选即生效；预加载越多开书越快，但占用存储也越多"),
         face = face_hint, width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
     }
 
@@ -6236,21 +7962,12 @@ function XRead:showBookSettingsPanel()
         text = _("书籍设置"), face = face_title, bold = true,
         fgcolor = Blitbuffer.COLOR_BLACK,
     }
-    local close_w = Screen:scaleBySize(48)
-    local CloseBtn = InputContainer:extend{}
-    function CloseBtn:init()
-        self.dimen = Geom:new{ w = close_w, h = Screen:scaleBySize(36) }
-        self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
-        self[1] = TextWidget:new{
-            text = "✕", face = face_title, bold = true,
-            fgcolor = Blitbuffer.COLOR_GRAY_D,
-        }
-    end
-    function CloseBtn:onTap() closePanel() return true end
+    local close_w = Screen:scaleBySize(44)
     local stretch = inner_w - title_tw:getSize().w - close_w
     if stretch < 0 then stretch = 0 end
     card[#card + 1] = HorizontalGroup:new{ align = "center",
-        title_tw, HorizontalSpan:new{ width = stretch }, CloseBtn:new{} }
+        title_tw, HorizontalSpan:new{ width = stretch },
+        UICommon.closeButtonAtEdge(closePanel, pad, close_w) }
     card[#card + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(14) }
     card[#card + 1] = LineWidget:new{
         dimen = Geom:new{ w = inner_w, h = 1 },
@@ -6295,13 +8012,256 @@ function XRead:showBookSettingsPanel()
 
     dialog = Overlay:new{}
 
+    self._book_settings_dialog = dialog
+
     UIManager:show(dialog)
 
 end
 
 -- ---------- 移除书籍（从后端书架删除） ----------
 
-function XRead:removeBookFlow()
+-- 真正执行删除：后端 deleteBook + 本地章节/目录缓存清理 + 刷新书架缓存
+function XRead:_confirmRemoveBook(book)
+
+    UIManager:show(ConfirmBox:new{
+
+        text = T(_("移除「%1」？\n将从服务器书架删除这本书（含服务器缓存与本地章节缓存）。"), book.name or ""),
+
+        ok_text = _("移除"),
+
+        ok_callback = function()
+
+            self:runQuiet(function()
+
+                local del_ok = self.client:deleteBook(book)
+
+                if del_ok then
+
+                    -- 清本地：章节分片目录 + 目录缓存 + 整本缓存文件 + 封面缓存
+                    pcall(function()
+
+                        local util = require("util")
+
+                        local dir = self.chapter_cache:dirFor(book)
+
+                        if lfs.attributes(dir, "mode") == "directory" then util.purgeDir(dir) end
+
+                        local meta_path = self.meta_cache:chaptersPath(book)
+
+                        if meta_path and lfs.attributes(meta_path, "mode") == "file" then os.remove(meta_path) end
+
+                        removeBookCacheFiles(book)
+
+                        if self.cover_cache and self.cover_cache.removeBook then
+                            self.cover_cache:removeBook(book)
+                        end
+
+                    end)
+
+                    -- 刷新书架缓存（移除后重新拉取）
+                    pcall(function()
+
+                        local fresh = self.client:getBookshelf()
+
+                        if type(fresh) == "table" then self.meta_cache:putShelf(fresh) end
+
+                    end)
+
+                else
+
+                    self:showInfo(_("移除失败"))
+
+                end
+
+            end)
+
+        end,
+
+    })
+
+end
+
+-- 正文「下载」：把整本书导出为 EPUB 到 Kindle/KOReader 本地文档目录。
+-- 后端无整本下载接口，按目录逐章 getBookContent；优先用本地章节缓存， networked 拉取带重试。
+function XRead:downloadBookToDevice(book)
+    if not book then
+        self:showInfo(_("没有可下载的书"))
+        return
+    end
+
+    local dir
+    pcall(function() dir = BookExport:docDir() end)
+    local target = _("本地文档目录") .. "（" .. tostring(dir or "?") .. "）"
+    UIManager:show(ConfirmBox:new{
+        text = T(_("把「%1」导出为 EPUB 保存到 %2？\n导出后可在 KOReader 文件管理器或 Kindle 书架直接打开，需要逐章拉取，章节较多时请耐心等待。"),
+            tostring(book.name or ""), target),
+        ok_text = _("下载"),
+        cancel_text = _("取消"),
+        ok_callback = function() self:_doDownloadBook(book) end,
+    })
+end
+
+function XRead:_doDownloadBook(book)
+
+    -- 导出的网络 + 打包全部在 fork 出的子进程里做，主进程只轮询进度文件。
+    -- 原实现逐章同步请求跑在 UI 线程（每章一个 12s 超时），几千章要跑很久，
+    -- 期间界面完全无响应；失败章节还被写成「（本章获取失败）」后仍提示"下载完成"。
+    Trapper:wrap(function()
+
+        -- 取目录这一次请求仍在 UI 线程（本地缓存命中时是 0 网络），
+        -- 先给个提示，避免用户以为点了没反应
+        Trapper:info(_("正在准备目录…"))
+
+        local ok_chapters, chapters = pcall(function()
+            local cached = self.meta_cache:getChapters(book)
+            if type(cached) == "table" and #cached > 0 then return cached end
+            return self.client:getChapterList(book)
+        end)
+        if not ok_chapters or type(chapters) ~= "table" or #chapters == 0 then
+            Trapper:clear()
+            self:showInfo(_("下载失败：无法获取目录"))
+            return
+        end
+
+        local total = #chapters
+        local stem = bookCacheStem(book)
+        local prog_file = BOOK_DIR .. "/" .. stem .. ".exportprog"
+        local res_file = BOOK_DIR .. "/" .. stem .. ".exportres"
+        pcall(os.remove, prog_file)
+        pcall(os.remove, res_file)
+
+        local client, cache = self.client, self.chapter_cache
+
+        local function writeProg(done, state)
+            local f = io.open(prog_file .. ".tmp", "w")
+            if not f then return end
+            f:write(string.format("done=%d total=%d state=%s", done, total, state))
+            f:close()
+            pcall(os.rename, prog_file .. ".tmp", prog_file)
+        end
+
+        local function writeResult(tag, payload)
+            local f = io.open(res_file .. ".tmp", "w")
+            if not f then return end
+            f:write(tostring(tag) .. "\n" .. tostring(payload or "") .. "\n")
+            f:close()
+            pcall(os.rename, res_file .. ".tmp", res_file)
+        end
+
+        writeProg(0, "run")
+
+        local ok_fork, pid = pcall(ffiutil.runInSubProcess, function()
+
+            local function getContent(i, ch)
+                local cached = cache:get(book, i)
+                if cached and cached ~= "" then return cached end
+                local ok, text = pcall(function() return client:getBookContent(ch, book) end)
+                if ok and type(text) == "string" and text ~= "" then
+                    pcall(function() cache:put(book, i, text) end)
+                    return text
+                end
+                return nil       -- nil = 该章失败，由 book_export 统计并计入门槛
+            end
+
+            -- 多返回值用表接：createEpub -> path, err, stats
+            local r = { pcall(BookExport.createEpub, BookExport, book, chapters, getContent,
+                function(done) writeProg(done, "run") end) }
+
+            if r[1] and r[2] then
+                writeResult("ok", r[2])
+            elseif r[1] then
+                writeResult("err", r[3])
+            else
+                writeResult("err", r[2])
+            end
+
+            writeProg(total, "end")
+
+        end, false)
+
+        if not (ok_fork and pid) then
+            logger.warn("xread export fork failed:", tostring(pid))
+            Trapper:clear()
+            pcall(os.remove, prog_file)
+            self:showInfo(_("下载失败：当前环境不支持后台任务"))
+            return
+        end
+
+        -- 轮询进度：Trapper:info 每次让出 100ms 让 UI 能刷新/响应；
+        -- 按秒节流，避免 e-ink 被高频重绘。
+        local deadline = os.time() + math.max(180, total * 30)
+        local last_done, last_t = -1, 0
+        local user_aborted = false
+        while os.time() < deadline do
+            local text = ""
+            local pf = io.open(prog_file, "r")
+            if pf then
+                text = pf:read("*a") or ""
+                pf:close()
+            end
+            local state = text:match("state=(%w+)")
+            local done = tonumber(text:match("done=(%d+)")) or 0
+            if state == "end" then break end
+            local now = os.time()
+            local go_on
+            if done ~= last_done and (now - last_t >= 1 or done >= total) then
+                last_done, last_t = done, now
+                go_on = Trapper:info(T(_("正在下载 %1%（%2/%3）"),
+                    tostring(math.floor(done / total * 100)), tostring(done), tostring(total)))
+            else
+                go_on = Trapper:info(nil)      -- 保持提示，仅让出一次时间片
+            end
+            -- 用户点了提示框的「中止」：不再等下去（子进程会自己跑完，不阻塞界面）
+            if go_on == false then
+                user_aborted = true
+                break
+            end
+        end
+
+        Trapper:clear()
+
+        if user_aborted then
+            -- 用户主动中止：子进程可能还在写，清掉进度文件，不要误报「下载失败」
+            pcall(os.remove, prog_file)
+            pcall(os.remove, res_file)
+            self:showInfo(_("已取消下载"))
+            return
+        end
+
+        local tag, payload = "err", _("子进程未返回结果")
+        local rf = io.open(res_file, "r")
+        if rf then
+            local all = rf:read("*a") or ""
+            rf:close()
+            tag = all:match("^(%a+)") or "err"
+            payload = all:match("^%a+\n(.-)\n*$") or ""
+        end
+        pcall(os.remove, prog_file)
+        pcall(os.remove, res_file)
+
+        if tag ~= "ok" or payload == "" then
+            self:showInfo(_("下载失败：") .. tostring(payload))
+            return
+        end
+
+        local size = fileSize(payload)
+        self:showInfo(T(_("下载完成\n%1\n共 %2 章 · %3\n可在 KOReader 文件管理器打开"),
+            tostring(payload), tostring(total), tostring(size) .. " B"), 8)
+
+    end)
+
+end
+
+-- 正文里的「删除」直接删当前书；没有传入书时才列书单供选择
+function XRead:removeBookFlow(book)
+
+    if book then
+
+        self:_confirmRemoveBook(book)
+
+        return
+
+    end
 
     local ok, books = pcall(function() return self.client:getBookshelf() end)
 
@@ -6315,67 +8275,13 @@ function XRead:removeBookFlow()
 
     local items = {}
 
-    for _i, book in ipairs(books) do
+    for _i, b in ipairs(books) do
 
         items[#items + 1] = {
 
-            text = (book.name or "?") .. "　" .. (book.author or ""),
+            text = (b.name or "?") .. "　" .. (b.author or ""),
 
-            callback = function()
-
-                UIManager:show(ConfirmBox:new{
-
-                    text = T(_("移除「%1」？\n将从服务器书架删除这本书（含服务器缓存与本地章节缓存）。"), book.name or ""),
-
-                    ok_text = _("移除"),
-
-                    ok_callback = function()
-
-                        self:runQuiet(function()
-
-                            local del_ok = self.client:deleteBook(book)
-
-                            if del_ok then
-
-                                -- 清本地：章节分片目录 + 目录缓存
-                                pcall(function()
-
-                                    local util = require("util")
-
-                                    local dir = self.chapter_cache:dirFor(book)
-
-                                    if lfs.attributes(dir, "mode") == "directory" then util.purgeDir(dir) end
-
-                                    local meta_path = self.meta_cache:chaptersPath(book)
-
-                                    if meta_path and lfs.attributes(meta_path, "mode") == "file" then os.remove(meta_path) end
-
-                                end)
-
-                                -- 刷新书架缓存（移除后重新拉取）
-                                pcall(function()
-
-                                    local fresh = self.client:getBookshelf()
-
-                                    if type(fresh) == "table" then self.meta_cache:putShelf(fresh) end
-
-                                end)
-
-                                self:showInfo(T(_("已移除「%1」"), book.name or ""))
-
-                            else
-
-                                self:showInfo(_("移除失败"))
-
-                            end
-
-                        end)
-
-                    end,
-
-                })
-
-            end,
+            callback = function() self:_confirmRemoveBook(b) end,
 
         }
 
@@ -6445,47 +8351,194 @@ end
 
 function XRead:doCacheBook(book, count)
 
-    local UI = require("ui/trapper")
-
+    -- 整本缓存是一条 SSE 长连接，几千章要跑几分钟。原来在 UI 线程同步跑，
+    -- 这段时间界面完全无响应、无进度、不可取消，用户只能强杀 KOReader。
+    -- 改成：子进程消费 SSE 并写进度文件，主进程轮询显示进度（网络不再占 UI 线程）。
     Trapper:wrap(function()
 
-        local last_msg = ""
+        local opts = {
 
-        local ok, err = pcall(function()
+            count = tonumber(count) or 0,   -- 0 = 全部章节
 
-            self.client:cacheBookSSE(book, {
+            concurrentCount = 8,
 
-                count = tonumber(count) or 0,   -- 0 = 全部章节
+            refresh = 0,
 
-                concurrentCount = 8,
+        }
 
-                refresh = 0,
+        local stem = bookCacheStem(book)
 
-            }, function(info)
+        local prog_file = BOOK_DIR .. "/" .. stem .. ".sseprog"
 
-                local msg = string.format(
+        local err_file = prog_file .. ".err"
 
-                    _("已缓存 %d 章（成功 %d / 失败 %d）"),
+        pcall(os.remove, prog_file)
 
-                    info.cachedCount or 0, info.successCount or 0, info.failedCount or 0)
+        pcall(os.remove, err_file)
 
-                if info.isEnd then msg = _("缓存完成：") .. msg end
+        local client = self.client
 
-                if msg ~= last_msg then UI:info(msg); last_msg = msg end
+        local function writeProg(info, done)
+
+            local f = io.open(prog_file .. ".tmp", "w")
+
+            if not f then return end
+
+            f:write(string.format("cached=%d ok=%d fail=%d state=%s",
+
+                info.cachedCount or 0, info.successCount or 0, info.failedCount or 0,
+
+                done and "end" or "run"))
+
+            f:close()
+
+            pcall(os.rename, prog_file .. ".tmp", prog_file)
+
+        end
+
+        writeProg({}, false)
+
+        local ok_fork, pid = pcall(ffiutil.runInSubProcess, function()
+
+            local last = {}
+
+            local ok_req, req_err = pcall(function()
+
+                client:cacheBookSSE(book, opts, function(info)
+
+                    last = info
+
+                    if info.isEnd then
+
+                        logger.info("xread cache book done", tostring(info.cachedCount),
+
+                            tostring(info.successCount), tostring(info.failedCount))
+
+                    end
+
+                    writeProg(info, info.isEnd)
+
+                end)
 
             end)
 
-        end)
+            if not ok_req then
 
-        UI:clear()
+                local f = io.open(err_file, "w")
 
-        if ok then
+                if f then
 
-            self:showInfo(_("整本缓存完成，可在书架直接阅读"))
+                    f:write(tostring(req_err))
 
-        else
+                    f:close()
 
-            self:showInfo(_("缓存失败：") .. tostring(err))
+                end
+
+            end
+
+            writeProg(last, true)
+
+        end, false)
+
+        if not (ok_fork and pid) then
+
+            Trapper:clear()
+
+            pcall(os.remove, prog_file)
+
+            self:showInfo(_("缓存失败：当前环境不支持后台任务"))
+
+            return
+
+        end
+
+        -- 主进程只轮询进度，不持有任何网络连接
+        local deadline = os.time() + 3 * 3600
+
+        local last_cached, last_t = -1, 0
+
+        local user_aborted = false
+
+        while os.time() < deadline do
+
+            local text = ""
+
+            local pf = io.open(prog_file, "r")
+
+            if pf then
+
+                text = pf:read("*a") or ""
+
+                pf:close()
+
+            end
+
+            local state = text:match("state=(%w+)")
+
+            local cached = tonumber(text:match("cached=(%d+)")) or 0
+
+            if state == "end" then break end
+
+            local now = os.time()
+
+            local go_on
+
+            if cached ~= last_cached and now - last_t >= 1 then
+
+                last_cached, last_t = cached, now
+
+                go_on = Trapper:info(T(_("正在缓存到服务器：已处理 %1 章"), tostring(cached)))
+
+            else
+
+                go_on = Trapper:info(nil)
+
+            end
+
+            -- 用户点了「中止」：不再等（子进程自己会结束，不阻塞界面）
+            if go_on == false then
+
+                user_aborted = true
+
+                break
+
+            end
+
+        end
+
+        Trapper:clear()
+
+        if user_aborted then
+
+            pcall(os.remove, prog_file)
+
+            pcall(os.remove, err_file)
+
+            self:showInfo(_("已取消缓存"))
+
+            return
+
+        end
+
+        local err_text
+
+        local ef = io.open(err_file, "r")
+
+        if ef then
+
+            err_text = ef:read("*a")
+
+            ef:close()
+
+        end
+
+        pcall(os.remove, prog_file)
+
+        pcall(os.remove, err_file)
+
+        if err_text and err_text ~= "" then
+
+            self:showInfo(_("缓存失败：") .. readable_error(err_text))
 
         end
 
@@ -6504,7 +8557,7 @@ function XRead:downloadComicAndOpen(book, chapters, start_index)
 
     local last = math.min(start_index + batch - 1, #chapters)
 
-    local path = BOOK_DIR .. "/" .. safeFileName(book.name) .. "_" .. start_index .. ".cbz"
+    local path = BOOK_DIR .. "/" .. bookCacheStem(book) .. "_" .. start_index .. ".cbz"
 
     local arc = Archiver.Writer:new{}
 
@@ -6522,45 +8575,67 @@ function XRead:downloadComicAndOpen(book, chapters, start_index)
 
     local total_img, total_ch = 0, 0
 
-    for i = start_index, last do
+    -- 用 pcall 包住整个下载 + 写包过程：任何异常都必须能走到 arc:close()，
+    -- 否则 libarchive 句柄泄漏，并留下半个 .cbz（下次会被当成完整缓存直接打开）。
+    local ok_loop, loop_err = pcall(function()
 
-        local ch = chapters[i]
+        for i = start_index, last do
 
-        local ok, html = pcall(function() return self.client:getBookContentRaw(ch, book) end)
+            local ch = chapters[i]
 
-        if ok then
+            if ch then
 
-            local urls = self.client:extractImageUrls(html)
+                local ok, html = pcall(function() return self.client:getBookContentRaw(ch, book) end)
 
-            local n = 0
+                if ok then
 
-            for j, url in ipairs(urls) do
+                    local urls = self.client:extractImageUrls(html)
 
-                local data = self.client:downloadImage(url)
+                    local n = 0
 
-                if data then
+                    for j, url in ipairs(urls) do
 
-                    n = n + 1
+                        local data = self.client:downloadImage(url)
 
-                    arc:addFileFromMemory(string.format("%04d_%04d.jpg", i, j), data, mtime)
+                        if data then
 
-                    total_img = total_img + 1
+                            n = n + 1
+
+                            arc:addFileFromMemory(string.format("%04d_%04d.jpg", i, j), data, mtime)
+
+                            total_img = total_img + 1
+
+                        end
+
+                        -- 静默下载：不再弹进度框，点书后直接等正文打开（避免弹窗挡住操作）
+
+                    end
+
+                    if n > 0 then total_ch = total_ch + 1 end
 
                 end
 
-                -- 静默下载：不再弹进度框，点书后直接等正文打开（避免弹窗挡住操作）
-
             end
-
-            if n > 0 then total_ch = total_ch + 1 end
 
         end
 
+    end)
+
+    pcall(arc.close, arc)
+
+    if not ok_loop then
+
+        pcall(os.remove, path)
+
+        self:showInfo(_("漫画下载失败：") .. readable_error(loop_err))
+
+        return
+
     end
 
-    arc:close()
-
     if total_img == 0 then
+
+        pcall(os.remove, path)      -- 不留 0 图片的坏 cbz
 
         self:showInfo(_("没有下载到任何图片"))
 

@@ -6,6 +6,8 @@
 
 -- 阅读时长趋势柱状图、读得最多的书 Top 榜。
 -- 数据：KOReader 自带 statistics.sqlite3 + 插件自己的阅读会话记录（兜底）。
+local UICommon        = require("xread.ui_common")
+
 local Blitbuffer      = require("ffi/blitbuffer")
 
 local Geom            = require("ui/geometry")
@@ -692,21 +694,10 @@ function ReadingStats:init()
 
     end
 
-    local close_mark = TapBox:new{
+    -- 关闭按钮与其它弹出页统一：圆形浅灰底 + 居中 ✕
+    local close_mark = UICommon.closeButton(
 
-        width = scaled(34), height = scaled(34),
-
-        widget = TextWidget:new{
-
-            text = "✕", face = Font:getFace("cfont", scaled(16)),
-
-            fgcolor = Blitbuffer.COLOR_GRAY_6,
-
-        },
-
-        callback = function() self:close() end,
-
-    }
+        function() self:close() end, scaled(34), scaled(16))
 
     local header = FrameContainer:new{
 

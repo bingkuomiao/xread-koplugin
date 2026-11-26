@@ -2,4 +2,4 @@
 XREAD_NAS_HOST=192.168.31.51
 XREAD_NAS_USER=bingkuomiao
 XREAD_NAS_PASS=your-password-here
-XREAD_NAS_REMOTE_DIR=/var/apps/xread/var/data/webdav/bingkuomiao/plugin
+XREAD_NAS_REMOTE_DIR=/vol1/@appdata/xread/data/webdav/bingkuomiao/plugin

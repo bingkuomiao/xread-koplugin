@@ -41,7 +41,9 @@ emu_start() {
     pkill -9 -f '[X]vfb' 2>/dev/null
     pkill -9 -f '[l]uajit' 2>/dev/null
     sleep 1
-    rm -f /tmp/xread_autotest_once /root/.config/koreader/history.lua
+    rm -f /tmp/xread_autotest_once /tmp/xread_flow_once /root/.config/koreader/history.lua
+    # KOReader 启动会恢复上次打开的书（settings["lastfile"]），会把自动进入的首页/书架盖住
+    sed -i '/\["lastfile"\]/d' /root/.config/koreader/settings.reader.lua 2>/dev/null
 
     export DISPLAY=:99
     Xvfb :99 -screen 0 1072x1448x24 -nolisten tcp >/tmp/xread-xvfb.log 2>&1 &

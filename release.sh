@@ -37,9 +37,9 @@ RC=$?
 if [ "$RC" -eq 0 ]; then
     echo "== RELEASE OK: $ROOT_DIR/xread.koplugin.zip =="
 
-    # 生成在线热更新发布包（publish/plugin/：manifest2.json + 规范 zip）
+    # 生成在线热更新发布包（publish/plugin/：规范 zip + md5 sidecar + filelist.json）
     # 上传到 NAS：python3 publish_update.py --ssh <用户>@192.168.31.51 --ssh-port <端口>
-    #   或手动把 publish/plugin/ 内容拷到 NAS 的 /var/apps/xread/var/data/assets/plugin/
+    #   或手动把 publish/plugin/ 内容拷到 NAS 的 /var/apps/xread/var/data/webdav/<用户>/plugin/
     echo "== [3/3] build online-update publish package =="
     python3 "$ROOT_DIR/publish_update.py" || true
 else

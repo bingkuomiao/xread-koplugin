@@ -71,13 +71,16 @@ end
 
 -- 开书/手动同步后把最新章进度写进缓存里的对应书条目，
 -- 让首页「最近阅读」卡片实时反映刚读的书（不用等缓存过期）
-function MetaCache:updateShelfProgress(book_url, dur_index)
+-- when_ts：本次进度的时间戳（默认当前时间）。同步时用它和服务器端的
+-- durChapterTime 比较，避免把几周前的旧本地进度推上去覆盖其它设备的新进度。
+function MetaCache:updateShelfProgress(book_url, dur_index, when_ts)
     local d = readJson(self:shelfPath())
     if not d or type(d.books) ~= "table" then return nil end
     local changed = false
     for _i, b in ipairs(d.books) do
         if tostring(b.bookUrl or "") == tostring(book_url or "") then
             b.durChapterIndex = tonumber(dur_index) or b.durChapterIndex
+            b.durChapterTime = tonumber(when_ts) or os.time()
             changed = true
             break
         end

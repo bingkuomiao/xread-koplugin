@@ -9,7 +9,7 @@
 tests/
 ├── CASE_INDEX.md          本文件：用例索引 + 判定规则 + 坐标基准
 ├── lib/common.sh          公共库：模拟器启停、验收标记等待、断言、截图
-├── cases/01..13/*.sh      12 个独立用例（12=规范 zip 更新，13=包留存策略；11 旧散文件用例已移除）
+├── cases/01..19/*.sh      独立用例（12=zip 更新，13=包留存策略，16=按版本挑最新，17=封面单测，18=tar.gz 更新，19=本地包更新；11 旧散文件用例已移除）
 ├── reports/<时间戳>/      每次运行归档：SUMMARY.md + 逐用例日志 + 截图
 └── run_all.sh             统一入口（--full / --quick / --only）
 ```
@@ -28,8 +28,12 @@ tests/
 | 08_toolbar_catalog_tap | 工具栏点目录 | `open` + `FLOW=panel` + 点击 | `tapped 目录` 日志、点击前后两张截图 | ~100s |
 | 09_syntax | 全量 Lua 语法 | LuaJIT `loadfile` | 部署目录所有 `.lua` 可解析 | <5s |
 | 10_package_consistency | 交付包一致性 | md5 | zip / 源码 / WSL 部署三方逐文件匹配 | <5s |
-| 12_update_zip | 规范 zip 包热更新 | `update` + manifest2.json + zip | `newer=true`、下载 zip 解压后本地版本变为测试版本；解压到 `xread_update/<包名>/`、同名 zip 同级留存 | ~90s |
-| 13_package_retention | 更新包留存与清理 | `update` + 预置 4 个历史包 | 新包落 `xread_update/<包名>/`；索引只留 3 条；最旧 p1/p2 的目录与 zip 被清理，p3/p4 保留 | ~90s |
+| 12_update_zip | 列目录模式 zip 热更新全流程 | `update` + filelist.json + zip + md5 sidecar（无 manifest） | `via=list`、`newer=true`、下载 zip 解压后本地版本变为测试版本；同名 zip 与解压目录同级留存 | ~90s |
+| 13_package_retention | 设备端更新包留存与清理 | `update` + filelist.json（1 包）+ 预置 4 个历史包 | 新包落 `xread_update/<包名>/`；索引只留 3 条；最旧 p1/p2 的目录与 zip 被清理，p3/p4 保留 | ~90s |
+| 16_filelist_latest | 列目录按版本挑最新（不按时间） | `update` + filelist.json（2 包，无 version 字段）+ md5 sidecar | `via=list`、按包名语义版本挑中高版本（`remote=0.7.1-test`）而非时间戳更新的低版本、包内版本裁决后本地版本更新、不误装旧包 | ~90s |
+| 17_cover_api | 统一封面接口（本地/网络书通用） | 纯 Lua 单测（LuaJIT + mock socket.http） | `path=<customCoverUrl||coverUrl 原值>`、统一带 accessToken/secureKey/userNS、未登录网络书 URL 正确、Referer 为合法 header、本地书 401 重登后用新 token 重试 | <5s |
+| 18_targz_update | tar.gz 包热更新全流程（v0.6.2+） | `update` + filelist.json + tar.gz + md5 sidecar | `via=list`、识别 .tar.gz 包名版本、下载解压后本地版本变为测试版本；同名 tar.gz 与解压目录同级留存 | ~90s |
+| 19_local_update | 本地包热更新（v0.6.4+，不联网） | `localupdate` + 规范 zip 放插件目录内（同级目录负向验证不扫描） | `via=local`、本地包版本识别、解压后本地版本变为测试版本；源包挪入 xread_update 留存、插件目录清理；同级目录 9.9.9 包未被识别 | ~30s |
 
 ## 运行方式
 
@@ -85,7 +89,7 @@ bash /mnt/d/WorkBuddy/2026-11-22-00-23-49/xread-migration/tests/run_all.sh
 | 工具栏「书架」图标 | (918, 313) | 功能区第 4 格 |
 | 书架第 1 本书封面中心 | (146, 345) | 4×3 网格第 1 格 |
 | 书架翻页箭头 | (979, 1401) | 底栏右侧 |
-| KOReader 顶端菜单 | (536, 60) | 工具标签约 (340, 50)，阅读X约 (133, 133) |
+| KOReader 顶端菜单 | (536, 60) | v0.6.1 起原生菜单无阅读X入口；引导进入书架改用 `emu_start "shelf"` |
 
 > 截图查看软件常缩放到 808 宽，图上坐标 ×1.327 才是原图坐标。
 
@@ -96,6 +100,17 @@ bash /mnt/d/WorkBuddy/2026-11-22-00-23-49/xread-migration/tests/run_all.sh
 3. **WSL 后台进程不跨 `wsl.exe` 调用存活**：所有点击与截图必须在同一个 `run_all.sh` 进程内完成。
 4. **每轮启动前清状态**：`rm -f /tmp/xread_autotest_once /root/.config/koreader/history.lua`，否则会打开上次 quickstart 或不再触发 autotest。
 5. **启动入口**必须是 `./lib/koreader/koreader.sh /root`，不是 `./bin/koreader`。
+
+## 手动探针（不参与 run_all）
+
+| 脚本 | 验证内容 | 备注 |
+|---|---|---|
+| `tests/probe_health_ui.sh` | 测试连接回执：成功「地址 + 耗时」，失败「地址 + 耗时 + 原因」 | 用 `XREAD_AUTOTEST_DELAY` 对齐截图时机（提示会超时消失） |
+| `tests/probe_update_ui.sh [confirm|full]` | 检查更新 → 唯一确认框「更新并重启」→ 安装进度 → 自动重启，`_meta.lua` 已换成包内版本 | `full` 需传 `TAP_OK_X/TAP_OK_Y`（确认框按钮坐标） |
+| `tests/probe_auto_raw.sh` | 自动检查更新提示（本地 http.server 提供 filelist.json + 0.6.8 包，避开 NAS webdav 抖动） | 通过 `XREAD_UPDATER_URL` 走 raw 通道 |
+| `tests/probe_remote_targz.sh [confirm|full]` | 远端 tar.gz 全链路：模拟器降级 0.6.6 → 列远端目录 → 确认框 → 下载/校验/解压 → 自动重启 | `full` 传 `TAP_OK_X=732 TAP_OK_Y=816` |
+| `tests/probe_remote_targz_multi.sh` | 同上的多文件替换版本（0.6.6 包体 + 0.6.7 main.lua） | 旧版 updater 无超时，NAS 抖动时可能长时间无响应 |
+| `tests/probe_targz_multi_local.sh` | 插件目录内 tar.gz 多文件替换（`changed=2 skipped=108`），不联网 | 需传 `NEW_PKG=<tar.gz 绝对路径>` |
 
 ## 归档说明
 

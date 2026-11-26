@@ -167,16 +167,13 @@ function ChapterRow:init()
 
     local inverted = self.is_current or is_caching
 
-    local fgcolor = inverted and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+    -- 已缓存章节：日间深灰底白字、夜间反色后浅底黑字（对比目录普通行）
+    local fgcolor = inverted and Blitbuffer.COLOR_WHITE
+        or (is_cached and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK)
 
-    -- 夜间模式：高亮底反色后变浅灰，字色用 WHITE（反色后黑字），保证对比度
-    if is_cached and Screen.night_mode and not inverted then
-        fgcolor = Blitbuffer.COLOR_WHITE
-    end
-
-    -- 当前章/缓存中：黑底白字加粗；已预加载：高亮底；其余白底
     -- 夜间模式全局反色：GRAY_E(0xEE) 会变 0x11 近黑而失去区分度，改用 GRAY_3(0x33)，反色后为浅灰 0xCC
-    local cached_bg = Screen.night_mode and Blitbuffer.COLOR_GRAY_3 or Blitbuffer.COLOR_GRAY_E
+    -- 日间用 GRAY_6(0x66) 深灰底 + 白字（用户要求深灰、更明显）
+    local cached_bg = Screen.night_mode and Blitbuffer.COLOR_GRAY_3 or Blitbuffer.COLOR_GRAY_6
 
     local background = inverted and Blitbuffer.COLOR_BLACK
         or (is_cached and cached_bg or Blitbuffer.COLOR_WHITE)
@@ -247,7 +244,7 @@ function ChapterRow:onUnfocus()
 
     if not self.is_current then
 
-        local cached_bg = Screen.night_mode and Blitbuffer.COLOR_GRAY_3 or Blitbuffer.COLOR_GRAY_E
+        local cached_bg = Screen.night_mode and Blitbuffer.COLOR_GRAY_3 or Blitbuffer.COLOR_GRAY_6
 
         self.frame.background = (self.cache_state == "active")
 
@@ -650,7 +647,7 @@ function CatalogView:init()
 
         dimen = Geom:new{ w = 1, h = L.body_h },
 
-        background = Blitbuffer.COLOR_GRAY_D,
+        background = Blitbuffer.COLOR_BLACK,
 
     }
 
@@ -693,6 +690,15 @@ function CatalogView:init()
     local right_inner = VerticalGroup:new{ align = "left" }
 
     table.insert(right_inner, right_header)
+
+    -- 目录顶与章节列表之间补一条黑色分隔线，消除白色缝隙（夜间反色后为白色）
+    table.insert(right_inner, LineWidget:new{
+
+        dimen = Geom:new{ w = L.right_w, h = 1 },
+
+        background = Blitbuffer.COLOR_BLACK,
+
+    })
 
     local idx = 0
 
@@ -748,7 +754,7 @@ function CatalogView:init()
 
                 dimen = Geom:new{ w = L.right_w, h = 1 },
 
-                background = Blitbuffer.COLOR_GRAY_D,
+                background = Blitbuffer.COLOR_BLACK,
 
             })
 

@@ -4,6 +4,8 @@
 
 -- 圆角白卡 + 两条滑块（章节进度 / 字号）+ 3×4 图标网格。
 
+local UICommon        = require("xread.ui_common")
+
 local Blitbuffer      = require("ffi/blitbuffer")
 
 local Geom            = require("ui/geometry")
@@ -214,7 +216,8 @@ function SliderTrack:setRatio(ratio)
 
     self.ratio = clamp(ratio or 0, 0, 1)
 
-    UIManager:setDirty("all", "ui")
+    -- 只刷滑条自身区域
+    UIManager:setDirty(self, "ui")
 
 end
 
@@ -333,7 +336,8 @@ function GridCell:setHint(text)
 
     self.hint_widget:setText(text or "")
 
-    UIManager:setDirty("all", "ui")
+    -- 只刷这一格：原来整屏 setDirty("all") 会让缓存进度每更新一章就全屏闪一次
+    UIManager:setDirty(self, "ui")
 
 end
 
@@ -437,9 +441,10 @@ function QuickPanel:init()
 
     }
 
-    local close_mark = textBox("✕", scaled(15), Blitbuffer.COLOR_GRAY_6,
+    -- 关闭按钮与其它弹出页统一：圆形浅灰底 + 居中 ✕
+    local close_mark = UICommon.closeButton(
 
-        scaled(30), scaled(30), function() self:close() end)
+        function() self:close() end, scaled(34), scaled(15))
 
     local header = HorizontalGroup:new{
 

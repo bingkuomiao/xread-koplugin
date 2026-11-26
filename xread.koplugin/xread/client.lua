@@ -1,18 +1,17 @@
 -- xread.koplugin/xread/client.lua
--- 网络层：封装 xread-fpk /reader3/* 的 9 个接口
+-- 网络层：封装 xread-fpk /reader3/* 的接口
 -- 逻辑来自已实测通过的 test_network.lua，只依赖 KOReader 自带模块
 --   (socket.http / ltn12 / dkjson)，无需额外安装
+--
+-- 超时：所有请求都走 xread/http_client，单请求可指定超时且结束后必定恢复全局值。
+-- 绝不再写 `http.TIMEOUT = 12`（会把 KOReader 自己的 OPDS/同步/词典一并改掉）。
 
-local http = require("socket.http")
 local ltn12 = require("ltn12")
-
--- luasocket 默认超时 60s，后端偶发挂起会让 UI 卡死/请求堆积。
--- 统一收紧：接口请求最多等 12 秒，失败走各自的错误提示/回退。
-http.TIMEOUT = 12
+local HttpClient = require("xread/http_client")
 
 local json
-local ok = pcall(function() json = require("json") end)   -- KOReader 内置 json
-if not ok then json = require("dkjson") end               -- 桌面/测试环境回退
+local ok_json = pcall(function() json = require("json") end)   -- KOReader 内置 json
+if not ok_json then json = require("dkjson") end               -- 桌面/测试环境回退
 
 local Client = {}
 Client.__index = Client
@@ -26,36 +25,83 @@ local function urlencode(str)
     end))
 end
 
+--- 安全地把码点转成 UTF-8 字符
+-- 关键：**不能**用 utf8.char。utf8 是 Lua 5.3+ 的标准库，KOReader 跑在 LuaJIT
+-- （Lua 5.1 语义）上根本没有这个全局表，调用会抛 "attempt to index global 'utf8'"
+-- 并连带整章正文失败。这里用纯字节运算自己编码，5.1 / LuaJIT / 5.4 全通用。
+-- 非法码点（代理区、超出 Unicode 上限、负数）直接丢弃，宁缺不乱码。
+-- @return string UTF-8 字节串（非法时返回 ""）
+local function codePointToChar(cp)
+    cp = tonumber(cp)
+    if not cp or cp ~= cp then return "" end
+    cp = math.floor(cp)
+    if cp < 0 or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) then
+        return ""
+    end
+    if cp < 0x80 then
+        return string.char(cp)
+    elseif cp < 0x800 then
+        return string.char(
+            0xC0 + math.floor(cp / 0x40),
+            0x80 + (cp % 0x40))
+    elseif cp < 0x10000 then
+        return string.char(
+            0xE0 + math.floor(cp / 0x1000),
+            0x80 + (math.floor(cp / 0x40) % 0x40),
+            0x80 + (cp % 0x40))
+    end
+    return string.char(
+        0xF0 + math.floor(cp / 0x40000),
+        0x80 + (math.floor(cp / 0x1000) % 0x40),
+        0x80 + (math.floor(cp / 0x40) % 0x40),
+        0x80 + (cp % 0x40))
+end
+
 --- HTML 正文 -> 纯文本
 -- 后端返回的是网页 HTML（<div class="con"><p>...</p>...），需转成可阅读的纯文本。
--- 处理：img 保留占位、块级标签转换行、去标签、解实体、合并空行。
+-- 处理：剔脚本/样式块、img 保留占位、块级标签转换行、去标签、解实体、合并空行。
 local function htmlToText(s)
     if type(s) ~= "string" then return tostring(s or "") end
     local text = s
-    -- 漫画图片：转成占位提示（KOReader TXT 不显示图片）
+
+    -- ① 先整块剔掉 script/style 的内容。
+    -- 只靠后面对 "<[^>]+>" 去标签是不够的：标签内的 CSS/JS 文本会原样留在正文里，
+    -- 表现为章节开头突然出现一段 ".con{...}" 或 "var a=..."。
+    text = text:gsub("<%s*script[^>]*>.-<%s*/%s*script%s*>", "")
+    text = text:gsub("<%s*style[^>]*>.-<%s*/%s*style%s*>", "")
+    -- 无闭合的残块：从 <script 一直吃到文末，宁可丢内容也不显示源码
+    text = text:gsub("<%s*script[^>]*>.*$", "")
+    text = text:gsub("<%s*style[^>]*>.*$", "")
+
+    -- ② 漫画图片：转成占位提示（KOReader TXT 不显示图片）
     local img_count = 0
     text = text:gsub("<img[^>]-src=[\"']([^\"']+)[\"'][^>]-/?>", function(src)
         img_count = img_count + 1
         return "\n[图 " .. img_count .. "]\n"
     end)
-    -- 块级标签转换行
+    -- ③ 块级标签转换行
     text = text:gsub("<%s*br%s*/?%s*>", "\n")
     text = text:gsub("</%s*p%s*>", "\n")
     text = text:gsub("<%s*p[^>]*>", "\n")
     text = text:gsub("</%s*div%s*>", "\n")
     text = text:gsub("<%s*div[^>]*>", "\n")
     text = text:gsub("</%s*(h%d?|li|tr|table)[^>]*>", "\n")
-    -- 去掉其余所有标签
+    -- ④ 去掉其余所有标签
     text = text:gsub("<[^>]+>", "")
-    -- 解 HTML 实体
+    -- ⑤ 解 HTML 实体（命名实体 -> 字符；数字实体 -> UTF-8 字符）
     local entities = {
         nbsp = " ", amp = "&", lt = "<", gt = ">", quot = "\"", apos = "'",
         hellip = "…", mdash = "—", ndash = "–", ldquo = "“", rdquo = "”",
+        lsquo = "‘", rsquo = "’", middot = "·",
     }
-    text = text:gsub("&([%a%d]+);", function(name) return entities[name] end)
-    text = text:gsub("&#(%d+);", function(n) return string.char(tonumber(n) % 256) end)
-    text = text:gsub("&#x(%x+);", function(n) return utf8.char(tonumber(n, 16)) end)
-    -- 合并 >=3 的连续换行为 2 个，去掉行首行尾空白，去全角空格缩进
+    text = text:gsub("&([%a][%a%d]*);", function(name)
+        return entities[name] or ("&" .. name .. ";")
+    end)
+    -- 十进制实体 &#20013; = "中"。历史写法 string.char(n % 256) 会把中文变成 "-"。
+    text = text:gsub("&#(%d+);", function(n) return codePointToChar(tonumber(n)) end)
+    -- 十六进制实体 &#x4E2D;
+    text = text:gsub("&#[xX](%x+);", function(n) return codePointToChar(tonumber(n, 16)) end)
+    -- ⑥ 合并 >=3 的连续换行为 2 个，去掉行首行尾空白，去全角空格缩进
     text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
     text = text:gsub("\n[ \t]*\n[ \t]*\n+", "\n\n")
     text = text:gsub("^[ \t\n]+", ""):gsub("[ \t\n]+$", "")
@@ -73,6 +119,8 @@ function Client:new(address)
     return setmetatable({
         address = address or "http://127.0.0.1:7777",
         accessToken = nil,
+        secureKey = nil,
+        userNS = nil,
         username = nil,
         password = nil,
     }, self)
@@ -83,15 +131,15 @@ end
 -- 先试根路径，失败再回退到 /reader3/health，二者都兼容。
 function Client:health()
     local ok_res, res = pcall(function()
-        return self:httpGet(self.address .. "/health")
+        return self:httpGet(self.address .. "/health", { timeout = 3 })
     end)
     if ok_res and type(res) == "table" and res.isSuccess ~= nil then
         return res
     end
-    return self:httpGet(self.address .. "/reader3/health")
+    return self:httpGet(self.address .. "/reader3/health", { timeout = 3 })
 end
 
---- 登录，成功后自动保存 accessToken
+--- 登录，成功后自动保存鉴权参数（封面本地资源接口需要）
 function Client:login(username, password)
     self.username, self.password = username, password
     local res = self:httpPost(self.address .. "/reader3/login", {
@@ -99,6 +147,8 @@ function Client:login(username, password)
     })
     assert(res.isSuccess, "登录失败: " .. tostring(res.errorMsg))
     self.accessToken = res.data and res.data.accessToken
+    self.secureKey = res.data and res.data.secureKey
+    self.userNS = res.data and res.data.userNS
     return res
 end
 
@@ -130,23 +180,44 @@ local function sanitizeJson(t)
     return t
 end
 
---- GET 请求 -> table
-function Client:httpGet(url)
-    local chunks = {}
-    local _, code = http.request{ url = url, sink = ltn12.sink.table(chunks) }
-    assert(tonumber(code) == 200, "HTTP GET 失败: " .. tostring(code) .. " " .. url)
-    local body = table.concat(chunks)
-    local data, err = json.decode(body)
-    assert(data, "JSON 解析失败: " .. tostring(err))
-    return sanitizeJson(data)
+--- 鉴权失败判定
+-- 后端两种表现都要认：HTTP 401/403，以及 HTTP 200 但 isSuccess=false 且提示里带
+-- token/登录/未授权（部分版本的 reader3 走后者）。
+local function isAuthFailure(code, data)
+    code = tonumber(code)
+    if code == 401 or code == 403 then return true end
+    if code == 200 and type(data) == "table" and data.isSuccess == false then
+        local msg = tostring(data.errorMsg or "")
+        local lower = msg:lower()
+        if lower:find("token", 1, true) or msg:find("登录", 1, true)
+            or msg:find("未授权", 1, true) or lower:find("unauthorized", 1, true) then
+            return true
+        end
+    end
+    return false
 end
 
---- POST 请求(JSON body) -> table
--- 非 200 时尽量解析后端 errorMsg，给出简洁错误（不回显 URL/token）
-function Client:httpPost(url, obj, _retry)
+--- 底层 GET：返回 ok, code, data(已清洗), raw_body
+function Client:_rawGet(url, timeout)
+    local chunks = {}
+    local ok, code = HttpClient.request({
+        url = url, sink = ltn12.sink.table(chunks),
+    }, timeout)
+    local body = table.concat(chunks)
+    if not ok then return false, nil, nil, body end
+    local data
+    if body and body ~= "" then
+        local ok_json_decode, decoded = pcall(json.decode, body)
+        if ok_json_decode then data = sanitizeJson(decoded) end
+    end
+    return true, code, data, body
+end
+
+--- 底层 POST(JSON body)：返回 ok, code, data(已清洗), raw_body
+function Client:_rawPost(url, obj, timeout)
     local payload = json.encode(obj)
     local chunks = {}
-    local _, code = http.request{
+    local ok, code = HttpClient.request({
         url = url, method = "POST",
         source = ltn12.source.string(payload),
         headers = {
@@ -154,15 +225,89 @@ function Client:httpPost(url, obj, _retry)
             ["Content-Length"] = tostring(#payload),
         },
         sink = ltn12.sink.table(chunks),
-    }
-    code = tonumber(code)
+    }, timeout)
     local body = table.concat(chunks)
-    local data = json.decode(body)   -- 成功/失败都可能是 JSON
-    data = sanitizeJson(data)
+    if not ok then return false, nil, nil, body end
+    local data
+    if body and body ~= "" then
+        local ok_json_decode, decoded = pcall(json.decode, body)
+        if ok_json_decode then data = sanitizeJson(decoded) end
+    end
+    return true, code, data, body
+end
+
+--- token 失效后自愈：用已保存的账号重登一次
+-- 用 _reauthorizing 标志挡住 login 内部 httpPost 的递归重登，防止死循环。
+-- @return true 表示已拿到新 token
+function Client:_reauthorize()
+    if self._reauthorizing then return false end
+    if self.username == nil or self.password == nil then return false end
+    self._reauthorizing = true
+    local ok = pcall(function()
+        local res = self:httpPost(self.address .. "/reader3/login", {
+            isLogin = true, username = self.username, password = self.password, code = "",
+        }, { _no_auth_retry = true })
+        assert(res and res.isSuccess, "重登失败")
+        self.accessToken = res.data and res.data.accessToken
+        self.secureKey = res.data and res.data.secureKey
+        self.userNS = res.data and res.data.userNS
+    end)
+    self._reauthorizing = false
+    if not ok then self.accessToken = nil end
+    return ok
+end
+
+--- 发起请求并在鉴权失败时自愈重试一次
+-- @param opts { timeout=number, _no_auth_retry=boolean, _retried=boolean }
+-- @return ok, code, data, raw
+function Client:_request(method, url, obj, opts)
+    opts = opts or {}
+    local function once()
+        if method == "GET" then
+            return self:_rawGet(url, opts.timeout)
+        end
+        return self:_rawPost(url, obj, opts.timeout)
+    end
+    local ok, code, data, raw = once()
+    if ok and isAuthFailure(code, data) and not opts._no_auth_retry then
+        if self:_reauthorize() then
+            ok, code, data, raw = once()   -- 只重试一次
+        end
+    end
+    return ok, code, data, raw
+end
+
+--- GET 请求 -> table
+-- @param opts 可选 { timeout=秒 }
+function Client:httpGet(url, opts)
+    local ok, code, data, raw = self:_request("GET", url, nil, opts)
+    if not ok then
+        error("HTTP GET 失败: 网络错误 " .. tostring(raw), 0)
+    end
+    assert(tonumber(code) == 200, "HTTP GET 失败: " .. tostring(code))
+    assert(data, "JSON 解析失败")
+    return data
+end
+
+--- POST 请求(JSON body) -> table
+-- 非 200 时尽量解析后端 errorMsg，给出简洁错误（不回显 URL/token）
+-- @param opts 可选 { timeout=秒, retry=boolean }
+--   retry=true 只用于**幂等**接口（读目录/读正文/搜索）。saveBook / deleteBook /
+--   saveBookProgress 这类写操作绝不能重试，否则服务器会执行两次。
+function Client:httpPost(url, obj, opts)
+    if opts == true then opts = { retry = true } end        -- 兼容旧的布尔第三参
+    opts = opts or {}
+    local ok, code, data = self:_request("POST", url, obj, opts)
+    if not ok then
+        error("网络错误：" .. tostring(data), 0)
+    end
+    code = tonumber(code)
     if code ~= 200 then
-        -- 后端偶发 500：自动重试一次
-        if code == 500 and not _retry then
-            return self:httpPost(url, obj, true)
+        -- 5xx 且调用方声明幂等：重试一次（_retried 防无限递归）
+        if opts.retry and code >= 500 and not opts._retried then
+            return self:httpPost(url, obj, {
+                retry = true, _retried = true, timeout = opts.timeout,
+            })
         end
         local msg = type(data) == "table" and data.errorMsg or nil
         if not msg or msg == "" then msg = tostring(code) end
@@ -181,12 +326,12 @@ function Client:getBookshelf(refresh)
     return res.data or {}
 end
 
---- 获取某本书的目录
+--- 获取某本书的目录（幂等读接口，允许 5xx 重试一次）
 function Client:getChapterList(book)
     local ok_res, res = pcall(function()
         return self:httpPost(self:apiUrl("getChapterList"), {
             refresh = 1, url = book.bookUrl,
-        })
+        }, { retry = true })
     end)
     if not ok_res then
         error("获取《" .. tostring(book.name or "?") .. "》目录失败：" .. tostring(res), 0)
@@ -201,7 +346,7 @@ function Client:getBookContent(chapter, book)
         chapterUrl = chapter.url or chapter.chapterUrl,
         bookSourceUrl = book.origin,
         refresh = 0,
-    })
+    }, { retry = true })
     assert(res.isSuccess, "获取正文失败: " .. tostring(res.errorMsg))
     return htmlToText(res.data or "")
 end
@@ -212,23 +357,45 @@ function Client:getBookContentRaw(chapter, book)
         chapterUrl = chapter.url or chapter.chapterUrl,
         bookSourceUrl = book.origin,
         refresh = 0,
-    })
+    }, { retry = true })
     assert(res.isSuccess, "获取正文失败: " .. tostring(res.errorMsg))
     return res.data or ""
 end
 
 --- 从 HTML 中提取所有图片 URL
+-- 覆盖三种常见写法：src、懒加载 data-src / data-original、srcset、以及 <source>。
+-- 懒加载漫画如果只认 src，会得到一堆 data:image/gif 占位图（或直接漏图）。
 function Client:extractImageUrls(html)
     local urls = {}
     if type(html) ~= "string" then return urls end
-    -- 匹配 <img ... src="..." ...>，兼容单双引号、属性顺序
-    for src in html:gmatch("<img[^>]-src%s*=%s*[\"']([^\"']+)[\"']") do
-        if src and src ~= "" then urls[#urls + 1] = src end
+    local seen = {}
+    local function push(u)
+        if type(u) ~= "string" then return end
+        u = u:gsub("^%s+", ""):gsub("%s+$", "")
+        if u == "" or u:sub(1, 5) == "data:" then return end
+        if seen[u] then return end
+        seen[u] = true
+        urls[#urls + 1] = u
+    end
+    -- <img>/<source> 标签内部：优先懒加载属性，其次 src
+    for tag in html:gmatch("<%s*[Ii][Mm][Gg][^>]*>") do
+        local u = tag:match("[Dd][Aa][Tt][Aa]%-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]%s*=%s*[\"']([^\"']+)[\"']")
+            or tag:match("[Dd][Aa][Tt][Aa]%-[Ss][Rr][Cc]%s*=%s*[\"']([^\"']+)[\"']")
+            or tag:match("[Ss][Rr][Cc]%s*=%s*[\"']([^\"']+)[\"']")
+        if u then push(u) end
+        -- srcset="a.jpg 1x, b.jpg 2x"：取第一段
+        local srcset = tag:match("[Ss][Rr][Cc][Ss][Ee][Tt]%s*=%s*[\"']([^\"']+)[\"']")
+        if srcset then push(srcset:match("^%s*([^,]+)")) end
+    end
+    for tag in html:gmatch("<%s*[Ss][Oo][Uu][Rr][Cc][Ee][^>]*>") do
+        local u = tag:match("[Ss][Rr][Cc][Ss][Ee][Tt]%s*=%s*[\"']([^\"']+)[\"']")
+            or tag:match("[Ss][Rr][Cc]%s*=%s*[\"']([^\"']+)[\"']")
+        if u then push(u:match("^%s*([^,]+)")) end
     end
     return urls
 end
 
---- 保存阅读进度
+--- 保存阅读进度（写操作，不重试）
 function Client:saveBookProgress(book, index)
     local res = self:httpPost(self:apiUrl("saveBookProgress"), {
         url = book.bookUrl, index = index, name = book.name, author = book.author,
@@ -239,7 +406,7 @@ end
 --- 获取后端版本（getVersionUpdate 的 currentVersion；失败返回 nil，不影响调用方）
 function Client:getServerVersion()
     local ok, res = pcall(function()
-        return self:httpGet(self:apiUrl("getVersionUpdate"))
+        return self:httpGet(self:apiUrl("getVersionUpdate"), { timeout = 3 })
     end)
     if ok and res.isSuccess and type(res.data) == "table" then
         local v = res.data.currentVersion
@@ -264,12 +431,13 @@ function Client:getBookSources()
 end
 
 --- 在指定书源搜索书籍（失败/无结果返回空表，不抛错，便于轮询换源）
-function Client:searchBook(key, sourceUrl)
+-- @param timeout 可选，单次搜索超时秒数（多源轮询时给短超时）
+function Client:searchBook(key, sourceUrl, timeout)
     local ok_res, res = pcall(function()
         return self:httpPost(self:apiUrl("searchBook"), {
             key = key,
             bookSourceUrl = sourceUrl,
-        })
+        }, { retry = true, timeout = timeout })
     end)
     if not ok_res or not res.isSuccess then return {} end
     return res.data or {}
@@ -297,20 +465,38 @@ function Client:deleteBook(book)
 end
 
 --- 删除某本书的正文缓存（count 全部）
-function Client:deleteBookCache(book)    local res = self:httpPost(self:apiUrl("deleteBookCache"), {
+function Client:deleteBookCache(book)
+    local res = self:httpPost(self:apiUrl("deleteBookCache"), {
         bookUrl = book.bookUrl,
     })
     return res
 end
 
+--- 图片单张最大字节数（默认 12MB）：超过就中断，避免异常响应把内存打满
+local MAX_IMAGE_BYTES = 12 * 1024 * 1024
+
 --- 下载图片到内存（返回 string 或 nil, err）
-function Client:downloadImage(url)
-    local chunks = {}
-    local _, code = http.request{
+-- 用自定义 sink 做两件事：限制累计大小、超限立刻中断传输。
+function Client:downloadImage(url, max_bytes)
+    local limit = tonumber(max_bytes) or MAX_IMAGE_BYTES
+    local chunks, total, overflow = {}, 0, false
+    local sink = function(chunk, err)
+        if not chunk then return 1 end          -- 流结束
+        total = total + #chunk
+        if total > limit then
+            overflow = true
+            return nil, "image too large"       -- 非 nil 的第一个值会让 http 中断
+        end
+        chunks[#chunks + 1] = chunk
+        return 1
+    end
+    local ok, code = HttpClient.request({
         url = url,
-        sink = ltn12.sink.table(chunks),
+        sink = sink,
         headers = { ["User-Agent"] = "Mozilla/5.0" },
-    }
+    }, 20)
+    if not ok then return nil, "网络错误" end
+    if overflow then return nil, "图片超过 " .. tostring(math.floor(limit / 1024)) .. "KB 上限" end
     if tonumber(code) ~= 200 then return nil, "HTTP " .. tostring(code) end
     local data = table.concat(chunks)
     if #data < 100 then return nil, "图片过小" end
@@ -321,9 +507,10 @@ end
 --- 整本预缓存：调用 GET /reader3/cacheBookSSE，消费 SSE 流
 --- 后端逐章并发缓存到服务器磁盘（storage/<用户>/<书>/<章MD5>.txt）
 --- @param book        书籍对象（需 bookUrl）
---- @param opts        { count=0(全部), concurrentCount=8, refresh=0 }
+--- @param opts        { count=0(全部), concurrentCount=8, refresh=0, timeout=秒 }
 --- @param on_progress function(info)  每收到一条 data 事件回调
 ---                    info = { cachedCount=, successCount=, failedCount=, isEnd=bool }
+--- 注意：这是长连接，调用方必须放到子进程/协程里跑，不要占 UI 线程（见 main.lua）。
 ----------------------------------------------------------------------
 function Client:cacheBookSSE(book, opts, on_progress)
     opts = opts or {}
@@ -354,11 +541,16 @@ function Client:cacheBookSSE(book, opts, on_progress)
         end
         return true
     end
-    local _, code = http.request{
+    -- 长连接：默认不设总超时（timeout=nil 表示沿用当前全局值），
+    -- 由调用方的子进程/可取消进度控制生命周期。
+    local ok, code = HttpClient.request({
         url = url, method = "GET",
         sink = chunk_sink,
         headers = { ["Accept"] = "text/event-stream", ["Connection"] = "keep-alive" },
-    }
+    }, opts.timeout)
+    if not ok then
+        error("预缓存请求网络错误", 0)
+    end
     assert(tonumber(code) == 200, "预缓存请求失败: " .. tostring(code))
 end
 
@@ -369,7 +561,12 @@ function Client:_parseSSEChunk(event, on_progress)
     local data_line = nil
     for line in event:gmatch("[^\r\n]+") do
         if line:sub(1, 6) == "event:" then
-            if line:sub(7):match("end") then is_end = true end
+            -- 事件名必须整体比较。原来用 sub(7):match("end") 是子串匹配，
+            -- "event: pending" / "event: append" 都会被误判成结束。
+            local name = line:sub(7):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+            if name == "end" or name == "done" or name == "complete" or name == "finished" then
+                is_end = true
+            end
         elseif line:sub(1, 5) == "data:" then
             data_line = line:sub(6):gsub("^%s+", "")
         end
@@ -377,7 +574,8 @@ function Client:_parseSSEChunk(event, on_progress)
     if data_line then
         local ok, info = pcall(json.decode, data_line)
         if ok and type(info) == "table" then
-            info.isEnd = is_end
+            -- 后端在 data 里自带 isEnd 时以它为准，event 名只作为补充信号
+            info.isEnd = info.isEnd == true or is_end
             on_progress(info)
         end
     end

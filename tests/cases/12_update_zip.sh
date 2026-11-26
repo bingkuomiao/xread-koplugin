@@ -1,7 +1,7 @@
 #!/bin/bash
-# TC-12 规范 zip 包热更新全流程（manifest2.json → 下载 zip → 解压增量替换）
-# 前置：无（本地 http.server 模拟更新服务，不依赖 NAS）
-# 预期：识别远端版本 → newer=true → 下载 zip → 本地 _meta 版本变为测试版本
+# TC-12 规范 zip 包热更新全流程（filelist.json 列目录 → 下载 zip → 校验 → 解压增量替换）
+# 前置：无（本地 http.server 模拟更新服务，raw 模式，不依赖 NAS）
+# 预期：列目录识别版本 → newer=true → 下载 zip → 本地 _meta 版本变为测试版本
 CASE_ID="12_update_zip"
 source "$(dirname "$0")/../lib/common.sh"
 
@@ -18,7 +18,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-case_begin "TC-12 规范 zip 包热更新"
+case_begin "TC-12 规范 zip 包热更新（列目录模式）"
 
 rm -f /root/.config/koreader/xread_update_manifest.json
 rm -rf /root/.config/koreader/xread_update
@@ -29,7 +29,7 @@ cp -r "$DEPLOY"/. "$PKG_ROOT/assets/plugin/staging/" \
 sed -i 's/version = ".*"/version = "0.7.0-test"/' "$PKG_ROOT/assets/plugin/staging/_meta.lua"
 
 python3 - "$PKG_ROOT/assets/plugin" "$ZIP_NAME" "$VER" <<'PY'
-import hashlib, json, os, sys, zipfile
+import hashlib, json, os, sys, time, zipfile
 root, zip_name, ver = sys.argv[1], sys.argv[2], sys.argv[3]
 staging = os.path.join(root, "staging")
 picks = ["_meta.lua", "main.lua", "xread/updater.lua", "resources/icons/miuread/check.svg"]
@@ -43,13 +43,17 @@ with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
     for it in files:
         z.write(os.path.join(staging, it["path"].replace("/", os.sep)), it["path"])
 blob = open(zpath, "rb").read()
-m = {
-    "version": ver, "build": "20261124120000", "notes": "zip 自动测试",
-    "package": zip_name, "package_size": len(blob), "package_md5": hashlib.md5(blob).hexdigest(),
-    "files_count": len(files), "files": files,
-}
-with open(os.path.join(root, "manifest2.json"), "w", encoding="utf-8") as fh:
-    json.dump(m, fh, ensure_ascii=False)
+md5 = hashlib.md5(blob).hexdigest()
+# 纯列目录模式：只提供 filelist.json + 同名 .md5 sidecar，不提供 manifest2.json
+filelist = [{
+    "name": zip_name, "path": "/plugin/" + zip_name,
+    "size": len(blob), "lastModified": int(time.time() * 1000),
+    "md5": md5, "isDirectory": False,
+}]
+with open(os.path.join(root, "filelist.json"), "w", encoding="utf-8") as fh:
+    json.dump(filelist, fh, ensure_ascii=False)
+with open(os.path.join(root, zip_name + ".md5"), "w") as fh:
+    fh.write(md5 + "\n")
 print("zip test package:", len(files), "files,", len(blob), "bytes")
 PY
 
@@ -59,10 +63,16 @@ sleep 1
 curl -sf "http://127.0.0.1:$SRV_PORT/assets/plugin/$ZIP_NAME" >/dev/null \
     || fail "本地更新服务不可用"
 
+# 确认测试目录没有 manifest2.json：验证纯列目录独立工作
+if [ -f "$PKG_ROOT/assets/plugin/manifest2.json" ]; then
+    fail "测试环境不应存在 manifest2.json（纯列目录模式）"
+fi
+
 export XREAD_UPDATER_URL="http://127.0.0.1:$SRV_PORT/assets/plugin/"
 emu_start "update"
 emu_wait_mark "mode=update done" 180
-assert_log_contains 'remote=0\.7\.0-test' "远端版本识别（manifest2）"
+assert_log_contains 'via=list' "走列目录模式"
+assert_log_contains 'remote=0\.7\.0-test' "远端版本识别（包名解析）"
 assert_log_contains 'newer=true' "判定有新版本"
 assert_log_contains 'local_version_now=0\.7\.0-test' "zip 解压后本地版本已更新"
 assert_no_fatal

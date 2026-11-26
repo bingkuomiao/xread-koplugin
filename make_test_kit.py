@@ -75,10 +75,10 @@ def main():
         # 规范热更新包（发布用的那个）
         for p in latest_publish_zip():
             count += add_file(zf, p, "publish/" + os.path.basename(p))
-        # 清单，便于对照服务端结构
-        p = os.path.join(ROOT, "publish", "plugin", "manifest2.json")
+        # 目录索引，便于对照服务端结构（纯列目录模式，不再有 manifest 清单）
+        p = os.path.join(ROOT, "publish", "plugin", "filelist.json")
         if os.path.isfile(p):
-            count += add_file(zf, p, "publish/plugin/manifest2.json")
+            count += add_file(zf, p, "publish/plugin/filelist.json")
     print(f"打包完成: {out}（{count} 文件，{os.path.getsize(out)} 字节，版本 v{ver}）")
 
 
