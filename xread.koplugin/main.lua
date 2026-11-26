@@ -89,6 +89,8 @@ local ReadingStats = require("xread.reading_stats")
 
 local UICommon = require("xread.ui_common")
 local BookExport = require("xread.book_export")
+-- 长任务进度框：单实例、文字原地刷新（替代 Trapper:info 的空框闪屏）
+local ProgressToast = require("xread.progress_toast")
 
 --- 插件版本：唯一来源是插件根目录的 _meta.lua
 -- 原来这里硬编码 "0.6.10"，升级到 0.6.13 后关于页/更新提示仍显示旧版本，
@@ -4024,6 +4026,18 @@ function XRead:openAtChapter(book, chapters, index)
 
     local last = math.min(index + max_chapters - 1, #chapters)
 
+    -- 「默认缓存章节数」（设置 → 缓存管理）：50 / 100 / 全部。
+    -- 开书只拼 max_chapters 章立即打开，剩下的由后台缓存到这里给的末尾；
+    -- 原来后台也只补到 max_chapters 章，翻几页就没缓存了，每章都要等网络。
+    local bg_last = last
+    local depth = self:cacheDepthLimit()
+    if depth and depth > 0 then
+        local wanted = index + depth - 1
+        if wanted > bg_last then
+            bg_last = math.min(wanted, #chapters)
+        end
+    end
+
     -- 先取第一章原始 HTML：既能判断漫画，也能复用成正文（不重复请求）
 
     local raw, raw_ok = nil, false
@@ -4191,7 +4205,7 @@ function XRead:openAtChapter(book, chapters, index)
 
     -- 剩余章节后台补，退出书籍即中断
 
-    if contig_end < last then
+    if contig_end < bg_last then
 
         startBg{
 
@@ -4211,7 +4225,7 @@ function XRead:openAtChapter(book, chapters, index)
 
             next = contig_end + 1,
 
-            last = last,
+            last = bg_last,
 
         }
 
@@ -4818,9 +4832,31 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
     end
 
+    -- 行距：crengine 的 setInterlineSpacePercent，100 就是「原生」行距。
+    -- 原来这里的 ± 没有回调，只有文字「原生」两个字，点了没有任何反应。
+    local function currentLineSpacing()
+
+        local v
+
+        pcall(function()
+
+            local f = self.ui and self.ui.font
+
+            v = f and f.configurable and tonumber(f.configurable.line_spacing)
+
+        end)
+
+        return v or 100
+
+    end
+
     local function spacingLabel()
 
-        return _("原生")
+        local v = currentLineSpacing()
+
+        if v == 100 then return _("原生") end
+
+        return tostring(v) .. "%"
 
     end
 
@@ -4840,8 +4876,8 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
     end)
 
-    -- 昵称跟在「首页」按钮后面；第二行标题位显示书名；左下格显示当前章节名。
-    -- 昵称兜底与首页一致：设置昵称 > 登录账号 > 「书友」。
+    -- 昵称跟在「首页」按钮后单独占一格：拼进 home_label 时昵称一长就折行，
+    -- 看着像「首页」和昵称挤在一起。第二行标题位显示书名，左下格显示当前章节名。
     local nickname = tostring(self:getSetting("nickname", "") or "")
 
     if nickname == "" then nickname = tostring(self:getSetting("username", "") or "") end
@@ -4856,7 +4892,9 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
         header = {
 
-            home_label = _("首页") .. " " .. nickname,
+            home_label = _("首页"),
+
+            nickname_label = nickname,
 
             title = name,
 
@@ -4943,6 +4981,10 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
                 label = _("行距"), value = spacingLabel(),
 
                 callback = function() self:showSettings() end,
+
+                on_decrease = function() self:changeLineSpacing(-10); return spacingLabel() end,
+
+                on_increase = function() self:changeLineSpacing(10); return spacingLabel() end,
 
             },
 
@@ -5250,6 +5292,46 @@ function XRead:changeFontSize(delta)
     local ok = pcall(function() ui:handleEvent(Event:new("ChangeSize", delta)) end)
 
     if not ok then pcall(function() ui.font:onChangeSize(delta) end) end
+
+end
+
+-- 行距加减（百分比，100 = 原生行距）。走 crengine 的 setInterlineSpacePercent，
+-- 与 KOReader 原生「行距」设置是同一个值，所以两处显示一致。
+-- 不用 Event:new("SetLineSpace") 是因为它会额外弹一个 Notification，
+-- 连点几下 ± 就会弹一串提示盖住正文。
+function XRead:changeLineSpacing(delta)
+
+    local ui = self.ui
+
+    if not (ui and ui.document) then return end
+
+    local cur = 100
+
+    pcall(function()
+
+        local f = ui.font
+
+        cur = tonumber(f and f.configurable and f.configurable.line_spacing) or 100
+
+    end)
+
+    local target = math.max(50, math.min(200, cur + (tonumber(delta) or 0)))
+
+    if target == cur then return end
+
+    pcall(function()
+
+        if ui.font and ui.font.configurable then
+
+            ui.font.configurable.line_spacing = target
+
+        end
+
+        ui.document:setInterlineSpacePercent(target)
+
+        ui:handleEvent(Event:new("UpdatePos"))
+
+    end)
 
 end
 
@@ -6536,7 +6618,7 @@ function XRead:showMoreListPanel(title, items, opts)
     end
 
     function Overlay:paintTo(bb, x, y)
-        bb:paintRect(x, y, self.dimen.w, self.dimen.h, Blitbuffer.COLOR_GRAY_E)
+        UICommon.dimBackdrop(bb, x, y, self.dimen.w, self.dimen.h)
         self[1]:paintTo(bb, x, y)
     end
 
@@ -6556,11 +6638,12 @@ end
 
 function XRead:showMorePanel()
 
+    -- 「翻页管理」从这里移除了：它并进首页齿轮「设置」的翻页管理分组。
+    -- 同一功能保留两个入口，用户会在两份列表里各点一遍。
     self:showMoreListPanel(_("更多"), {
         { label = _("我的书架"), callback = function() self:openShelf() end },
         { label = _("地址管理"), callback = function() self:showServerManage() end },
         { label = _("账号管理"), callback = function() self:showAccountManage() end },
-        { label = _("翻页管理"), callback = function() self:showPageManage() end },
         { label = _("关于本机"), callback = function() self:showAboutPanel() end },
     }, { hint = _("点击条目进入；点空白处返回。") })
 
@@ -7144,10 +7227,8 @@ function XRead:showServerManage()
 
     local draft = self._server_draft
     if not draft then
-        local addr = tostring(self:getSetting("address", "") or "")
-        local host = addr:gsub("^%w+://", "")
-        local ip, port = host:match("^([^:/]+):(%d+)$")
-        if not ip then ip, port = host, "" end
+        -- 与设置页共用同一份地址解析，避免两处规则不一致
+        local ip, port = self:serverAddressParts()
         draft = {
             ip = tostring(ip or ""),
             port = tostring(port or ""),
@@ -7166,30 +7247,8 @@ function XRead:showServerManage()
     local dialog  -- forward
 
     local function saveDraft()
-        local ip = (draft.ip or ""):gsub("%s", "")
-        local port = (draft.port or ""):gsub("%s", "")
-        if ip == "" then return end
-        local addr = "http://" .. ip
-        if port ~= "" then addr = addr .. ":" .. port end
-        self:saveSetting("address", addr)
-        local changed = addr ~= self.client.address
-        if changed then
-            self.client.address = addr
-            self.client.accessToken = nil   -- 换地址后需重登
-        end
-        -- 地址改动后：立刻解除「连不上」冷却，并异步测一次新地址
-        -- （以前要等到下一次点开页面才发现地址还是错的，且没有任何回执）
-        self:clearBackendDown()
-        if changed then
-            BackendProbe.check(addr, 2.5, function(ok, reason)
-                if ok then
-                    self:showInfo(T(_("地址已保存：%1\n连接正常"), display_address(addr)), 4)
-                else
-                    self:showInfo(T(_("地址已保存：%1\n但连接失败：%2\n\n请核对 IP、端口，以及后端服务是否已启动。"),
-                        display_address(addr), readable_error(reason)), 10)
-                end
-            end)
-        end
+        -- 真正的写入/探活逻辑在 applyServerAddress（设置页的地址/端口也用它）
+        self:applyServerAddress(draft.ip, draft.port)
     end
 
     local function saveAndClose()
@@ -7352,7 +7411,7 @@ function XRead:showServerManage()
     end
 
     function Overlay:paintTo(bb, x, y)
-        bb:paintRect(x, y, self.dimen.w, self.dimen.h, Blitbuffer.COLOR_GRAY_E)
+        UICommon.dimBackdrop(bb, x, y, self.dimen.w, self.dimen.h)
         self[1]:paintTo(bb, x, y)
     end
 
@@ -7582,7 +7641,7 @@ function XRead:showAccountManage()
     end
 
     function Overlay:paintTo(bb, x, y)
-        bb:paintRect(x, y, self.dimen.w, self.dimen.h, Blitbuffer.COLOR_GRAY_E)
+        UICommon.dimBackdrop(bb, x, y, self.dimen.w, self.dimen.h)
         self[1]:paintTo(bb, x, y)
     end
 
@@ -7911,176 +7970,149 @@ function XRead:_showShelfManageDialog(books, selected, page)
 
 end
 
+-- 地址解析：把 settings 里的 address（http://ip:port）拆成 地址 + 端口。
+-- 设置页和「更多 → 地址管理」共用同一份逻辑，避免两处解析规则不一致。
+function XRead:serverAddressParts()
+    local addr = tostring(self:getSetting("address", "") or "")
+    local host = addr:gsub("^%w+://", "")
+    local ip, port = host:match("^([^:/]+):(%d+)$")
+    if not ip then
+        ip, port = host:match("^([^:/]+)$")
+        if not ip then
+            ip, port = host, ""
+        end
+    end
+    return tostring(ip or ""), tostring(port or "")
+end
+
+-- 写入地址并即时探活：设置页改地址/端口与地址管理页走同一条路
+function XRead:applyServerAddress(ip, port)
+    ip = tostring(ip or ""):gsub("%s", "")
+    port = tostring(port or ""):gsub("%s", "")
+    if ip == "" then return false end
+    local addr = "http://" .. ip
+    if port ~= "" then addr = addr .. ":" .. port end
+    self:saveSetting("address", addr)
+    local changed = addr ~= self.client.address
+    if changed then
+        self.client.address = addr
+        self.client.accessToken = nil   -- 换地址后需重登
+    end
+    -- 地址改动后：立刻解除「连不上」冷却，并异步测一次新地址
+    -- （以前要等到下一次点开页面才发现地址还是错的，且没有任何回执）
+    self:clearBackendDown()
+    if changed then
+        BackendProbe.check(addr, 2.5, function(ok, reason)
+            if ok then
+                self:showInfo(T(_("地址已保存：%1\n连接正常"), display_address(addr)), 4)
+            else
+                self:showInfo(T(_("地址已保存：%1\n但连接失败：%2\n\n请核对 IP、端口，以及后端服务是否已启动。"),
+                    display_address(addr), readable_error(reason)), 10)
+            end
+        end)
+    end
+    return true
+end
+
+-- 「默认缓存章节数」：50 / 100 / 全部（all）
+function XRead:cacheDepthLimit()
+    local v = tostring(self:getSetting("cache_depth", "50") or "50")
+    if v == "all" then return math.huge end
+    local n = tonumber(v)
+    if not n or n < 1 then n = 50 end
+    return n
+end
+
 function XRead:showSettings()
 
-    -- miuread 风格设置页：分组标题 + 行式布局 + 步进器 + 取消/保存（参考觅阅设置设计稿）
+    -- 首页齿轮「设置」：地址管理 / 账号管理 / 翻页管理 / 缓存管理 四组。
+    -- 地址、端口、账号三项与「更多 → 地址管理 / 账号管理」同一套读写逻辑，
+    -- 这里只是把它们收在一页里；地址/端口即改即存，账号与缓存项关闭时保存。
     local VerticalGroup = require("ui/widget/verticalgroup")
     local HorizontalGroup = require("ui/widget/horizontalgroup")
     local HorizontalSpan = require("ui/widget/horizontalspan")
     local FrameContainer = require("ui/widget/container/framecontainer")
     local CenterContainer = require("ui/widget/container/centercontainer")
     local LeftContainer = require("ui/widget/container/leftcontainer")
+    local RightContainer = require("ui/widget/container/rightcontainer")
+    local InputContainer = require("ui/widget/container/inputcontainer")
     local TextBoxWidget = require("ui/widget/textboxwidget")
     local TextWidget = require("ui/widget/textwidget")
     local Button = require("ui/widget/button")
     local LineWidget = require("ui/widget/linewidget")
+    local GestureRange = require("ui/gesturerange")
     local Font = require("ui/font")
     local Blitbuffer = require("ffi/blitbuffer")
     local Geom = require("ui/geometry")
 
-    -- 草稿：跨对话框重建保留，保存/取消时清除
+    -- 草稿：账号 / 缓存项跨面板重建保留（点地址、点账号都会重建面板）
     local draft = self._settings_draft
     if not draft then
+        local depth = tostring(self:getSetting("cache_depth", "50") or "50")
+        if depth ~= "all" and depth ~= "100" then depth = "50" end
         draft = {
-            address = tostring(self:getSetting("address", "") or ""),
             username = tostring(self:getSetting("username", "") or ""),
             password = tostring(self:getSetting("password", "") or ""),
             nickname = tostring(self:getSetting("nickname", "") or ""),
             max_chapters = tonumber(self:getSetting("max_chapters", "3")) or 3,
+            cache_depth = depth,
         }
         self._settings_draft = draft
     end
 
-    local W = math.min(Screen:getWidth() - 80, 860)
-    local pad = math.floor(Screen:getWidth() * 0.03)
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local W = math.min(sw - 80, 860)
+    local pad = math.floor(sw * 0.03)
     local inner_w = W - pad * 2
     local face_title = Font:getFace("cfont", 22)
     local face_group = Font:getFace("smallinfofont", 15)
     local face_row = Font:getFace("cfont", 18)
     local face_hint = Font:getFace("smallinfofont", 13)
+    local face_desc = Font:getFace("cfont", 14)
+
+    -- 行高按屏幕高度自适应：9 行 + 4 个分组标题在小屏上也能放下
+    local row_h = math.max(Screen:scaleBySize(32), math.min(Screen:scaleBySize(52), math.floor(sh * .045)))
+    local gap_row = Screen:scaleBySize(4)
+    local gap_group = Screen:scaleBySize(12)
+    local label_w = math.floor(inner_w * .38)
 
     local dialog  -- forward
 
-    -- 统一提交草稿到配置（关闭即保存）
     local function saveDraft()
         local old_username = self:getSetting("username", "")
         local old_password = self:getSetting("password", "")
         local old_address = self:getSetting("address", "")
-        self:saveSetting("address", draft.address)
+        self:saveSetting("nickname", draft.nickname)
         self:saveSetting("username", draft.username)
         self:saveSetting("password", draft.password)
-        self:saveSetting("nickname", draft.nickname)
         self:saveSetting("max_chapters", tostring(draft.max_chapters))
-        -- 地址/账号/密码任一变更：清旧 token、按新账号重登、换账号清旧书架缓存
-        -- 延迟登录：让设置页/账号页先关掉，再在后台走登录（最长 12s，不能卡住关闭动作）
+        self:saveSetting("cache_depth", tostring(draft.cache_depth))
+        -- 账号/密码变更：清旧 token、按新账号重登（延迟到面板关掉之后）
         self:_syncCredentials(old_username, old_password, old_address, true)
+    end
+
+    local function closeSelf()
+        if dialog then UIManager:close(dialog) end
+        UIManager:setDirty("all", "full")   -- 整屏重绘，防残影
     end
 
     local function saveAndClose()
         saveDraft()
         self._settings_draft = nil
-        if dialog then UIManager:close(dialog) end
+        closeSelf()
         self:_refreshHomeIfOpen()   -- 昵称改动实时反映到首页
-        UIManager:setDirty("all", "full")   -- 整屏重绘，防残影
     end
 
     local function refreshDialog()
         if dialog then UIManager:close(dialog) end
+        -- 只换波形、不整屏深刷：原来每改一个字段就全屏黑白闪一次
         UIManager:setDirty("all", "ui")
-        self:showSettings()   -- 重建读 self._settings_draft
+        self:showSettings()
     end
 
     local function groupLabel(text)
         return TextBoxWidget:new{
             text = text, face = face_group, bold = true,
-            width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
-        }
-    end
-
-    local function editField(key, title, default, is_password)
-        local old_val = draft[key]
-        local d
-        d = InputDialog:new{
-            title = title,
-            input = tostring(draft[key] or ""),
-            input_type = is_password and "password" or "string",
-            text = is_password and _("密码将以明文保存在本地配置文件中") or nil,
-            buttons = {{
-                { text = _("取消"), callback = function() UIManager:close(d) end },
-                {
-                    text = _("确定"), is_enter_default = true,
-                    callback = function()
-                        draft[key] = d:getInputValue()
-                        UIManager:close(d)
-                        refreshDialog()
-                    end,
-                },
-            }},
-        }
-        UIManager:show(d)
-        d:onShowKeyboard()
-    end
-
-    local function fieldRow(label, key, is_password, title, default)
-        local value = tostring(draft[key] or "")
-        local shown = value ~= "" and value or _("(未设置)")
-        if is_password and value ~= "" then shown = "******" end
-        return Button:new{
-            text = label .. "  " .. shown,
-            text_font_face = "cfont",
-            text_font_size = 18,
-            text_font_bold = true,
-            bordersize = 0,
-            width = inner_w,
-            padding = 0,
-            align = "left",
-            callback = function() editField(key, title, default, is_password) end,
-        }
-    end
-
-    local value_widget  -- 步进器数值，点 ± 后就地刷新文本
-    local function stepperRow()
-        -- 就地更新数值，不重建整个对话框。
-        -- 原来每次按 ± 都 close + 整屏深刷 + 重建，e-ink 上按一下闪一下。
-        local function bump(delta)
-            draft.max_chapters = math.max(1, math.min(200,
-                (tonumber(draft.max_chapters) or 3) + delta))
-            if value_widget and value_widget.setText then
-                pcall(function()
-                    value_widget:setText(tostring(draft.max_chapters))
-                    value_widget:getSize()          -- free() 后重算尺寸
-                    UIManager:setDirty(dialog or "all", "ui")
-                end)
-            else
-                refreshDialog()
-            end
-        end
-        local minus = Button:new{
-            text = "－",
-            text_font_face = "cfont", text_font_size = 20,
-            bordersize = 1, radius = 6,
-            width = Screen:scaleBySize(72),
-            callback = function() bump(-1) end,
-        }
-        local plus = Button:new{
-            text = "＋",
-            text_font_face = "cfont", text_font_size = 20,
-            bordersize = 1, radius = 6,
-            width = Screen:scaleBySize(72),
-            callback = function() bump(1) end,
-        }
-        value_widget = TextWidget:new{
-            text = tostring(draft.max_chapters),
-            face = face_row, bold = true,
-        }
-        local label = TextWidget:new{
-            text = _("默认缓存章数"),
-            face = face_row, bold = true,
-        }
-        local row = HorizontalGroup:new{ align = "center",
-            LeftContainer:new{ dimen = Geom:new{ w = inner_w * 0.55, h = Screen:scaleBySize(52) }, label },
-            minus,
-            HorizontalSpan:new{ width = Screen:scaleBySize(14) },
-            CenterContainer:new{ dimen = Geom:new{ w = Screen:scaleBySize(90), h = Screen:scaleBySize(52) }, value_widget },
-            HorizontalSpan:new{ width = Screen:scaleBySize(14) },
-            plus,
-        }
-        return row
-    end
-
-    local function hintLine(text)
-        return TextBoxWidget:new{
-            text = text, face = face_hint,
             width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
         }
     end
@@ -8092,34 +8124,273 @@ function XRead:showSettings()
         }
     end
 
-    local gap_small = Screen:scaleBySize(10)
-    local gap_mid = Screen:scaleBySize(16)
+    local function hintLine(text)
+        return TextBoxWidget:new{
+            text = text, face = face_hint,
+            width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
+        }
+    end
 
-    local content = VerticalGroup:new{ align = "left",
-        TextBoxWidget:new{ text = _("设置"), face = face_title, bold = true, width = inner_w },
-        HorizontalSpan:new{ width = gap_mid },
-        separator(),
-        HorizontalSpan:new{ width = gap_mid },
-        groupLabel(_("服务器连接")),
-        HorizontalSpan:new{ width = gap_small },
-        fieldRow(_("后端地址"), "address", false, _("后端地址"), "http://192.168.31.51:7777"),
-        HorizontalSpan:new{ width = gap_small },
-        fieldRow(_("账号"), "username", false, _("账号"), ""),
-        HorizontalSpan:new{ width = gap_small },
-        fieldRow(_("密码"), "password", true, _("密码"), ""),
-        HorizontalSpan:new{ width = gap_mid },
-        groupLabel(_("个人设置")),
-        HorizontalSpan:new{ width = gap_small },
-        fieldRow(_("昵称"), "nickname", false, _("昵称（首页显示）"), ""),
-        HorizontalSpan:new{ width = gap_mid },
-        groupLabel(_("阅读偏好")),
-        HorizontalSpan:new{ width = gap_small },
-        stepperRow(),
-        HorizontalSpan:new{ width = gap_mid },
-        separator(),
-        HorizontalSpan:new{ width = gap_small },
-        hintLine(_("点空白处或按返回键关闭并保存。")),
+    -- 一行「左侧标签 + 右侧取值」，左右各自贴边（原来用 Button 左对齐拼字符串，
+    -- 长短不一时右边的值参差不齐，看着很乱）
+    local ParamRow = InputContainer:extend{
+        label = nil, value = nil, width = nil, height = nil,
+        callback = nil, arrow = nil, value_face = nil,
     }
+    function ParamRow:init()
+        local left_w = math.floor(self.width * .38)
+        local right_w = math.max(1, self.width - left_w)
+        local label_tw = TextWidget:new{
+            text = tostring(self.label or ""), face = face_row, bold = true,
+            max_width = left_w, fgcolor = Blitbuffer.COLOR_BLACK,
+        }
+        local value_text = tostring(self.value or "")
+        if self.arrow then value_text = value_text .. "   ›" end
+        local value_tw = TextWidget:new{
+            text = value_text, face = self.value_face or face_row,
+            max_width = right_w, fgcolor = Blitbuffer.COLOR_GRAY_D,
+        }
+        self[1] = HorizontalGroup:new{
+            align = "center",
+            LeftContainer:new{ dimen = Geom:new{ w = left_w, h = self.height }, label_tw },
+            RightContainer:new{ dimen = Geom:new{ w = right_w, h = self.height }, value_tw },
+        }
+        self.dimen = Geom:new{ w = self.width, h = self.height }
+        self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
+    end
+    function ParamRow:onTap()
+        if self.callback then self.callback() end
+        return true
+    end
+
+    local function row(label, value, on_tap, opts)
+        opts = opts or {}
+        return ParamRow:new{
+            label = label, value = value, width = inner_w, height = row_h,
+            callback = on_tap, arrow = opts.arrow, value_face = opts.value_face,
+        }
+    end
+
+    local function editText(title, initial, is_password, on_ok)
+        local d
+        d = InputDialog:new{
+            title = title,
+            input = tostring(initial or ""),
+            input_type = is_password and "password" or "string",
+            text = is_password and _("密码将以明文保存在本地配置文件中") or nil,
+            buttons = {{
+                { text = _("取消"), callback = function() UIManager:close(d) end },
+                {
+                    text = _("确定"), is_enter_default = true,
+                    callback = function()
+                        local value = d:getInputValue()
+                        UIManager:close(d)
+                        on_ok(value)
+                    end,
+                },
+            }},
+        }
+        UIManager:show(d)
+        d:onShowKeyboard()
+    end
+
+    -- ---------- 地址管理 ----------
+    local ip, port = self:serverAddressParts()
+    local address_row = row(_("地址"), ip ~= "" and ip or _("(未设置)"), function()
+        editText(_("地址"), ip, false, function(value)
+            self:applyServerAddress(value, port)
+            refreshDialog()
+        end)
+    end, { arrow = true })
+
+    local port_row = row(_("端口"), port ~= "" and port or _("(未设置)"), function()
+        editText(_("端口"), port, false, function(value)
+            self:applyServerAddress(ip, value)
+            refreshDialog()
+        end)
+    end, { arrow = true })
+
+    -- ---------- 账号管理 ----------
+    local nickname_row = row(_("昵称"), draft.nickname ~= "" and draft.nickname or _("(未设置)"), function()
+        editText(_("昵称"), draft.nickname, false, function(value)
+            draft.nickname = tostring(value or "")
+            refreshDialog()
+        end)
+    end, { arrow = true })
+
+    local username_row = row(_("账号"), draft.username ~= "" and draft.username or _("(未设置)"), function()
+        editText(_("账号"), draft.username, false, function(value)
+            draft.username = tostring(value or "")
+            refreshDialog()
+        end)
+    end, { arrow = true })
+
+    local password_row = row(_("密码"), draft.password ~= "" and "******" or _("(未设置)"), function()
+        editText(_("密码"), draft.password, true, function(value)
+            draft.password = tostring(value or "")
+            refreshDialog()
+        end)
+    end, { arrow = true })
+
+    -- ---------- 翻页管理 ----------
+    -- 只保留两种方案；选中即生效（阅读中会重新注册分区）
+    local PAGE_MODE_TEXT = {
+        default = { label = _("上下分区"), desc = _("上点上一页 · 下点下一页") },
+        left_right = { label = _("左右分区"), desc = _("左点上一页 · 右点下一页") },
+    }
+    local cur_mode = self:currentPageMode()
+    local page_keys = {}
+    for key in pairs(PAGE_MODES) do page_keys[#page_keys + 1] = key end
+    table.sort(page_keys, function(a, b)
+        if (a == "default") ~= (b == "default") then return a == "default" end
+        return tostring(a) < tostring(b)
+    end)
+    local page_rows = {}
+    for _i, key in ipairs(page_keys) do
+        local info = PAGE_MODE_TEXT[key] or {}
+        local chosen = key == cur_mode
+        local mode_key = key
+        page_rows[#page_rows + 1] = row(
+            (chosen and "● " or "○ ") .. tostring(info.label or key),
+            tostring(info.desc or ""),
+            function()
+                self:saveSetting("page_mode", mode_key)
+                pcall(function() self:setupCenterTap() end)   -- 阅读中即时生效
+                refreshDialog()
+            end,
+            { value_face = face_desc })
+    end
+
+    -- ---------- 缓存管理 ----------
+    local step_btn_w = Screen:scaleBySize(56)
+    local value_w = Screen:scaleBySize(70)
+    local value_widget
+    local function bumpChapters(delta)
+        draft.max_chapters = math.max(1, math.min(200, (tonumber(draft.max_chapters) or 3) + delta))
+        if value_widget and value_widget.setText then
+            pcall(function()
+                value_widget:setText(tostring(draft.max_chapters))
+                value_widget:getSize()
+            end)
+            UIManager:setDirty(dialog or "all", "ui")
+        else
+            refreshDialog()
+        end
+    end
+    local function stepButton(text, delta)
+        return CenterContainer:new{
+            dimen = Geom:new{ w = step_btn_w, h = row_h },
+            Button:new{
+                text = text, text_font_face = "cfont", text_font_size = 18,
+                text_font_bold = true, bordersize = 1, radius = 6,
+                width = step_btn_w,
+                callback = function() bumpChapters(delta) end,
+            },
+        }
+    end
+    value_widget = TextWidget:new{
+        text = tostring(draft.max_chapters), face = face_row, bold = true,
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    local stepper_row = HorizontalGroup:new{ align = "center",
+        LeftContainer:new{ dimen = Geom:new{ w = label_w, h = row_h },
+            TextWidget:new{ text = _("默认预缓存章节数"), face = face_row, bold = true,
+                max_width = label_w, fgcolor = Blitbuffer.COLOR_BLACK } },
+        RightContainer:new{ dimen = Geom:new{ w = inner_w - label_w, h = row_h },
+            HorizontalGroup:new{ align = "center",
+                stepButton("－", -1),
+                CenterContainer:new{ dimen = Geom:new{ w = value_w, h = row_h }, value_widget },
+                stepButton("＋", 1),
+            } },
+    }
+
+    -- 默认缓存章节数：50 章 / 100 章 / 全部（三段选择）
+    local DEPTH_OPTIONS = {
+        { key = "50", label = _("50 章") },
+        { key = "100", label = _("100 章") },
+        { key = "all", label = _("全部") },
+    }
+    local seg_w = Screen:scaleBySize(88)
+    local seg_group = HorizontalGroup:new{ align = "center" }
+    for _i, opt in ipairs(DEPTH_OPTIONS) do
+        local key = opt.key
+        local active = draft.cache_depth == key
+        seg_group[#seg_group + 1] = CenterContainer:new{
+            dimen = Geom:new{ w = seg_w, h = row_h },
+            Button:new{
+                text = opt.label, text_font_face = "cfont", text_font_size = 16,
+                text_font_bold = active == true,
+                bordersize = active and 3 or 1,
+                radius = 6, width = seg_w,
+                callback = function()
+                    if draft.cache_depth == key then return end
+                    draft.cache_depth = key
+                    refreshDialog()
+                end,
+            },
+        }
+    end
+    local depth_row = HorizontalGroup:new{ align = "center",
+        LeftContainer:new{ dimen = Geom:new{ w = label_w, h = row_h },
+            TextWidget:new{ text = _("默认缓存章节数"), face = face_row, bold = true,
+                max_width = label_w, fgcolor = Blitbuffer.COLOR_BLACK } },
+        RightContainer:new{ dimen = Geom:new{ w = inner_w - label_w, h = row_h }, seg_group },
+    }
+
+    local rows = VerticalGroup:new{ align = "left" }
+    local function addRow(widget, gap)
+        rows[#rows + 1] = widget
+        if gap then rows[#rows + 1] = HorizontalSpan:new{ width = gap } end
+    end
+    addRow(separator(), gap_group)
+    addRow(groupLabel(_("地址管理")), gap_row)
+    addRow(address_row, gap_row)
+    addRow(port_row, gap_group)
+    addRow(groupLabel(_("账号管理")), gap_row)
+    addRow(nickname_row, gap_row)
+    addRow(username_row, gap_row)
+    addRow(password_row, gap_group)
+    addRow(groupLabel(_("翻页管理")), gap_row)
+    for _i, page_row in ipairs(page_rows) do
+        addRow(page_row, gap_row)
+    end
+    addRow(HorizontalSpan:new{ width = gap_group - gap_row })
+    addRow(groupLabel(_("缓存管理")), gap_row)
+    addRow(stepper_row, gap_row)
+    addRow(depth_row, gap_group)
+    addRow(separator(), Screen:scaleBySize(8))
+    addRow(hintLine(_("点空白处或按返回键关闭并保存。修改地址/端口立即生效。")))
+
+    local card = VerticalGroup:new{ align = "left" }
+
+    -- 标题行右侧「✕」：点空白关闭收不到手势时也有可见的关闭入口
+    local title_tw = TextWidget:new{
+        text = _("设置"), face = face_title, bold = true,
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    local close_w = Screen:scaleBySize(44)
+    local stretch = inner_w - title_tw:getSize().w - close_w
+    if stretch < 0 then stretch = 0 end
+    card[#card + 1] = HorizontalGroup:new{ align = "center",
+        title_tw, HorizontalSpan:new{ width = stretch },
+        UICommon.closeButtonAtEdge(saveAndClose, pad, close_w) }
+    card[#card + 1] = HorizontalSpan:new{ width = gap_group }
+    card[#card + 1] = rows
+
+    -- 内容比屏幕高时套一层滚动容器（小屏上不至于把首尾行挤出屏幕）
+    local body = card
+    local max_body_h = sh - pad * 2 - Screen:scaleBySize(60)
+    local ok_size, card_size = pcall(function() return card:getSize() end)
+    if ok_size and card_size and tonumber(card_size.h) and card_size.h > max_body_h then
+        local ok_scroll, ScrollableContainer = pcall(require, "ui/widget/container/scrollablecontainer")
+        if ok_scroll and ScrollableContainer then
+            body = ScrollableContainer:new{
+                dimen = Geom:new{ w = inner_w, h = math.max(1, max_body_h) },
+                _show_v_scrollbar = true,
+                card,
+            }
+        end
+    end
 
     local frame = FrameContainer:new{
         bordersize = 2,
@@ -8127,18 +8398,13 @@ function XRead:showSettings()
         padding = pad,
         background = Blitbuffer.COLOR_WHITE,
         color = Blitbuffer.COLOR_DARK_GRAY,
-        content,
+        body,
     }
 
     -- 全屏浮层：子控件未消费的点击 = 点空白 → 保存并关闭
-    local InputOverlay = require("ui/widget/container/inputcontainer")
-    local GestureRange = require("ui/gesturerange")
+    local overlay_dimen = Geom:new{ w = sw, h = sh }
 
-    local overlay_dimen = Geom:new{ w = Screen:getWidth(), h = Screen:getHeight() }
-
-    -- 必须用实例（:new）入窗：直接 show 类不会跑 _init，
-    -- _ordered_touch_zones 为 nil，任何手势广播都会 ipairs(nil) 崩溃
-    local Overlay = InputOverlay:extend{}
+    local Overlay = InputContainer:extend{}
     function Overlay:init()
         self.dimen = overlay_dimen
         self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = overlay_dimen } } }
@@ -8159,8 +8425,8 @@ function XRead:showSettings()
     end
 
     function Overlay:paintTo(bb, x, y)
-        -- 先刷一层浅灰遮罩再画卡片，提示「点空白关闭」
-        bb:paintRect(x, y, self.dimen.w, self.dimen.h, Blitbuffer.COLOR_GRAY_E)
+        -- 半透明压暗：保留弹窗前的首页画面当背景（原来整屏灰底把内容全盖掉）
+        UICommon.dimBackdrop(bb, x, y, self.dimen.w, self.dimen.h)
         self[1]:paintTo(bb, x, y)
     end
 
@@ -8453,7 +8719,7 @@ function XRead:showBookSettingsPanel()
     end
 
     function Overlay:paintTo(bb, x, y)
-        bb:paintRect(x, y, self.dimen.w, self.dimen.h, Blitbuffer.COLOR_GRAY_E)
+        UICommon.dimBackdrop(bb, x, y, self.dimen.w, self.dimen.h)
         self[1]:paintTo(bb, x, y)
     end
 
@@ -8634,8 +8900,15 @@ function XRead:_doDownloadBook(book)
             return
         end
 
-        -- 轮询进度：Trapper:info 每次让出 100ms 让 UI 能刷新/响应；
-        -- 按秒节流，避免 e-ink 被高频重绘。
+        -- 先关掉上面那条「正在准备目录…」：Trapper:clear() 会把它从窗口栈上摘掉，
+        -- 否则它会一直压在进度框上面（看着像进度框没出来、旧的提示一直不消失）。
+        Trapper:clear()
+
+        -- 进度框：只建一次，文字原地刷新（见 xread/progress_toast.lua 里的说明）。
+        -- 原来是每轮 Trapper:info(nil) —— 它会新建一个空文字 InfoMessage，
+        -- 真机上就是「进度框不停闪 + 反复出现空框」。
+        ProgressToast.show(ProgressToast.hint(T(_("正在下载 %1%（%2/%3）"),
+            "0", "0", tostring(total))))
         local deadline = os.time() + math.max(180, total * 30)
         local last_done, last_t = -1, 0
         local user_aborted = false
@@ -8653,17 +8926,19 @@ function XRead:_doDownloadBook(book)
             local go_on
             if done ~= last_done and (now - last_t >= 1 or done >= total) then
                 last_done, last_t = done, now
-                go_on = Trapper:info(T(_("正在下载 %1%（%2/%3）"),
-                    tostring(math.floor(done / total * 100)), tostring(done), tostring(total)))
+                go_on = ProgressToast.update(ProgressToast.hint(T(_("正在下载 %1%（%2/%3）"),
+                    tostring(math.floor(done / total * 100)), tostring(done), tostring(total))))
             else
-                go_on = Trapper:info(nil)      -- 保持提示，仅让出一次时间片
+                go_on = ProgressToast.update(nil)   -- 保持提示，仅让出一次时间片
             end
-            -- 用户点了提示框的「中止」：不再等下去（子进程会自己跑完，不阻塞界面）
+            -- 用户点了进度框：不再等下去（子进程会自己跑完，不阻塞界面）
             if go_on == false then
                 user_aborted = true
                 break
             end
         end
+
+        ProgressToast.close()
 
         Trapper:clear()
 
@@ -8906,6 +9181,11 @@ function XRead:doCacheBook(book, count)
         -- 主进程只轮询进度，不持有任何网络连接
         local deadline = os.time() + 3 * 3600
 
+        -- 清掉「正在连接…」一类的残留提示，再显示进度框
+        Trapper:clear()
+
+        -- 进度框：只建一次，文字原地刷新（避免每轮新建空 InfoMessage 导致闪屏）
+        ProgressToast.show(ProgressToast.hint(T(_("正在缓存到服务器：已处理 %1 章"), "0")))
         local last_cached, last_t = -1, 0
 
         local user_aborted = false
@@ -8938,15 +9218,15 @@ function XRead:doCacheBook(book, count)
 
                 last_cached, last_t = cached, now
 
-                go_on = Trapper:info(T(_("正在缓存到服务器：已处理 %1 章"), tostring(cached)))
+                go_on = ProgressToast.update(ProgressToast.hint(T(_("正在缓存到服务器：已处理 %1 章"), tostring(cached))))
 
             else
 
-                go_on = Trapper:info(nil)
+                go_on = ProgressToast.update(nil)
 
             end
 
-            -- 用户点了「中止」：不再等（子进程自己会结束，不阻塞界面）
+            -- 用户点了进度框：不再等（子进程自己会结束，不阻塞界面）
             if go_on == false then
 
                 user_aborted = true
@@ -8956,6 +9236,8 @@ function XRead:doCacheBook(book, count)
             end
 
         end
+
+        ProgressToast.close()
 
         Trapper:clear()
 

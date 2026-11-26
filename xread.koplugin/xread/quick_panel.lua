@@ -759,7 +759,8 @@ function QuickPanel:paintTo(bb, x, y)
 
     self.dimen.y = y
 
-    bb:paintRect(x, y, L.screen_w, L.screen_h, Blitbuffer.COLOR_GRAY_E)
+    -- 半透明压暗：保留弹窗前的正文/书架画面当背景（原整屏灰底会盖掉内容）
+    UICommon.dimBackdrop(bb, x, y, L.screen_w, L.screen_h)
 
     if self._card then
 

@@ -62,4 +62,19 @@ function M.closeButtonAtEdge(callback, pad, size, face_size)
     }
 end
 
+-- 弹窗遮罩：只把底下的画面压暗，不再刷一整块不透明灰底。
+-- 原来用 bb:paintRect(..., COLOR_GRAY_E)，弹窗前看到的首页/正文被整块盖掉，
+-- 用户会觉得「点一下弹窗，背景就没了」。darkenRect 是带 alpha 的混合，
+-- 底图仍在，只是变暗，弹窗边框也更清楚。
+-- amount 默认 .22（0..1，越大越暗）。
+function M.dimBackdrop(bb, x, y, w, h, amount)
+    local by = tonumber(amount) or .22
+    if by <= 0 then return end
+    if type(bb.darkenRect) == "function" then
+        local ok = pcall(bb.darkenRect, bb, x, y, w, h, by)
+        if ok then return end
+    end
+    -- 极老的 BlitBuffer 没有 darkenRect：宁可不画遮罩，也不要盖掉背景内容
+end
+
 return M

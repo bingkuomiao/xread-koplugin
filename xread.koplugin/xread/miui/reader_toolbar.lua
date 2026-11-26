@@ -244,6 +244,9 @@ end
 local function status_item(entry, width, height, callback, hold_callback, owner, ref_key)
     entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
+    -- icon_only：只画图标、不占文字位（「更多」用它 —— 首页 header 就只有一个 ⋯，
+    -- 以前这里图标 + 文字「更多」一起画，看起来像有两个「更多」）
+    local icon_only = entry.icon_only == true and entry.icon ~= nil
     local icon_w = entry.icon and Skin.dp(29, 25, 38) or 0
     local gap = entry.icon and Skin.dp(4, 3, 6) or 0
     local text_w = math.max(1, width - icon_w - gap)
@@ -252,21 +255,50 @@ local function status_item(entry, width, height, callback, hold_callback, owner,
     local label_face = entry.multiline
         and Skin.face("cfont", 9.8, 12.8, 8.4)
         or Skin.face("cfont", 10.5, 13.8, 8.9)
+    -- 一律单行：原来用 TextBoxWidget 自动折行，昵称一长就折成「首页 昵 / 称」，
+    -- 看着像「首页」和昵称挤在一起。这里先按可用宽度截断，再补省略号。
     local function format_label(value)
-        local raw = tostring(value or "")
+        local raw = tostring(value or ""):gsub("[\r\n]+", " ")
         if entry.multiline then return fit_two_lines(raw, text_w, label_face, bold) end
-        return raw
+        return fit_line(raw, text_w, label_face, bold, true)
     end
-    local label_widget = TextBoxWidget:new{
-        text = format_label(entry.label or ""),
-        face = label_face,
-        bold = bold,
-        width = text_w,
-        height_adjust = true,
-        height_overflow_show_ellipsis = true,
-        alignment = text_align,
-        fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    local tap = TapBox:new{
+        dimen = Geom:new{w = width, h = height},
+        enabled = enabled,
+        callback = callback,
+        hold_callback = hold_callback,
     }
+    if icon_only then
+        tap[1] = CenterContainer:new{
+            dimen = Geom:new{w = width, h = height},
+            icon_box(entry.icon, width, height, enabled, Skin.dp(21, 18, 28)),
+        }
+        return tap
+    end
+    -- multiline（Wi-Fi 这种要折成两行的）仍用 TextBoxWidget；其余一律 TextWidget
+    -- 单行显示：TextBoxWidget 会自己折行，昵称稍长就变成「首页 昵 / 称」。
+    local label_widget
+    if entry.multiline then
+        label_widget = TextBoxWidget:new{
+            text = format_label(entry.label or ""),
+            face = label_face,
+            bold = bold,
+            width = text_w,
+            height_adjust = true,
+            height_overflow_show_ellipsis = true,
+            alignment = text_align,
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        }
+    else
+        label_widget = TextWidget:new{
+            text = format_label(entry.label or ""),
+            face = label_face,
+            bold = bold,
+            max_width = text_w,
+            truncate_with_ellipsis = true,
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        }
+    end
     local label_box = Ui.align(label_widget, text_w, height, text_align, "center")
     if owner and ref_key then
         owner._text_refs[ref_key] = label_widget
@@ -277,12 +309,6 @@ local function status_item(entry, width, height, callback, hold_callback, owner,
         entry.icon and icon_box(entry.icon, icon_w, height, enabled, Skin.dp(20, 17, 26)) or HorizontalSpan:new{width = 0},
         entry.icon and HorizontalSpan:new{width = gap} or HorizontalSpan:new{width = 0},
         label_box,
-    }
-    local tap = TapBox:new{
-        dimen = Geom:new{w = width, h = height},
-        enabled = enabled,
-        callback = callback,
-        hold_callback = hold_callback,
     }
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, content}
     return tap
@@ -417,18 +443,23 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
     header = type(header) == "table" and header or {}
     local has_bluetooth = header.bluetooth_visible == true
     local entries, callbacks, holds, ref_keys
+    -- 昵称单独占一格（跟在「首页」后面那一格），不再拼进 home_label：
+    -- 拼在一起时只要昵称稍长就会折行成「首页 昵 / 称」，看着像挤在一起。
+    -- 「更多」只画 ⋯ 图标（icon_only），与首页 header 一致。
     if has_bluetooth then
         entries = {
-            {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
-            {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true},
-            {icon = "bluetooth", label = header.bluetooth_label or "蓝牙", enabled = type(header.bluetooth_callback) == "function", bold = true},
-            {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
-            {label = header.time_label or "", enabled = true, text_align = "center", bold = true},
-            {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
-            {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
+            {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true, weight = 1.0},
+            {label = header.nickname_label or "", enabled = true, text_align = "left", bold = true, weight = 1.2},
+            {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true, weight = 1.1},
+            {icon = "bluetooth", label = header.bluetooth_label or "蓝牙", enabled = type(header.bluetooth_callback) == "function", bold = true, weight = 1.0},
+            {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true, weight = 1.15},
+            {label = header.time_label or "", enabled = true, text_align = "center", bold = true, weight = 0.9},
+            {icon = "battery", label = header.battery_label or "", enabled = true, bold = true, weight = 1.05},
+            {icon = "more", icon_only = true, enabled = type(header.more_callback) == "function", weight = 0.62},
         }
         callbacks = {
             function() self:_activate(header.home_callback, "首页") end,
+            nil,
             function() self:_activate(header.wifi_callback, "Wi-Fi") end,
             function() self:_activate(header.bluetooth_callback, "蓝牙") end,
             function() self:_activate(header.sync_callback, "同步") end,
@@ -437,22 +468,25 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
         }
         holds = {
             type(header.home_hold_callback) == "function" and function() self:_activate_hold(header.home_hold_callback, "首页 设置") end or nil,
+            nil,
             type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
             type(header.bluetooth_hold_callback) == "function" and function() self:_activate_hold(header.bluetooth_hold_callback, "蓝牙设备") end or nil,
             nil,nil,nil,nil,
         }
-        ref_keys = {"home","wifi","bluetooth","sync","time","battery","more"}
+        ref_keys = {"home","nickname","wifi","bluetooth","sync","time","battery","more"}
     else
         entries = {
-            {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
-            {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true},
-            {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
-            {label = header.time_label or "", enabled = true, text_align = "center", bold = true},
-            {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
-            {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
+            {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true, weight = 1.0},
+            {label = header.nickname_label or "", enabled = true, text_align = "left", bold = true, weight = 1.2},
+            {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true, weight = 1.1},
+            {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true, weight = 1.15},
+            {label = header.time_label or "", enabled = true, text_align = "center", bold = true, weight = 0.9},
+            {icon = "battery", label = header.battery_label or "", enabled = true, bold = true, weight = 1.05},
+            {icon = "more", icon_only = true, enabled = type(header.more_callback) == "function", weight = 0.62},
         }
         callbacks = {
             function() self:_activate(header.home_callback, "首页") end,
+            nil,
             function() self:_activate(header.wifi_callback, "Wi-Fi") end,
             function() self:_activate(header.sync_callback, "同步") end,
             nil,nil,
@@ -460,16 +494,28 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
         }
         holds = {
             type(header.home_hold_callback) == "function" and function() self:_activate_hold(header.home_hold_callback, "首页 设置") end or nil,
+            nil,
             type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
             nil,nil,nil,nil,
         }
-        ref_keys = {"home","wifi","sync","time","battery","more"}
+        ref_keys = {"home","nickname","wifi","sync","time","battery","more"}
     end
+    -- 按 weight 分配格宽：昵称/已连接这种要宽一点，⋯ 只留图标要窄一点。
+    -- 原来一律 width/count 平分，短格子里的文字只能折行，长格子又空一大块。
     local count = #entries
-    local cell_w = math.floor(width / count)
-    local used = 0
+    local total_weight = 0
+    for _i, entry in ipairs(entries) do
+        total_weight = total_weight + (tonumber(entry.weight) or 1)
+    end
+    local used, acc_weight = 0, 0
     for index, entry in ipairs(entries) do
-        local w = index == count and (width - used) or cell_w
+        local w
+        if index == count then
+            w = width - used
+        else
+            acc_weight = acc_weight + (tonumber(entry.weight) or 1)
+            w = math.floor(width * acc_weight / total_weight) - used
+        end
         root[#root + 1] = OffsetContainer:new{
             x_off = x + used, y_off = y,
             status_item(entry, w, height, callbacks[index], holds[index], self, ref_keys[index]),
@@ -494,8 +540,11 @@ end
 
 function Toolbar:_chapter_row(root, header, x, y, width, height)
     header = type(header) == "table" and header or {}
-    local left_w = math.floor(width * .20)
-    local middle_w = math.floor(width * .55)
+    -- 左格放章节名，要能放下「第002章 拜师徐庶」这种 8-10 字标题；
+    -- 原来只给 20%，标题一长就折成两行（截图里「第002章 拜师徐 / 庶」）。
+    -- 中格章号固定「第 N / M 章」，右格百分比贴右，三段左右贴齐内容区。
+    local left_w = math.floor(width * .34)
+    local middle_w = math.floor(width * .36)
     local right_w = width - left_w - middle_w
 
     local chapter = TapBox:new{
@@ -503,16 +552,19 @@ function Toolbar:_chapter_row(root, header, x, y, width, height)
         enabled = type(header.chapter_callback) == "function",
         callback = function() self:_activate(header.chapter_callback, "目录") end,
     }
-    -- 书名单行显示，超宽省略号截断，绝不换行
+    -- 章节名严格单行：先按可用宽度截断再交给 TextWidget（不会自动折行）
     local chapter_text = fit_line(tostring(header.chapter_label or "☰ 目录"), left_w,
         Skin.face("cfont", 10.5, 13.8, 8.9), true)
-    local chapter_box=Ui.textbox(chapter_text, left_w, height,
+    local chapter_box=Ui.text(chapter_text, left_w, height,
         Skin.face("cfont", 10.5, 13.8, 8.9), {alignment = "center", halign = "center", bold = true})
     if chapter_box and chapter_box[1] then self._text_refs.chapter=chapter_box[1] end
     chapter[1] = chapter_box
 
-    local location_box=Ui.textbox(tostring(header.location_label or "当前阅读位置"), middle_w, height,
-        Skin.face("cfont", 10.1, 13.3, 8.6), {alignment = "center", halign = "center", bold = false})
+    local location_face = Skin.face("cfont", 10.1, 13.3, 8.6)
+    local location_text = fit_line(tostring(header.location_label or "当前阅读位置"), middle_w,
+        location_face, false)
+    local location_box=Ui.text(location_text, middle_w, height,
+        location_face, {alignment = "center", halign = "center", bold = false})
     if location_box and location_box[1] then self._text_refs.location=location_box[1] end
     local location = TapBox:new{dimen = Geom:new{w = middle_w, h = height}, enabled = false}
     location[1] = location_box
@@ -523,7 +575,7 @@ function Toolbar:_chapter_row(root, header, x, y, width, height)
     }
     -- 进度百分比只作展示，后面的「›」入口按钮去掉（不需要从这里进入阅读记录）
     local progress_text=tostring(header.progress_label or "")
-    local progress_box=Ui.textbox(progress_text, right_w, height,
+    local progress_box=Ui.text(progress_text, right_w, height,
         Skin.face("cfont", 10.3, 13.6, 8.7), {alignment = "right", halign = "right", bold = true})
     if progress_box and progress_box[1] then self._text_refs.progress=progress_box[1] end
     progress[1] = progress_box
@@ -673,10 +725,18 @@ end
 function Toolbar:_device_row(root, entries, x, y, width, height)
     entries = type(entries) == "table" and entries or {}
     local count = math.max(1, #entries)
-    local cell_w = math.floor(width / count)
+    -- 与上一行「目录/缓存/下载/删除/书架」（5 格）共用同一套格宽：
+    -- 首项和末项的图标中心因此上下对齐，中间几项均匀铺开。
+    -- 原来这一行按 4 等分，第一项比上一行的第一项更靠里，看着整排都错位。
+    local item_w = math.floor(width / 5)
+    if count >= 5 then item_w = math.floor(width / count) end
+    local gap = 0
+    if count > 1 then
+        gap = math.floor((width - item_w * count) / (count - 1))
+    end
     for index, entry in ipairs(entries) do
-        local cell_x = x + (index - 1) * cell_w
-        local actual_w = index == count and (x + width - cell_x) or cell_w
+        local cell_x = x + (index - 1) * (item_w + gap)
+        local actual_w = index == count and math.max(1, x + width - cell_x) or item_w
         root[#root + 1] = OffsetContainer:new{
             x_off = cell_x, y_off = y,
             compact_action_item(entry, actual_w, height,
@@ -828,6 +888,7 @@ function Toolbar:updateFromOptions(opts)
     set_ref(self._text_refs.time,header.time_label or "")
     set_ref(self._text_refs.battery,header.battery_label or "")
     set_ref(self._text_refs.home,header.home_label or "首页")
+    set_ref(self._text_refs.nickname,header.nickname_label or "",self._text_formatters.nickname)
     set_ref(self._text_refs.more,header.more_label or "更多")
     set_ref(self._text_refs.title,header.title or "正在阅读")
     set_ref(self._text_refs.chapter,header.chapter_label or "☰ 目录")
