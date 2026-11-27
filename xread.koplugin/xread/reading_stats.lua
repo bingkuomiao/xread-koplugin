@@ -694,10 +694,24 @@ function ReadingStats:init()
 
     end
 
-    -- 关闭按钮与其它弹出页统一：圆形浅灰底 + 居中 ✕
-    local close_mark = UICommon.closeButton(
+    -- 关闭按钮与其它弹出页统一：纯黑 ✕、贴到卡片边框内侧
+    local close_w = UICommon.closeButtonSize()
 
-        function() self:close() end, scaled(34), scaled(16))
+    local close_mark = UICommon.closeButtonAtEdge(
+
+        function() self:close() end, L.pad)
+
+    -- 标题按实际宽度算 span（原来写死 scaled(90)，实际字宽更大，
+    -- 会把 ✕ 顶出卡片边框）
+    local title_tw = TextWidget:new{
+
+        text = _("阅读记录"),
+
+        face = Font:getFace("tfont", scaled(18)),
+
+        fgcolor = Blitbuffer.COLOR_BLACK,
+
+    }
 
     local header = FrameContainer:new{
 
@@ -711,17 +725,9 @@ function ReadingStats:init()
 
             align = "center",
 
-            TextWidget:new{
+            title_tw,
 
-                text = _("阅读记录"),
-
-                face = Font:getFace("tfont", scaled(18)),
-
-                fgcolor = Blitbuffer.COLOR_BLACK,
-
-            },
-
-            HorizontalSpan:new{ width = L.inner_w - scaled(90) - scaled(34) },
+            HorizontalSpan:new{ width = math.max(0, L.inner_w - title_tw:getSize().w - close_w) },
 
             close_mark,
 

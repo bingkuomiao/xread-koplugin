@@ -162,6 +162,8 @@ function Client:login(username, password)
 end
 
 --- 统一 URL 拼接（对应前端 url() 函数逻辑）
+-- 注意：token 仍放在 query 上（老版本后端只认这个），同时 _authHeaders 会把
+-- Authorization / X-Secure-Key / X-User-NS 一并带上（新版本契约）。
 function Client:apiUrl(router, params)
     local url = self.address .. "/reader3/" .. router .. "?v=" .. os.time()
     if self.accessToken then
@@ -169,10 +171,33 @@ function Client:apiUrl(router, params)
     end
     if params then
         for k, v in pairs(params) do
-            url = url .. "&" .. k .. "=" .. urlencode(v)
+            if v ~= nil then
+                url = url .. "&" .. k .. "=" .. urlencode(v)
+            end
         end
     end
     return url
+end
+
+--- 鉴权头（接口文档 1.0.48.205+ 的官方约定：裸 token / secureKey / userNS）
+-- 新后端三种都认；老后端忽略未知头，所以无条件加上是安全的。
+function Client:_authHeaders(extra)
+    local h = {
+        ["Accept"] = "application/json",
+    }
+    if self.accessToken and self.accessToken ~= "" then
+        h["Authorization"] = tostring(self.accessToken)
+    end
+    if self.secureKey and self.secureKey ~= "" then
+        h["X-Secure-Key"] = tostring(self.secureKey)
+    end
+    if self.userNS and tostring(self.userNS) ~= "" then
+        h["X-User-NS"] = tostring(self.userNS)
+    end
+    if extra then
+        for k, v in pairs(extra) do h[k] = v end
+    end
+    return h
 end
 
 --- 递归清洗 LuaJSON 解码结果：JSON null 会被解码成 function 哨兵值，
@@ -211,6 +236,7 @@ function Client:_rawGet(url, timeout)
     local chunks = {}
     local ok, code, _, err = HttpClient.request({
         url = url, sink = ltn12.sink.table(chunks),
+        headers = self:_authHeaders(),
     }, timeout)
     local body = table.concat(chunks)
     if not ok then return false, nil, nil, (err and tostring(err) or body) end
@@ -229,10 +255,10 @@ function Client:_rawPost(url, obj, timeout)
     local ok, code, _, err = HttpClient.request({
         url = url, method = "POST",
         source = ltn12.source.string(payload),
-        headers = {
+        headers = self:_authHeaders({
             ["Content-Type"] = "application/json; charset=utf-8",
             ["Content-Length"] = tostring(#payload),
-        },
+        }),
         sink = ltn12.sink.table(chunks),
     }, timeout)
     local body = table.concat(chunks)
@@ -330,9 +356,15 @@ function Client:httpPost(url, obj, opts)
     return data
 end
 
---- 获取书架（refresh=true 时让后端重新扫描，用于封面/元数据后台静默刷新）
-function Client:getBookshelf(refresh)
-    local res = self:httpGet(self:apiUrl("getBookshelf", { refresh = refresh and "1" or "0" }))
+--- 获取书架
+-- 接口文档 1.0.48.205+ 把这个接口定成「唯一、干净、无副作用」的书架读接口：
+-- 入参为空、返回顺序即书架物理顺序（新书在前），展示字段由后端统一清洗。
+-- 因此不再带 refresh 参数（新后端会忽略；老后端也只会多扫一次书源，纯浪费）。
+-- 旧调用点里的 getBookshelf(true) 保留形参，只是不再影响请求。
+function Client:getBookshelf(_refresh, opts)
+    opts = opts or {}
+    local res = self:httpGet(self:apiUrl("getBookshelf"),
+        { timeout = tonumber(opts.timeout) or 8 })
     assert(res.isSuccess, "获取书架失败: " .. tostring(res.errorMsg))
     return res.data or {}
 end
@@ -432,12 +464,37 @@ function Client:getServerVersion()
     return nil
 end
 
---- 查询某本书的缓存信息（哪些章已缓存）
-function Client:getShelfBookWithCacheInfo(book)
-    local res = self:httpGet(self:apiUrl("getShelfBookWithCacheInfo", {
-        url = book.bookUrl,
-    }), { timeout = 6 })
-    return res
+--- 带缓存信息的书架（接口文档 3.2）
+-- ⚠️ 契约变更：1.0.48.205 起**无入参**，返回整个书架数组，每本书多一个
+-- cachedChapterCount 字段（服务端已缓存章节数）；旧版本传 url 只返回单本。
+-- 另外它会在后台触发目录预取（延迟 15s、限流 8 本），比 getBookshelf 重，
+-- 所以只有真的要显示「服务器已缓存 N 章」时才调它。
+-- @return Book[]（每项带 cachedChapterCount）
+function Client:getShelfBookWithCacheInfo(opts)
+    opts = opts or {}
+    local res = self:httpGet(self:apiUrl("getShelfBookWithCacheInfo"),
+        { timeout = tonumber(opts.timeout) or 8 })
+    if type(res) ~= "table" or not res.isSuccess then
+        error("获取书架缓存信息失败: " .. tostring(res and res.errorMsg), 0)
+    end
+    local data = res.data
+    if type(data) ~= "table" then return {} end
+    -- 兼容旧后端（传 url 时返回单个 Book 对象）
+    if data.bookUrl or data.name then return { data } end
+    return data
+end
+
+--- 从 getShelfBookWithCacheInfo 的结果里取某本书的服务器缓存章节数
+-- @return number|nil
+function Client:cachedChapterCountOf(books, book)
+    if type(books) ~= "table" or not book then return nil end
+    local want = tostring(book.bookUrl or "")
+    for _i, b in ipairs(books) do
+        if want ~= "" and tostring(b.bookUrl or "") == want then
+            return tonumber(b.cachedChapterCount)
+        end
+    end
+    return nil
 end
 
 --- 获取全部书源（legado 格式列表：bookSourceName/bookSourceUrl/bookSourceType/enabled...）
@@ -460,7 +517,11 @@ function Client:searchBook(key, sourceUrl, timeout)
     return res.data or {}
 end
 
---- 保存书籍到服务器书架（换源后更新 bookUrl/origin）
+--- 保存书籍到服务器书架（换源后更新 bookUrl/origin；搜书加入书架）
+-- 契约变更（1.0.48.205+）：新书由后端插到书架**最前面**（insert(0)），已存在的书
+-- 更新时保持原位；展示字段由后端清洗。所以本地缓存不能再假设「新书在末尾」，
+-- 保存后要拉一次 getBookshelf 重排（调用方已经这么做）。
+-- @return 保存后的 Book（失败返回 false）
 function Client:saveBook(book)
     local res = self:httpPost(self:apiUrl("saveBook"), {
         name = book.name,
@@ -468,8 +529,14 @@ function Client:saveBook(book)
         bookUrl = book.bookUrl,
         origin = book.origin,
         tocUrl = book.tocUrl or book.bookUrl,
+        coverUrl = book.coverUrl,
+        intro = book.intro,
+        kind = book.kind,
+        wordCount = book.wordCount,
     }, { timeout = 8 })
-    return res.isSuccess == true
+    if res.isSuccess ~= true then return false end
+    if type(res.data) == "table" then return res.data end
+    return true
 end
 
 --- 从书架移除书籍（reader3 deleteBook；cleanupCache=true 同时清服务器缓存）

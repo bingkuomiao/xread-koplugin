@@ -20,6 +20,17 @@ local function hash(s)
     return string.format("%08x", h)
 end
 
+-- 文件 mtime（一次 stat）。用来判断内存里的书架副本是否还新鲜：
+-- 比每次进首页都解一遍 shelf.json（65 本书 ≈ 13KB JSON）便宜太多。
+local function fileMtime(path)
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok and lfs then
+        local a = lfs.attributes(path, "modification")
+        if a then return tonumber(a) end
+    end
+    return nil
+end
+
 local function readJson(path)
     local f = io.open(path, "r")
     if not f then return nil end
@@ -44,7 +55,9 @@ end
 function MetaCache:new(root)
     local dir = root or (DataStorage:getDataDir() .. "/xread_books/meta")
     util.makePath(dir)
-    return setmetatable({ dir = dir }, self)
+    -- _shelf_memo 只存「当前书架」这一份（约几十 KB），不是无上限缓存；
+    -- 有了它，首页→书架→首页 的来回切换不再重复读盘+解 JSON。
+    return setmetatable({ dir = dir, _shelf_memo = nil }, self)
 end
 
 function MetaCache:shelfPath()
@@ -52,20 +65,38 @@ function MetaCache:shelfPath()
 end
 
 -- 读书架缓存。max_age 秒；返回 nil 表示未命中/过期。
+-- 先查内存副本（mtime 未变就直接返回），变了才读盘。
 function MetaCache:getShelf(max_age)
-    local d = readJson(self:shelfPath())
-    if not d or type(d.books) ~= "table" or #d.books == 0 then return nil end
-    if max_age and os.time() - (tonumber(d.time) or 0) > max_age then return nil end
-    return d.books
+    local path = self:shelfPath()
+    local mt = fileMtime(path)
+    local memo = self._shelf_memo
+    if not (memo and mt and memo.mtime == mt) then
+        local d = readJson(path)
+        if not d or type(d.books) ~= "table" or #d.books == 0 then
+            self._shelf_memo = nil
+            return nil
+        end
+        memo = {
+            mtime = mt or 0,
+            time = tonumber(d.time) or 0,
+            books = d.books,
+        }
+        self._shelf_memo = memo
+    end
+    if type(memo.books) ~= "table" or #memo.books == 0 then return nil end
+    if max_age and os.time() - (memo.time or 0) > max_age then return nil end
+    return memo.books
 end
 
 function MetaCache:putShelf(books)
     if type(books) ~= "table" or #books == 0 then return nil end
+    self._shelf_memo = nil
     return writeJson(self:shelfPath(), { time = os.time(), books = books })
 end
 
 -- 清掉书架缓存（下次读取走网络），用于「更新」按钮与进度同步后强制刷新
 function MetaCache:clearShelf()
+    self._shelf_memo = nil
     pcall(os.remove, self:shelfPath())
 end
 
@@ -87,9 +118,15 @@ function MetaCache:updateShelfProgress(book_url, dur_index, when_ts)
     end
     if changed then
         d.time = os.time()
+        self._shelf_memo = nil
         return writeJson(self:shelfPath(), d)
     end
     return nil
+end
+
+--- 冷启动预热：把书架缓存读进内存，首次进首页不再付读盘+解码成本
+function MetaCache:warm()
+    pcall(function() self:getShelf(nil) end)
 end
 
 function MetaCache:chaptersPath(book)

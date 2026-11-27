@@ -179,7 +179,7 @@ function ChapterRow:init()
 
     local tw = TextWidget:new{
         text = self.text,
-        face = Font:getFace("cfont", scaled(14)),
+        face = Font:getFace("cfont", scaled(15)),
         bold = bold,
         fgcolor = fg,
         max_width = math.max(1, box_w - 2 * pad),
@@ -233,9 +233,9 @@ function CatalogView.computeLayout()
     local right_w = sw - left_w - divider
     local right_header_h = scaled(34)
 
-    -- 单列列表：一屏 14 章（与两列方块版之前的行高一致），行间只留一条细缝。
+    -- 单列列表：一屏 12 章（列表区大小不变，行高比 14 行时更高，章节名更松快）
     local cols = 1
-    local rows = 14
+    local rows = 12
     local gap = scaled(5)
     local list_h = body_h - 2 * pad - right_header_h - 1
     local row_h = math.max(scaled(30), math.floor(list_h / rows))
@@ -806,6 +806,8 @@ function CatalogView:init()
 
         self._cache_sig = self:_cacheSignature()
 
+        self._cache_idle = 0
+
         self:_scheduleCacheTick()
 
     end
@@ -816,7 +818,7 @@ function CatalogView:_cacheSignature()
 
     local chapters = self.chapters or {}
 
-    local page_size = self._page_size or 14
+    local page_size = self._page_size or 12
 
     local first = (self.page - 1) * page_size + 1
 
@@ -834,9 +836,15 @@ function CatalogView:_cacheSignature()
 
 end
 
+-- 预加载高亮的轮询：1.5s 一次（对当前页 12 章各一次 stat），
+-- 连续 80 次（约 2 分钟）没有任何变化就自动停 —— 目录页常开着不动时
+-- 不该一直占 CPU；用户翻页/重开目录会重新建视图，轮询自然恢复。
+local CACHE_TICK_INTERVAL = 1.5
+local CACHE_TICK_MAX_IDLE = 80
+
 function CatalogView:_scheduleCacheTick()
 
-    UIManager:scheduleIn(1.0, function()
+    UIManager:scheduleIn(CACHE_TICK_INTERVAL, function()
 
         if self._closed then return end
 
@@ -853,6 +861,10 @@ function CatalogView:_scheduleCacheTick()
             return
 
         end
+
+        self._cache_idle = (self._cache_idle or 0) + 1
+
+        if self._cache_idle >= CACHE_TICK_MAX_IDLE then return end
 
         self:_scheduleCacheTick()
 

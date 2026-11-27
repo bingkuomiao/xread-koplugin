@@ -441,10 +441,12 @@ function QuickPanel:init()
 
     }
 
-    -- 关闭按钮与其它弹出页统一：圆形浅灰底 + 居中 ✕
-    local close_mark = UICommon.closeButton(
+    -- 关闭按钮与其它弹出页统一：纯黑 ✕、贴到卡片边框内侧
+    local close_w = UICommon.closeButtonSize()
 
-        function() self:close() end, scaled(34), scaled(15))
+    local close_mark = UICommon.closeButtonAtEdge(
+
+        function() self:close() end, L.pad)
 
     local header = HorizontalGroup:new{
 
@@ -452,11 +454,11 @@ function QuickPanel:init()
 
         HorizontalSpan:new{ width = math.max(scaled(6),
 
-            L.inner_w - scaled(70) - title:getSize().w - counter:getSize().w) },
+            L.inner_w - close_w - scaled(10) - title:getSize().w - counter:getSize().w) },
 
         counter,
 
-        HorizontalSpan:new{ width = scaled(12) },
+        HorizontalSpan:new{ width = scaled(10) },
 
         close_mark,
 

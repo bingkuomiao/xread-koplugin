@@ -29,7 +29,19 @@ local M = {}
 local live
 
 local ABORT_HINT = "（点按此处可中止）"
+-- 边框/内边距/宽度/垂直位置全部跟 MessageBox 取同一套，
+-- 长任务进度框和普通提示框看起来是同一个东西。
 local BORDER = 2
+
+local function card_metrics()
+    local ok, MessageBox = pcall(require, "xread/message_box")
+    if ok and MessageBox and MessageBox.cardMetrics then
+        local w, pad, border, ratio = MessageBox.cardMetrics()
+        return w, pad, border or BORDER, ratio or 0.04
+    end
+    local sw = Screen:getWidth()
+    return math.min(math.floor(sw * 0.72)), Screen:scaleBySize(16), BORDER, 0.04
+end
 
 local Toast = InputContainer:extend{
     text = "",
@@ -43,9 +55,8 @@ function Toast:init()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     self.full_dimen = Geom:new{ x = 0, y = 0, w = sw, h = sh }
     self.dimen = self.full_dimen
-    self.pad = Screen:scaleBySize(16)
-    self.text_w = math.max(1,
-        math.min(sw - Screen:scaleBySize(90), Screen:scaleBySize(660)) - self.pad * 2)
+    self.pad = select(2, card_metrics())
+    self.text_w = math.max(1, select(1, card_metrics()) - self.pad * 2 - BORDER * 2)
     self.text_widget = TextBoxWidget:new{
         text = self.text,
         face = Font:getFace("cfont", 17),
@@ -66,7 +77,8 @@ function Toast:_measure()
     local box_w = math.min(sw - Screen:scaleBySize(40), tw + self.pad * 2 + BORDER * 2)
     local box_h = th + self.pad * 2 + BORDER * 2
     local box_x = math.floor((sw - box_w) / 2)
-    local box_y = math.floor(sh * .58)
+    -- 与 MessageBox 同一垂直基准：中线比屏幕正中上移 4%
+    local box_y = math.floor(sh * (0.5 - select(4, card_metrics())) - box_h / 2)
     if box_y + box_h > sh - Screen:scaleBySize(24) then
         box_y = math.max(Screen:scaleBySize(24), math.floor((sh - box_h) / 2))
     end
