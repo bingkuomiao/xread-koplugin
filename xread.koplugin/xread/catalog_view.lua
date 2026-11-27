@@ -659,7 +659,9 @@ function CatalogView:init()
         local label = ch.title or (_("第") .. bi .. _("章"))
         local cache_state = self.cache_fn and self.cache_fn(bi) or nil
         if cache_state == "active" then
-            label = label .. " · " .. _("缓存中")
+            -- 这里反映的是本地预加载（浏览器缓存预加载章节数）的进度，
+            -- 不是服务器缓存任务，文案统一叫「预加载中」。
+            label = label .. " · " .. _("预加载中")
         end
         local row = ChapterRow:new{
             text = label,

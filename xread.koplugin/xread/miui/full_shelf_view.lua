@@ -187,11 +187,11 @@ local function outlined_badge(text, width, height)
     for _, off in ipairs(offsets) do
         layer[#layer + 1] = OffsetContainer:new{x_off = off[1], y_off = off[2],
             CenterContainer:new{dimen = Geom:new{w = width, h = height}, TextWidget:new{
-                text = text, face = face("smallinfofont", 9.0, 13), bold = true, fgcolor = Blitbuffer.COLOR_WHITE,
+                text = text, face = face("smallinfofont", 8.4, 12.2), bold = true, fgcolor = Blitbuffer.COLOR_WHITE,
             }}}
     end
     layer[#layer + 1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, TextWidget:new{
-        text = text, face = face("smallinfofont", 9.0, 13), bold = true, fgcolor = Blitbuffer.COLOR_BLACK,
+        text = text, face = face("smallinfofont", 8.4, 12.2), bold = true, fgcolor = Blitbuffer.COLOR_BLACK,
     }}
     return layer
 end
@@ -218,8 +218,8 @@ local function book_card(book, width, height, on_select, on_hold)
     end
     if progress > 0 then
         local text = progress >= 100 and "已读" or tostring(math.floor(progress + .5)) .. "%"
-        local badge_w = math.max(UiScale.dp(32, 28, 48), U.utf8_len(text) * UiScale.dp(8, 7, 11) + UiScale.dp(11, 9, 15))
-        local badge_h = UiScale.dp(20, 18, 28)
+        local badge_w = math.max(UiScale.dp(29, 25, 43), U.utf8_len(text) * UiScale.dp(7.4, 6.4, 10) + UiScale.dp(10, 8, 14))
+        local badge_h = UiScale.dp(18, 16, 25)
         local inset = UiScale.dp(3, 2, 5)
         layer[#layer + 1] = OffsetContainer:new{
             x_off = math.max(0, cover_w - badge_w - inset),

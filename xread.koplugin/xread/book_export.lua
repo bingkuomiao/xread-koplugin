@@ -68,6 +68,14 @@ local function safeFileName(s)
     return s
 end
 
+--- 导出目标文件路径（只算路径，不判断是否存在）。
+--- 下载确认框要靠它判断「已存在 → 覆盖」，避免用户以为又下载了一份。
+function BookExport:exportPath(book)
+    local dir = self:exportDir()
+    local name = safeFileName(book and book.name or "book")
+    return dir .. "/" .. name .. ".epub"
+end
+
 -- 正文转 HTML 段落：沿用客户端已清洗的纯文本，按换行分段并转义
 local function textToHtml(text)
     local out = {}
@@ -114,8 +122,7 @@ function BookExport:createEpub(book, chapters, getContent, onProgress, opts)
     local ok_mk = pcall(util.makePath, dir)
     if not ok_mk then return nil, _("文档目录不可写：") .. tostring(dir) end
 
-    local name = safeFileName(book.name or "book")
-    local path = dir .. "/" .. name .. ".epub"
+    local path = self:exportPath(book)
     local tmp = path .. ".tmp"
     local epub = Archiver.Writer:new{}
     if not epub:open(tmp, "epub") then

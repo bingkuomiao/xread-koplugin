@@ -628,7 +628,7 @@ function QuickPanel:init()
 
             cell("info", _("阅读记录"), closeThen(self.on_stats)),
 
-            cell("appbar.contrast", _("夜间"), function()
+            cell("appbar.contrast", _("夜晚"), function()
 
                 if self.on_night then self.on_night() end
 

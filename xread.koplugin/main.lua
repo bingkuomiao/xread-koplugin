@@ -29,6 +29,8 @@ local Device       = require("device")
 
 local Screen       = require("device").screen
 
+local DeviceListener = require("device/devicelistener")
+
 local util         = require("util")
 
 local lfs          = require("libs/libkoreader-lfs")
@@ -147,11 +149,50 @@ local SHARED = {
 
     index = nil,
 
+    -- 当前 TXT 实际拼进去的章节范围（index .. index+max_chapters-1）；
+    -- TOC 只覆盖这一段，翻页换算全书章节号时需要它。
+    doc_first = nil,
+
+    doc_last = nil,
+
     cover_paths = nil,  -- 书架这一页已缓存的封面，目录页复用
 
     prev_end_action = nil,
 
 }
+
+--- 当前页 -> 当前章节序号（1 基）。
+-- TOC 是「每章一个起始页」的升序数组（原生 h2 或正文扫描注入），
+-- 用二分找最后一个 page <= pageno 的条目；条目数与章节数对不上时按比例映射。
+-- @return number|nil
+local function pageChapterIndex(ui, pageno, chapters, doc_first, doc_last)
+    local toc = ui and ui.toc and ui.toc.toc
+    if type(toc) ~= "table" or #toc == 0 then return nil end
+    pageno = tonumber(pageno) or 1
+    local lo, hi, idx = 1, #toc, 0
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        if (tonumber(toc[mid].page) or 0) <= pageno then
+            idx = mid
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    if idx == 0 then idx = 1 end
+    local total = type(chapters) == "table" and #chapters or 0
+    -- 当前 TXT 只拼了「起始章 .. 起始章+N」这一段，TOC 也只覆盖这一段：
+    -- 文档内第 idx 章 = 全书第 doc_first + idx - 1 章。
+    local first = tonumber(doc_first) or 1
+    local doc_count = (tonumber(doc_last) or 0) - first + 1
+    if doc_count > 0 and #toc == doc_count then
+        idx = first + idx - 1
+    elseif total > 0 and #toc ~= total then
+        idx = math.max(1, math.min(total, math.floor(idx / #toc * total + .5)))
+    end
+    if total > 0 then idx = math.max(1, math.min(total, idx)) end
+    return idx
+end
 
 local BG = { job = nil }
 
@@ -1029,6 +1070,73 @@ function XRead:init()
 
             end)
 
+        elseif flow == "cache_none" then
+
+            -- 缓存章节数全部取消（none）时，点「缓存」应先提示去首页设置
+            UIManager:scheduleIn(4, function()
+
+                local old = self:getSetting("cache_depth", "50")
+
+                self:saveSetting("cache_depth", "none")
+
+                self:doCacheBook(SHARED.book)
+
+                autotest_mark("flow=cache_none done")
+
+                UIManager:scheduleIn(10, function()
+                    self:saveSetting("cache_depth", tostring(old or "50"))
+                end)
+
+            end)
+
+        elseif flow == "download_confirm" then
+
+            -- 本地已导出过同一本书：确认框按钮应为「覆盖」
+            UIManager:scheduleIn(4, function()
+
+                local p
+
+                pcall(function() p = BookExport:exportPath(SHARED.book) end)
+
+                if p then
+
+                    pcall(function() util.makePath(p:match("^(.*)/[^/]+$") or ".") end)
+
+                    local f = io.open(p, "w")
+
+                    if f then f:write("x") f:close() end
+
+                end
+
+                autotest_mark("flow=download_confirm path=" .. tostring(p))
+
+                self:downloadBookToDevice(SHARED.book)
+
+            end)
+
+        elseif flow == "chapter_sync" then
+
+            -- 正常翻到最后一页（跨章），菜单/底栏章节名应随之更新
+            UIManager:scheduleIn(5, function()
+
+                local footer = self.ui and self.ui.view and self.ui.view.footer
+
+                local pages = tonumber(footer and footer.pages) or 1
+
+                pcall(function() self.ui:handleEvent(Event:new("GotoPage", pages)) end)
+
+                UIManager:scheduleIn(2.5, function()
+
+                    local ch = (SHARED.chapters or {})[SHARED.index or 1] or {}
+
+                    autotest_mark("flow=chapter_sync idx=" .. tostring(SHARED.index)
+                        .. " last=" .. tostring(SHARED.doc_last)
+                        .. " title=" .. tostring(ch.title))
+
+                end)
+
+            end)
+
         elseif flow == "shelf" then
 
             UIManager:scheduleIn(6, function()
@@ -1160,6 +1268,40 @@ function XRead:init()
 
                 autotest_mark("flow=progress done")
 
+            end)
+
+        elseif flow == "night_seq" then
+
+            -- 验收：正文夜晚 → 首页夜晚连续切换（首页必须每次都能翻转）
+            UIManager:scheduleIn(4, function()
+                autotest_mark("flow=night_seq book start")
+                self:toggleBookNightMode()
+                autotest_mark("flow=night_seq book done")
+                UIManager:scheduleIn(2, function()
+                    self.ui:onHome()
+                    UIManager:scheduleIn(2, function()
+                        local home_night = nil
+                        for idx, entry in ipairs(self:buildHomeActions()) do
+                            if tostring(entry.label) == tostring(_("夜晚")) then
+                                home_night = entry.callback
+                                break
+                            end
+                        end
+                        if home_night then home_night() end
+                        autotest_mark("flow=night_seq home1 done")
+                        UIManager:scheduleIn(2, function()
+                            local home_night2 = nil
+                            for idx2, entry in ipairs(self:buildHomeActions()) do
+                                if tostring(entry.label) == tostring(_("夜晚")) then
+                                    home_night2 = entry.callback
+                                    break
+                                end
+                            end
+                            if home_night2 then home_night2() end
+                            autotest_mark("flow=night_seq home2 done")
+                        end)
+                    end)
+                end)
             end)
 
         elseif flow == "msgbox" then
@@ -2229,6 +2371,9 @@ end
 -- 与现有「更新」按钮（整页重建）和 30s 心跳（只刷时间/连接）职责分离；
 -- 为避免和后台封面重试的 getBookshelf/putShelf 竞态，刷新期间停掉封面循环，结束再恢复。
 function XRead:refreshRecentBook()
+    if os.getenv("XREAD_AUTOTEST") then
+        print("[XREAD_AUTOTEST] hero_refresh tapped shown=" .. tostring(MiuiHome.is_shown()))
+    end
     if not MiuiHome.is_shown() then return end
     if self._opening_book or SHARED.open_path then return end
 
@@ -2267,6 +2412,17 @@ function XRead:refreshRecentBook()
 
         local layout = GridShelf.computeLayout(1)
         local cover_paths = self:prepareCovers({ hero_book }, 1, 1, layout, true)
+        -- 本地还没缓存封面时，刷新后异步补一张；否则「刷新」只会把空白封面
+        -- 再画一遍，看起来像按钮没生效。
+        if cover_paths[hero_book] == nil
+            and hero_book.coverUrl and hero_book.coverUrl ~= "" then
+            self:_fetchCoverAsync(hero_book, layout.cover_w, layout.cover_h, function(p)
+                if not p or not MiuiHome.is_shown() or self._opening_book then return end
+                local hero2 = self:_makeHeroInfo(hero_book, { [hero_book] = p })
+                hero2.cover_path, hero2.home_cover_path = p, p
+                pcall(function() MiuiHome.update_hero(hero2) end)
+            end)
+        end
         local hero = self:_makeHeroInfo(hero_book, cover_paths)
         local updated = MiuiHome.update_hero(hero)
         if not updated then
@@ -2619,7 +2775,7 @@ function XRead:buildHomeActions()
 
         {
 
-            -- 夜间模式开关：月亮=当前日间（点击进夜间），太阳=当前夜间（点击回日间）
+            -- 首页夜晚：月亮=当前日间（点击进夜晚），太阳=当前夜晚（点击回日间）
             icon_key = (function()
 
                 local ok, Screen = pcall(function() return require("device").screen end)
@@ -2837,11 +2993,23 @@ function XRead:showHome(page)
 
     end
 
-    -- hero 不在当前书架页时单独备好封面
+    -- hero 不在当前书架页时单独备好封面。
+    -- 注意必须把 prepareCovers 的返回值合并回 cover_paths：原来只 pcall 不接返回值，
+    -- 首页左上角那张封面永远是空白的（书架里同一本书却有图）。
 
     if cover_paths[hero_book] == nil then
 
-        pcall(function() self:prepareCovers({ hero_book }, 1, 1, layout, true) end)
+        local ok_hero_cover, hero_covers = pcall(function()
+
+            return self:prepareCovers({ hero_book }, 1, 1, layout, true)
+
+        end)
+
+        if ok_hero_cover and type(hero_covers) == "table" then
+
+            for hb, hp in pairs(hero_covers) do cover_paths[hb] = hp end
+
+        end
 
     end
 
@@ -2966,13 +3134,36 @@ function XRead:showHome(page)
 
     SHARED.home_view = view
 
+    -- 首屏封面队列是否还在跑：更新提示要等它结束再弹（见 _notifyUpdateWhenHomeReady）
+    self._home_covers_busy = true
+
     self:_queueMissingCovers(page_books, 1, show_n, layout, miui_books, view,
 
         function(i)
 
             if miui_books[i] then view:updateBook(miui_books[i].bookId) end
 
+        end,
+
+        function() self._home_covers_busy = false end)
+
+    -- hero 封面异步补救：不在当前书架页 / 首次打开时缓存还没好，
+    -- 单独拉一张并在完成后只刷新「最近阅读」这一张卡（不动整页）。
+    if hero and hero_book and not hero.cover_path
+
+        and hero_book.coverUrl and hero_book.coverUrl ~= "" then
+
+        self:_fetchCoverAsync(hero_book, layout.cover_w, layout.cover_h, function(p)
+
+            if not p or view._miu_closed or self._home_view ~= view then return end
+
+            hero.cover_path, hero.home_cover_path = p, p
+
+            pcall(function() MiuiHome.update_hero(hero) end)
+
         end)
+
+    end
 
     -- 首页定时器：时钟每 30s 走字；服务器连接状态每 60s 测一次（异常时明确显示）
     self:_startHomeTicker(view)
@@ -2992,9 +3183,9 @@ function XRead:showHome(page)
 
         self._update_pending_notice = nil
 
-        UIManager:scheduleIn(1.5, function()
+        UIManager:scheduleIn(1.0, function()
 
-            if self._home_view == view then self:notifyUpdateAvailable() end
+            if self._home_view == view then self:_notifyUpdateWhenHomeReady() end
 
         end)
 
@@ -3292,9 +3483,17 @@ end
 
 -- 未缓存封面不阻塞书架：先显示占位，再逐张静默下载并局部刷新。
 -- 用 generation 号防止翻页/关闭后旧队列继续刷新界面。
-function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view, refresh_fn)
+function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view, refresh_fn, on_done)
 
-    if os.getenv("XREAD_COVER_ASYNC") == "0" then return end
+    local finished = false
+
+    local function finish()
+        if finished then return end
+        finished = true
+        if on_done then pcall(on_done) end
+    end
+
+    if os.getenv("XREAD_COVER_ASYNC") == "0" then finish() return end
 
     local queue = {}
 
@@ -3312,7 +3511,7 @@ function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view,
 
     end
 
-    if #queue == 0 then return end
+    if #queue == 0 then finish() return end
 
     local gen = (self._cover_generation or 0) + 1
 
@@ -3320,14 +3519,14 @@ function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view,
 
     local function nextOne(k)
 
-        if k > #queue then return end
+        if k > #queue then finish() return end
 
         UIManager:scheduleIn(0.05, function()
 
-            if self._cover_generation ~= gen or view._miu_closed then return end
+            if self._cover_generation ~= gen or view._miu_closed then finish() return end
 
             -- 后端不可达时整队放弃，别一张一张撞超时（每张都是同步请求，会冻 UI）
-            if not self:_backendUsable() then return end
+            if not self:_backendUsable() then finish() return end
 
             -- 弹层开着时封面下载让路，别让同步 HTTP 卡住弹层里的点击
             if self:_uiHasOverlay() then
@@ -3340,7 +3539,7 @@ function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view,
             -- 网络段进子进程，主线程只做解码 + 局部刷新，不再被单张 8s 冻住
             self:_fetchCoverAsync(item.book, layout.cover_w, layout.cover_h, function(p)
 
-                if self._cover_generation ~= gen or view._miu_closed then return end
+                if self._cover_generation ~= gen or view._miu_closed then finish() return end
 
                 if p and miui_books[item.i] then
 
@@ -3642,7 +3841,21 @@ function XRead:_makeHeroInfo(hero_book, cover_paths)
 
     hero.last_read_text = _("上次读到第 ") .. tostring(dur + 1) .. _(" 章 · 共 ")
         .. tostring(total) .. _(" 章")
-    hero.description = tostring(hero_book.intro or "")
+
+    -- 简介只来自后端书架数据（书源抓取时带回来的字段），前端不生成内容。
+    -- 不同书源/后端版本用的字段名不一样，这里按常见别名依次取；
+    -- 有的书写简介、有的书（如家父汉高祖）后端本身就是空串，前端只能显示「暂无简介」。
+    local intro_text = ""
+    for _, key in ipairs({ "intro", "description", "desc", "summary",
+            "bookIntro", "introduction", "brief", "introText" }) do
+        local v = tostring(hero_book[key] or "")
+        if v ~= "" then
+            v = v:gsub("<[^>]+>", " "):gsub("&nbsp;", " ")
+                :gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+            if v ~= "" then intro_text = v break end
+        end
+    end
+    hero.description = intro_text
 
     -- 附件1格式：作者 · 书源（originName 作为来源/分类展示）
     local author = tostring(hero_book.author or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -4326,17 +4539,10 @@ function XRead:openAtChapter(book, chapters, index)
 
     local last = math.min(index + max_chapters - 1, #chapters)
 
-    -- 「默认缓存章节数」（设置 → 缓存管理）：50 / 100 / 全部。
-    -- 开书只拼 max_chapters 章立即打开，剩下的由后台缓存到这里给的末尾；
-    -- 原来后台也只补到 max_chapters 章，翻几页就没缓存了，每章都要等网络。
+    -- 后台本地预加载范围 = 「浏览器缓存预加载章节数」（max_chapters）。
+    -- 目录里的缓存高亮也按这个范围变化，与「服务器缓存预加载章节数」解耦：
+    -- 服务器缓存只由正文「缓存」按钮按需触发，不再顺带放大本地预加载。
     local bg_last = last
-    local depth = self:cacheDepthLimit()
-    if depth and depth > 0 then
-        local wanted = index + depth - 1
-        if wanted > bg_last then
-            bg_last = math.min(wanted, #chapters)
-        end
-    end
 
     -- 先取第一章原始 HTML：既能判断漫画，也能复用成正文（不重复请求）
 
@@ -4472,6 +4678,8 @@ function XRead:openAtChapter(book, chapters, index)
     end
 
     SHARED.book, SHARED.chapters, SHARED.index = book, chapters, index
+
+    SHARED.doc_first, SHARED.doc_last = index, last
 
     SHARED.txt_path, SHARED.txt_size = path, fileSize(path)
 
@@ -5236,8 +5444,27 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
                 callback = function()
 
-                    -- 缓存多少章由「设置 → 缓存管理 → 默认服务器缓存章节数」决定
+                    -- 缓存多少章由「设置 → 缓存管理 → 服务器缓存预加载章节数」决定；
+                    -- 用户把 50/100/全部 全部取消（不缓存）时，这里先引导去首页设置。
                     local count = self:cacheDepthCount()
+
+                    if count == nil then
+
+                        MessageBox.show{
+
+                            title = _("未设置缓存章节数"),
+
+                            text = _("请先在我的首页 → 设置 → 缓存管理里\n选择「服务器缓存预加载章节数」（50 章 / 100 章 / 全部），\n再回来点「缓存」。"),
+
+                            sticky = true,
+
+                            buttons = { { text = _("知道了") } },
+
+                        }
+
+                        return
+
+                    end
 
                     local text
 
@@ -5311,14 +5538,10 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
         device_actions = {
 
-            -- 夜间开关与首页一致：月亮=当前日间（点击进夜间），太阳=当前夜间（点击回日间）
-            { icon = (function()
-
-                local ok_n, Scr = pcall(function() return require("device").screen end)
-
-                return (ok_n and Scr and Scr.night_mode) and "sun" or "night"
-
-            end)(), label = _("夜间"), callback = function() self:toggleNightMode() end },
+            -- 正文夜晚只管当前这本书：月亮=这本书日间，太阳=这本书夜晚。
+            -- 它不切换 Screen 的整屏反色，所以菜单和弹出页保持原样。
+            { icon = self:_bookNightOn() and "sun" or "night",
+              label = _("夜晚"), callback = function() self:toggleBookNightMode() end },
 
             { icon = "refresh", label = _("刷新"), callback = function() UIManager:setDirty("all", "full") end },
 
@@ -5533,7 +5756,8 @@ function XRead:_showLegacyQuickPanel()
 
         on_stats = function() self:showReadingStats() end,
 
-        on_night = function() self:toggleNightMode() end,
+        -- 正文菜单里的夜晚按钮只作用于当前书籍，不影响菜单/弹出页
+        on_night = function() self:toggleBookNightMode() end,
 
         on_prev_chapter = function() self:jumpChapter(-1) end,
 
@@ -5721,22 +5945,133 @@ function XRead:showReadingStats()
 
 end
 
-function XRead:toggleNightMode()
+-- 首页「夜晚」：整屏切换（正文、菜单、弹出页都跟着反色）。
+--
+-- 之前这里广播 SetNightMode(not cur)，cur 用「设置 OR 屏幕」。一旦正文按钮
+-- 让 Screen.night_mode 和 G_reader_settings.night_mode 不一致，DeviceListener
+-- 只按设置值比对，会把「切回日间」当成已经到位而跳过，于是首页按钮连续点
+-- 都没反应。现在直接按屏幕当前视觉状态翻转一次，并在翻转前把设置同步到
+-- 屏幕状态，保证 DeviceListener 的绝对判断和画面始终一致。
+function XRead:_globalNightOn()
 
-    -- 用绝对状态 SetNightMode 代替相对 ToggleNightMode：
-    -- broadcastEvent 会把 ToggleNightMode 发给窗口栈里每个 widget，若有多个
-    -- 监听者各自翻转一次就抵消了，表现为「点了夜晚按钮没反应」（偶发）。
-    -- SetNightMode 是幂等的：DeviceListener:onSetNightMode 会先比对当前状态，
-    -- 已到位就不再翻转，无论广播到几个监听者结果都一致。
-    local cur = false
+    local on = false
+
+    pcall(function() on = (Screen and Screen.night_mode) and true or false end)
+
+    return on
+
+end
+
+-- 当前这本书是否处于「视觉夜晚」。没单独设过时跟随全局夜晚，
+-- 一旦正文按钮切换过就按这本书自己的设置走。
+function XRead:_bookNightOn()
+
+    local ui = self.ui
+
+    if not ui then return false end
+
+    local ds = ui.doc_settings
+    local v = nil
+
+    if ds then pcall(function() v = ds:readSetting("xread_book_night") end) end
+
+    if type(v) == "boolean" then return v end
+
+    return self:_globalNightOn()
+
+end
+
+-- 正文局部夜晚的源色是否需要写成深色：
+-- 全局夜晚靠整屏反色实现。要让正文在反色后仍是用户选的明暗，
+-- 源色必须在「书本地夜晚 ≠ 全局夜晚」时才写成深色。
+function XRead:_bookNightSourceDark()
+
+    return self:_bookNightOn() ~= self:_globalNightOn()
+
+end
+
+function XRead:_bookNightCss()
+
+    if not self:_bookNightSourceDark() then return "" end
+
+    return [[
+html, body { background-color: #000000 !important; color: #F2F2F2 !important; }
+body, body * { color: #F2F2F2 !important; border-color: #555555 !important; }
+a, a * { color: #F2F2F2 !important; }
+]]
+
+end
+
+-- 正文局部夜晚：只改文档样式，不动 Screen 反色，所以菜单和弹出页不受影响。
+-- 复用 applyParaIndent 的样式表入口，避免覆盖用户已有的 style tweaks。
+function XRead:_applyBookNightCss()
+
+    local ui = self.ui
+
+    if not (ui and ui.document) then return end
+
+    local dark = self:_bookNightSourceDark()
+
     pcall(function()
-        cur = (G_reader_settings and G_reader_settings:isTrue("night_mode"))
-            or (Screen and Screen.night_mode) or false
+        if ui.document.setBackgroundColor then
+            ui.document:setBackgroundColor(dark and "#000000"
+                or (G_reader_settings and G_reader_settings:readSetting("cre_background_color")))
+        end
     end)
 
-    UIManager:broadcastEvent(Event:new("SetNightMode", not cur))
+    pcall(function() self:applyParaIndent() end)
+
+end
+
+function XRead:toggleNightMode()
+
+    local visual = self:_globalNightOn()
+
+    -- 让 DeviceListener 的判断基准与画面一致，避免上面的「点了没反应」。
+    pcall(function()
+        if G_reader_settings and G_reader_settings:isTrue("night_mode") ~= visual then
+            G_reader_settings:saveSetting("night_mode", visual)
+        end
+    end)
+
+    -- 直接调用一次设备层的翻转，不走 broadcastEvent：
+    -- 窗口栈里多个监听者各自翻转会相互抵消。
+    pcall(function() DeviceListener:onToggleNightMode() end)
 
     UIManager:setDirty("all", "full")
+
+    -- 全局反色后，正文局部夜晚的源色要跟着重算一次。
+    self:_applyBookNightCss()
+
+    if os.getenv("XREAD_AUTOTEST") then
+        print("[XREAD_AUTOTEST] global_night=" .. tostring(self:_globalNightOn())
+            .. " book_night=" .. tostring(self:_bookNightOn()))
+    end
+
+end
+
+-- 正文菜单/工具栏的「夜晚」：只切当前书籍的明暗，菜单和弹出页保持原样。
+function XRead:toggleBookNightMode()
+
+    local ui = self.ui
+
+    if not (ui and ui.doc_settings) then return end
+
+    local on = not self:_bookNightOn()
+
+    pcall(function()
+        ui.doc_settings:saveSetting("xread_book_night", on)
+        ui.doc_settings:flush()
+    end)
+
+    self:_applyBookNightCss()
+
+    UIManager:setDirty("all", "full")
+
+    if os.getenv("XREAD_AUTOTEST") then
+        print("[XREAD_AUTOTEST] book_night=" .. tostring(on)
+            .. " global_night=" .. tostring(self:_globalNightOn()))
+    end
 
 end
 
@@ -6030,6 +6365,124 @@ function XRead:switchBookSource()
 
 end
 
+-- 翻页 / 换章监听：ReaderUI:handleEvent 会遍历自身数组里的 widget 调 onXxx，
+-- 往数组里注册一个小模块即可收到 PageUpdate / PosUpdate。
+-- 用于「正常翻到下一章后，菜单里的章节名还是旧的」这个问题。
+function XRead:_ensureReaderPageWatcher()
+
+    local ui = self.ui
+
+    if not ui or self._page_watcher_ui == ui then return end
+
+    self._page_watcher_ui = ui
+
+    local ok_w, Widget = pcall(require, "ui/widget/widget")
+
+    if not ok_w then return end
+
+    local owner = self
+
+    local Watcher = Widget:extend{
+
+        onPageUpdate = function() owner:_onReaderPageChanged() end,
+
+        onPosUpdate = function() owner:_onReaderPageChanged() end,
+
+    }
+
+    local watcher = Watcher:new{}
+
+    -- always_active=true：即使当前不在前台也收事件
+    pcall(function() ui:registerModule("xreadPageWatcher", watcher, true) end)
+
+end
+
+-- 同一帧里可能连发多个 PageUpdate（跨章时还有 PosUpdate），0.3s 防抖合并成一次刷新
+function XRead:_onReaderPageChanged()
+
+    if self._page_chrome_task then
+
+        pcall(function() UIManager:unschedule(self._page_chrome_task) end)
+
+        self._page_chrome_task = nil
+
+    end
+
+    local task
+
+    task = function()
+
+        if self._page_chrome_task ~= task then return end
+
+        self._page_chrome_task = nil
+
+        pcall(function() self:_refreshReaderChromeFromPage() end)
+
+    end
+
+    self._page_chrome_task = task
+
+    UIManager:scheduleIn(0.3, task)
+
+end
+
+-- 按当前页码重算「第 N / M 章」和章节名，刷新正文工具栏 + 底栏。
+-- 原来只有 onReaderReady（打开/跳章）时刷一次，正常翻页跨章后一直是旧章节名。
+function XRead:_refreshReaderChromeFromPage()
+
+    local ui = self.ui
+
+    if not (ui and SHARED.book) then return end
+
+    local doc = ui.document
+
+    if not (doc and doc.file and SHARED.txt_path == doc.file) then return end
+
+    local footer = ui.view and ui.view.footer
+
+    local total = type(SHARED.chapters) == "table" and #SHARED.chapters or 0
+
+    local idx = pageChapterIndex(ui, footer and footer.pageno, SHARED.chapters,
+        SHARED.doc_first, SHARED.doc_last)
+
+    if idx then SHARED.index = idx end
+
+    local cur = math.max(1, math.min(tonumber(SHARED.index) or 1, math.max(1, total)))
+
+    local ch = (SHARED.chapters and SHARED.chapters[cur]) or {}
+
+    local ch_title = ch.title or ch.name
+
+    if not ch_title or ch_title == "" then
+
+        ch_title = T(_("第 %1 章"), tostring(cur))
+
+    end
+
+    pcall(function()
+
+        ReaderToolbar.refreshHeader({
+
+            title = SHARED.book.name or _("未知书籍"),
+
+            chapter_label = tostring(ch_title),
+
+            location_label = T(_("第 %1 / %2 章"), tostring(cur), tostring(total)),
+
+            progress_label = (total > 0 and tostring(math.floor(cur / total * 100 + 0.5)) or "0") .. "%",
+
+        })
+
+    end)
+
+    if footer and footer.updateFooterText then
+
+        pcall(function() footer:updateFooterText(true) end)
+
+    end
+
+end
+
 -- 每次阅读器加载好文档记一个会话起点，退出时结算到阅读记录
 function XRead:onReaderReady()
 
@@ -6057,9 +6510,9 @@ function XRead:onReaderReady()
     -- 底部状态栏：左对齐章节名 / 右对齐页码，去掉进度条
     self:_applyReaderFooter()
 
-    -- 正文排版的用户偏好（段落缩进 / 字体粗细）在每次文档就绪后重新套一遍：
+    -- 正文排版的用户偏好（段落缩进 / 字体粗细 / 本书夜晚）在每次文档就绪后重新套一遍：
     -- crengine 换文档会丢掉 setStyleSheet 追加的覆盖规则
-    pcall(function() self:applyParaIndent() end)
+    pcall(function() self:_applyBookNightCss() end)
 
     pcall(function() self:applyFontBold() end)
 
@@ -6070,6 +6523,9 @@ function XRead:onReaderReady()
     -- 必须在文档就绪后重新注册，否则跳章后点正文中央无法呼出工具栏、回不了书架。
     -- onReaderReady 在文档加载完成后触发，是补注册的正确时机。
     self:setupCenterTap()
+
+    -- 监听翻页：正常读到下一章时同步菜单里的章节名 / 底栏章节名
+    self:_ensureReaderPageWatcher()
 
     -- 换书/切书源/跳章后，工具栏若还开着，标题仍是上一本书的名字（正文已变）。
     -- 用当前 SHARED.book 原地刷新标题/章节名，不必关掉重建。
@@ -6102,6 +6558,14 @@ function XRead:onReaderReady()
         pcall(function() UIManager:close(overlay) end)
 
     end
+
+    -- footer 的 pageno 要等 ReaderView 重新布局后才是新文档的值，
+    -- 这里延后一点再按页码校正一次章节名（跳章后立即刷新会拿到旧页码）。
+    UIManager:scheduleIn(0.6, function()
+
+        pcall(function() self:_refreshReaderChromeFromPage() end)
+
+    end)
 
 end
 
@@ -6198,6 +6662,47 @@ do
             end
 
             return ("%d / %d"):format(footer.pageno or 1, footer.pages or 1)
+
+        end
+
+        -- 底栏左侧章节名：跳章 / 换文档后 toc 可能还没重建，
+        -- getTocTitleByPage 返回空串 → 底栏只剩右边页码（用户反馈的「只有右边没有左边」）。
+        -- xread 的书用章节表兜底，保证左边永远有可读的章节名。
+        ReaderFooter.textGeneratorMap.book_chapter = function(footer)
+
+            local title
+
+            local ok_t, t = pcall(function()
+                return footer.ui.toc:getTocTitleByPage(footer.pageno)
+            end)
+
+            if ok_t then title = t end
+
+            if not title or title == "" then
+
+                local is_xread = SHARED.txt_path and footer.ui and footer.ui.document
+                    and footer.ui.document.file == SHARED.txt_path
+
+                if is_xread then
+
+                    local idx = pageChapterIndex(footer.ui, footer.pageno, SHARED.chapters,
+                        SHARED.doc_first, SHARED.doc_last) or SHARED.index or 1
+
+                    local ch = (SHARED.chapters and SHARED.chapters[idx]) or {}
+
+                    title = ch.title or ch.name or T(_("第 %1 章"), tostring(idx))
+
+                end
+
+            end
+
+            if not title or title == "" then title = _("正文") end
+
+            local ok_f, fitted = pcall(function()
+                return footer:getFittedText(title, footer.settings.book_chapter_max_width_pct)
+            end)
+
+            return ok_f and fitted or title
 
         end
 
@@ -7265,15 +7770,64 @@ end
 
 -- ---------- 在线热更新 ----------
 
+-- 首页第一屏（含封面）画完再弹更新提示。
+-- 原来固定 10s 后直接 showInfo，常和封面队列 / 首页重绘撞在一起，
+-- 提示一闪就被盖掉，看起来像「没提醒」。现在最多等 25s，队列一结束就弹。
+function XRead:_notifyUpdateWhenHomeReady(attempt)
+
+    attempt = tonumber(attempt) or 0
+
+    if SHARED.open_path or self._opening_book or not MiuiHome.is_shown() then
+
+        self._update_pending_notice = true
+
+        return
+
+    end
+
+    if self._home_covers_busy == true and attempt < 25 then
+
+        UIManager:scheduleIn(1, function() self:_notifyUpdateWhenHomeReady(attempt + 1) end)
+
+        return
+
+    end
+
+    UIManager:nextTick(function() self:notifyUpdateAvailable() end)
+
+end
+
 -- 自动检查发现新版本时的提示（同一版本只提示一次，由 _update_notified 去重）
--- 只做通知不做确认：安装入口仍是「更多 → 关于本机 → 检查更新」，那里只有一个确认框
+-- 用置顶卡片（不自动消失），避免被首页的下一次刷新盖掉；
+-- 安装入口仍是「更多 → 关于本机 → 检查更新」，这里只做提醒。
 function XRead:notifyUpdateAvailable()
 
     local info = self._update_info
 
     if not info or not info.newer then return end
 
-    self:showInfo(_("发现可用新版本，请检查更新"), 6)
+    local via_local = tostring(info.via or "") == "local"
+
+    -- 更新说明截断：首页卡片不能因为一段超长 notes 撑出屏幕
+    local notes = tostring(self._update_notes or ""):gsub("%s+", " ")
+    if notes == "" then notes = _("提升阅读与缓存稳定性") end
+    if #notes > 90 then notes = notes:sub(1, 90) .. "…" end
+
+    local text = via_local
+        and T(_("插件目录里已准备好新版本 %1，装完自动重启即可生效。\n\n更新内容：%2"),
+            tostring(info.remote_version or ""), notes)
+        or T(_("发现可用新版本 %1（当前 %2）。\n\n更新内容：%3"),
+            tostring(info.remote_version or ""), tostring(info.local_version or ""), notes)
+
+    MessageBox.show{
+        title = _("发现新版本"),
+        text = text,
+        sticky = true,
+        buttons = {
+            { text = _("稍后"), callback = function() end },
+            { text = _("去更新"), callback = function() self:showAboutPanel() end },
+        },
+    }
 
 end
 
@@ -7318,6 +7872,8 @@ function XRead:quietUpdateCheck(delay)
 
                 self._update_info = info
 
+                self._update_notes = tostring(manifest.notes or "")
+
                 logger.info("xread update available",
                     tostring(info.local_version), "->", tostring(info.remote_version))
 
@@ -7328,7 +7884,7 @@ function XRead:quietUpdateCheck(delay)
 
                 else
 
-                    UIManager:nextTick(function() self:notifyUpdateAvailable() end)
+                    self:_notifyUpdateWhenHomeReady()
 
                 end
 
@@ -7460,21 +8016,39 @@ end
 -- 再找插件目录内的本地更新包（规范命名 zip/tar.gz/tgz）；返回 manifest + info
 function XRead:checkUpdateBest(updater)
 
+    -- 两边都要查。原来远端目录一成功就直接返回（哪怕远端没有更高版本），
+    -- 插件目录里已经放好的本地升级包永远轮不到，启动时自然不提示。
     local ok_r, rmanifest, rinfo = pcall(function() return updater:check() end)
-
-    if ok_r and rmanifest then
-
-        return rmanifest, rinfo
-
-    end
 
     local ok_l, lmanifest, linfo = pcall(function() return updater:checkLocal() end)
 
-    if ok_l and lmanifest then
+    local use_r = ok_r and rmanifest ~= nil and rinfo ~= nil and rinfo.newer == true
 
-        return lmanifest, linfo
+    local use_l = ok_l and lmanifest ~= nil and linfo ~= nil and linfo.newer == true
+
+    -- 两边都有新版：装版本更高的那个
+    if use_r and use_l then
+
+        if updater.versionNewer(linfo.remote_version, rinfo.remote_version) then
+
+            use_r = false
+
+        else
+
+            use_l = false
+
+        end
 
     end
+
+    if use_r then return rmanifest, rinfo end
+
+    if use_l then return lmanifest, linfo end
+
+    -- 都没有更高版本：优先返回远端结果（「已是最新」的口径），其次本地
+    if ok_r and rmanifest and rinfo then return rmanifest, rinfo end
+
+    if ok_l and lmanifest and linfo then return lmanifest, linfo end
 
     -- 两者都没有：把远端错误抛出去（本地无包时保持原报错语义）
 
@@ -8608,18 +9182,21 @@ function XRead:applyServerAddress(ip, port)
     return true
 end
 
--- 服务器缓存章数：设置里的 50 / 100 / 全部 → 后端 count（0 = 全部章节）
+-- 服务器缓存章数：设置里的 50 / 100 / 全部 → 后端 count（0 = 全部章节）。
+-- 「两个选项都不选 / 再点一次取消」保存为 "none"，返回 nil = 不缓存。
 function XRead:cacheDepthCount()
     local v = tostring(self:getSetting("cache_depth", "50") or "50")
+    if v == "none" or v == "" then return nil end
     if v == "all" then return 0 end
     local n = tonumber(v)
     if not n or n < 1 then return 50 end
     return n
 end
 
--- 本地预加载深度：50 / 100 / 全部（all）
+-- 本地预加载深度：50 / 100 / 全部（all）；"none" 返回 0 = 不额外预加载
 function XRead:cacheDepthLimit()
     local v = tostring(self:getSetting("cache_depth", "50") or "50")
+    if v == "none" or v == "" then return 0 end
     if v == "all" then return math.huge end
     local n = tonumber(v)
     if not n or n < 1 then n = 50 end
@@ -8652,7 +9229,9 @@ function XRead:showSettings()
     local draft = self._settings_draft
     if not draft then
         local depth = tostring(self:getSetting("cache_depth", "50") or "50")
-        if depth ~= "all" and depth ~= "100" then depth = "50" end
+        -- "none" = 50/100/全部 都不选（不缓存），必须原样保留；
+        -- 其它未知值才回落到默认 50。
+        if depth ~= "all" and depth ~= "100" and depth ~= "none" then depth = "50" end
         draft = {
             username = tostring(self:getSetting("username", "") or ""),
             password = tostring(self:getSetting("password", "") or ""),
@@ -8934,9 +9513,39 @@ function XRead:showSettings()
         CenterContainer:new{ dimen = Geom:new{ w = value_w, h = row_h }, value_widget },
         stepButton("＋", 1),
     }
-    local stepper_row = ctlRow(_("默认预加载章节数"), stepper)
+    local stepper_row = ctlRow(_("浏览器缓存预加载章节数"), stepper)
 
-    -- 默认服务器缓存章节数：50 章 / 100 章 / 全部（三段选择）
+    -- 服务器缓存预加载章节数：50 章 / 100 章 / 全部。
+    -- 单选：点一次生效（黑底白字），再点一次取消；三个都不选 = 不缓存。
+    -- KOReader 的 Button 只支持黑字，画不出黑底白字，这里自绘一个分段按钮。
+    local SegButton = InputContainer:extend{
+        text = nil, width = nil, height = nil, active = false, callback = nil,
+    }
+    function SegButton:init()
+        local bg = self.active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
+        local fg = self.active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+        local tw = TextWidget:new{
+            text = self.text, face = Font:getFace("cfont", 15),
+            bold = self.active, fgcolor = fg,
+        }
+        self[1] = FrameContainer:new{
+            bordersize = 1, color = Blitbuffer.COLOR_BLACK, radius = 6,
+            background = bg, width = self.width, height = self.height,
+            padding = 0, margin = 0,
+            CenterContainer:new{
+                dimen = Geom:new{ w = math.max(1, self.width - 2),
+                    h = math.max(1, self.height - 2) },
+                tw,
+            },
+        }
+        self.dimen = Geom:new{ w = self.width, h = self.height }
+        self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
+    end
+    function SegButton:onTap()
+        if self.callback then self.callback() end
+        return true
+    end
+
     local DEPTH_OPTIONS = {
         { key = "50", label = _("50 章") },
         { key = "100", label = _("100 章") },
@@ -8949,15 +9558,13 @@ function XRead:showSettings()
     for _i, opt in ipairs(DEPTH_OPTIONS) do
         local key = opt.key
         local active = draft.cache_depth == key
-        seg_group[#seg_group + 1] = Button:new{
-            text = opt.label, text_font_face = "cfont", text_font_size = 15,
-            text_font_bold = active == true,
-            bordersize = active and 3 or 1,
-            radius = 6,
+        seg_group[#seg_group + 1] = SegButton:new{
+            text = opt.label,
             width = seg_w, height = step_btn_h,
+            active = active,
             callback = function()
-                if draft.cache_depth == key then return end
-                draft.cache_depth = key
+                -- 再点一次同一个 = 取消（不缓存）
+                draft.cache_depth = active and "none" or key
                 refreshDialog()
             end,
         }
@@ -8965,7 +9572,7 @@ function XRead:showSettings()
             seg_group[#seg_group + 1] = HorizontalSpan:new{ width = seg_gap }
         end
     end
-    local depth_row = ctlRow(_("默认服务器缓存章节数"), seg_group)
+    local depth_row = ctlRow(_("服务器缓存预加载章节数"), seg_group)
 
     local rows = VerticalGroup:new{ align = "left" }
     rows[#rows + 1] = groupTitle(_("地址管理"))
@@ -8979,6 +9586,12 @@ function XRead:showSettings()
     rows[#rows + 1] = VerticalSpan:new{ width = Screen:scaleBySize(14) }
     rows[#rows + 1] = TextWidget:new{
         text = _("点空白处或按返回键关闭并保存；地址/端口立即生效。"),
+        face = face_hint, fgcolor = Blitbuffer.COLOR_GRAY_6,
+        max_width = inner_w,
+    }
+    rows[#rows + 1] = VerticalSpan:new{ width = Screen:scaleBySize(3) }
+    rows[#rows + 1] = TextWidget:new{
+        text = _("缓存章节数：点一次生效（黑底白字），再点一次取消；都不选 = 不缓存。"),
         face = face_hint, fgcolor = Blitbuffer.COLOR_GRAY_6,
         max_width = inner_w,
     }
@@ -9074,13 +9687,14 @@ function XRead:applyParaIndent()
         if not self:paraIndentEnabled() then
             extra = "p { text-indent: 0 !important; }"
         end
-        -- 保留用户原有的样式表与样式微调，只在末尾追加我们这一条
+        -- 保留用户原有的样式表与样式微调，只在末尾追加我们的覆盖：
+        -- 段落缩进 + 正文局部夜晚深色源色（全局夜晚时由屏幕反色负责）。
         local tweaks = ""
         pcall(function() tweaks = ui.styletweak:getCssText() or "" end)
         local css = ui.typeset and ui.typeset.css
         if not css then css = ui.document.default_css end
         if not css then return end
-        ui.document:setStyleSheet(css, tweaks .. extra)
+        ui.document:setStyleSheet(css, tweaks .. extra .. self:_bookNightCss())
         ui:handleEvent(require("ui/event"):new("UpdatePos"))
     end)
 end
@@ -9659,11 +10273,22 @@ function XRead:downloadBookToDevice(book)
 
     local dir
     pcall(function() dir = BookExport:exportDir() end)
+    -- 已经导出过：确认框改成「覆盖」，并明确告诉用户会替换哪个文件
+    local existing
+    pcall(function() existing = BookExport:exportPath(book) end)
+    local exists = existing and lfs.attributes(existing, "mode") == "file"
     local target = _("本地文档目录") .. "（" .. tostring(dir or "?") .. "）"
-    MessageBox.confirm{
+    local text
+    if exists then
+        text = T(_("本地已经有「%1」的 EPUB：\n%2\n\n重新导出会覆盖旧文件，继续？"),
+            tostring(book.name or ""), tostring(existing))
+    else
         text = T(_("把「%1」导出成 EPUB 到 %2？\n逐章拉取，章节多时需要等一会儿。"),
-            tostring(book.name or ""), target),
-        ok_text = _("下载"),
+            tostring(book.name or ""), target)
+    end
+    MessageBox.confirm{
+        text = text,
+        ok_text = exists and _("覆盖") or _("下载"),
         callback = function(ok)
             if ok then self:_doDownloadBook(book) end
         end,
@@ -9937,6 +10562,27 @@ end
 
 function XRead:doCacheBook(book, count)
 
+    -- 未设置缓存章节数（50/100/全部 全取消）= 不缓存，先提示去首页设置
+    local wanted = tonumber(count)
+    if wanted == nil then wanted = self:cacheDepthCount() end
+    if wanted == nil then
+
+        MessageBox.show{
+
+            title = _("未设置缓存章节数"),
+
+            text = _("请先在我的首页 → 设置 → 缓存管理里\n选择「服务器缓存预加载章节数」，再缓存。"),
+
+            sticky = true,
+
+            buttons = { { text = _("知道了") } },
+
+        }
+
+        return
+
+    end
+
     -- 整本缓存是一条 SSE 长连接，几千章要跑几分钟。原来在 UI 线程同步跑，
     -- 这段时间界面完全无响应、无进度、不可取消，用户只能强杀 KOReader。
     -- 改成：子进程消费 SSE 并写进度文件，主进程轮询显示进度（网络不再占 UI 线程）。
@@ -9944,7 +10590,7 @@ function XRead:doCacheBook(book, count)
 
         local opts = {
 
-            count = tonumber(count) or self:cacheDepthCount(),   -- 0 = 全部章节
+            count = wanted,   -- 0 = 全部章节
 
             concurrentCount = 8,
 
@@ -10136,7 +10782,19 @@ function XRead:doCacheBook(book, count)
 
         if err_text and err_text ~= "" then
 
-            self:showInfo(_("缓存失败：") .. readable_error(err_text))
+            -- 失败原因必须让用户看清楚：原来 showInfo 几秒就自动消失，
+            -- 常常还没读完就没了，只能反复重试。改成置顶卡片，手动关闭。
+            MessageBox.show{
+
+                title = _("缓存失败"),
+
+                text = readable_error(err_text),
+
+                sticky = true,
+
+                buttons = { { text = _("知道了") } },
+
+            }
 
         end
 

@@ -361,9 +361,10 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
             or placeholder(cover_w, cover_h, book.title, book.author)
     end
     local text_w = math.max(1, inner_w - cover_w - gap)
-    -- 右上角刷新按钮（替代原「历史 ›」）：只占一个小图标宽度
-    local history_h = UiScale.dp(24, 22, 32)
-    local history_w = book.on_refresh and UiScale.dp(26, 22, 34) or 0
+    -- 右上角刷新按钮（替代原「历史 ›」）：热区比图标略大一点，
+    -- 电子墨水屏上手指落点偏差大，26dp 常常点不中。
+    local history_h = UiScale.dp(30, 26, 38)
+    local history_w = book.on_refresh and UiScale.dp(32, 28, 42) or 0
 
     local author = U.trim(tostring(book.author or ""))
     local category = U.trim(tostring(book.category or ""))
@@ -506,20 +507,36 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
 
     local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
     layers[#layers + 1] = content
+    local refresh_x = frame_inset + pad + cover_w + gap + math.max(0, text_w - history_w)
+    local refresh_y = frame_inset + pad
     if history_w > 0 then
+        -- 只画图标，不单独注册热区：OverlapGroup 的事件按「先加先收」分发，
+        -- 单独的刷新热区要么被整卡 tap 吞掉、要么把整卡的点击全抢走。
         layers[#layers + 1] = OffsetContainer:new{
-            x_off = frame_inset + pad + cover_w + gap + math.max(0, text_w - history_w),
-            y_off = frame_inset + pad,
-            tappable(history_w, history_h,
-                Ui.icon("↻", history_w, history_h, UiScale.dp(15, 12, 20), {
-                    icon_key = "refresh", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
-                }),
-                function() if book.on_refresh then book.on_refresh() end end),
+            x_off = refresh_x,
+            y_off = refresh_y,
+            Ui.icon("↻", history_w, history_h, UiScale.dp(15, 12, 20), {
+                icon_key = "refresh", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            }),
         }
     end
-    layers[#layers + 1] = tappable(width, height, Widget:new{dimen = Geom:new{w = width, h = height}}, callback, function(anchor)
-        if hold_callback then hold_callback(book, anchor) end
-    end)
+    -- 整卡只有一个输入所有者：落在右上角刷新区就刷新，其余区域进书。
+    local function on_card_tap(anchor, gest)
+        local pos = gest and gest.pos
+        if book.on_refresh and pos and anchor and tonumber(anchor.x) and tonumber(anchor.y) then
+            local rx, ry = anchor.x + refresh_x, anchor.y + refresh_y
+            if pos.x >= rx and pos.x < rx + history_w
+                and pos.y >= ry and pos.y < ry + history_h then
+                book.on_refresh()
+                return
+            end
+        end
+        if callback then callback(anchor, gest) end
+    end
+    layers[#layers + 1] = tappable(width, height, Widget:new{dimen = Geom:new{w = width, h = height}},
+        on_card_tap, function(anchor)
+            if hold_callback then hold_callback(book, anchor) end
+        end)
     return layers
 end
 
@@ -548,9 +565,13 @@ local function hero_card_classic(book, width, height, callback, hold_callback, s
     end
     local text_x = cover_w + gap
     local text_w = math.max(1, inner_w - text_x)
-    local history_w = book.on_refresh and UiScale.dp(26, 22, 34) or 0
-    local title_w = math.max(1, text_w - (history_w > 0 and history_w + UiScale.dp(5, 4, 8) or 0))
+    local history_w = book.on_refresh and UiScale.dp(32, 28, 42) or 0
     local title_h = math.min(math.floor(inner_h * .27), UiScale.dp(49, 43, 68))
+    -- 刷新图标与热区共用同一个高度：on_card_tap 里要用它判断右上角，
+    -- 之前只定义了 history_w，比较 y<history_h 时 history_h 是 nil，
+    -- 一点右上角就 "compare number with nil" 报错，表现就是刷新没反应。
+    local history_h = math.max(UiScale.dp(26, 23, 34), math.floor(title_h * .58))
+    local title_w = math.max(1, text_w - (history_w > 0 and history_w + UiScale.dp(5, 4, 8) or 0))
     title_h = math.max(1, title_h)
     local row_h = math.max(UiScale.dp(19, 17, 28), math.min(UiScale.dp(25, 22, 35), math.floor(inner_h * .12)))
     local function clean(value) return U.trim(tostring(value or '')) end
@@ -625,7 +646,7 @@ local function hero_card_classic(book, width, height, callback, hold_callback, s
     })
     if history_w > 0 then
         put(text_x+text_w-history_w,0,Ui.icon('↻',history_w,
-            math.max(UiScale.dp(22,20,30), math.floor(title_h*.58)), UiScale.dp(15,12,20),
+            history_h, UiScale.dp(15,12,20),
             {icon_key='refresh',fgcolor=Blitbuffer.COLOR_DARK_GRAY}))
     end
     local info_lines={}
@@ -940,12 +961,13 @@ local function shelf_book_card(book, width, height, callback, hold_callback, sho
     end
     if reading_badge ~= "" then
         local chars = math.max(2, U.utf8_len(reading_badge))
-        local badge_w = math.max(UiScale.dp(31, 26, 45), UiScale.dp(9, 8, 14) + chars * UiScale.dp(7, 6, 10))
-        local badge_h = UiScale.dp(20, 17, 27)
+        -- 封面右上角进度徽标：整体比之前收小一档，避免盖住封面主体
+        local badge_w = math.max(UiScale.dp(29, 25, 42), UiScale.dp(8, 7, 13) + chars * UiScale.dp(6.6, 5.6, 9.4))
+        local badge_h = UiScale.dp(18, 16, 25)
         local inset = UiScale.dp(2, 1, 4)
         cover_layer[#cover_layer + 1] = OffsetContainer:new{
             x_off = math.max(0, cover_w - badge_w - inset), y_off = inset,
-            outlined_badge_text(reading_badge, badge_w, badge_h, face("smallinfofont", 9.2, 13)),
+            outlined_badge_text(reading_badge, badge_w, badge_h, face("smallinfofont", 8.6, 12.2)),
         }
     end
 
