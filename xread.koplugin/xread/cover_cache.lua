@@ -36,6 +36,19 @@ function CoverCache:keyFor(book, max_w, max_h)
     return md5(seed)
 end
 
+--- 这本书有没有可取的封面源。
+--- 网络书的封面在 coverUrl，本地书的封面几乎都只写在 customCoverUrl 上
+--- （后端对 local-txt/local-epub 不返回 coverUrl）。以前各处只判 coverUrl，
+--- 本地书的封面就永远进不了下载队列，只能显示占位色块。
+function CoverCache:sourceFor(book)
+    if not book then return nil end
+    for _, k in ipairs({ "customCoverUrl", "coverUrl" }) do
+        local v = book[k]
+        if type(v) == "string" and v ~= "" then return v end
+    end
+    return nil
+end
+
 --- 书籍指纹（DJB2）：让文件名带上「哪本书」这一维，删书时可按前缀批量清理。
 -- 只用 md5(seed) 当文件名时，删书根本找不到这些文件，covers/*.png 永久残留。
 local function bookFingerprint(book)
@@ -82,8 +95,11 @@ end
 
 --- 一次性清理旧命名（纯 md5）的孤儿封面文件
 -- 旧文件名不带书籍指纹，删书时永远清不掉，只会在磁盘上堆着。
+-- schema3：v0.6.14 引入指纹命名时 storeFromData 仍按纯 md5 落盘，
+-- 于是「写 key.png、找 指纹-key.png」，磁盘缓存一次都没命中过（每次开首页
+-- 都重新下载全部封面）。升级后清掉那批只有 md5 的孤儿文件。
 function CoverCache:migrateLegacy()
-    local marker = self.dir .. "/.schema2"
+    local marker = self.dir .. "/.schema3"
     if lfs.attributes(marker, "mode") then return end
     local ok, iter, obj = pcall(lfs.dir, self.dir)
     if ok then
@@ -97,7 +113,7 @@ function CoverCache:migrateLegacy()
     end
     local f = io.open(marker, "w")
     if f then
-        f:write("2\n")
+        f:write("3\n")
         f:close()
     end
 end
@@ -119,7 +135,11 @@ local function fetch(url)
         },
     }, 8)
     if not ok then return nil, "network error" end
-    if tonumber(code) ~= 200 then return nil, "HTTP " .. tostring(code) end
+    if tonumber(code) ~= 200 then
+        -- 把响应体一并带回：后端鉴权失败返回的是 400 + {"errorMsg":"NEED_LOGIN"}，
+        -- 光看状态码没法区分「token 过期」和「本地 EPUB 地址本来就无效」。
+        return nil, "HTTP " .. tostring(code), table.concat(chunks)
+    end
     local data = table.concat(chunks)
     if #data < 100 then return nil, "too small" end
     -- 魔数校验：后端偶发把 HTML 错误页/损坏数据当封面返回，
@@ -158,7 +178,8 @@ function CoverCache:storeFromData(book, data, max_w, max_h)
         local ox = math.floor((cw - max_w) / 2)
         local oy = math.floor((ch - max_h) / 2)
         out:blitFrom(filled, 0, 0, ox, oy, max_w, max_h)
-        local path = self.dir .. "/" .. key .. ".png"
+        -- 必须和 pathFor() 用同一套命名，否则写进去的文件永远查不到。
+        local path = self.dir .. "/" .. self:fileNameFor(book, max_w, max_h)
         out:writePNG(path)
         filled:free(); out:free(); source:free()
         return path
@@ -180,9 +201,14 @@ end
 --- 构造统一封面接口 URL：后端 getCoverUrl 零判断，所有封面都带鉴权参数。
 --- 远程 URL 后端根本不读鉴权参数（无效/过期 token 不影响），本地书则必须有有效 token。
 function CoverCache:coverApiUrl(source)
-    if not self.base_url or self.base_url == "" then return nil, "no base url" end
-    local url = self.base_url .. "/reader3/cover?path=" .. urlencode(source)
     local client = self.client_getter and self.client_getter()
+    -- 地址以 client 为准：用户在设置里改 IP/端口后 client.address 会立刻更新，
+    -- 而 CoverCache 是插件 init 时建的，base_url 是那一刻的快照——
+    -- 只看 base_url 会导致换地址后封面继续往旧地址请求。
+    local base = (client and client.address and client.address ~= "" and client.address)
+        or self.base_url
+    if not base or base == "" then return nil, "no base url" end
+    local url = base .. "/reader3/cover?path=" .. urlencode(source)
     if client then
         if client.accessToken then
             url = url .. "&accessToken=" .. urlencode(client.accessToken)
@@ -197,12 +223,16 @@ function CoverCache:coverApiUrl(source)
     return url
 end
 
---- 统一封面接口取图；本地书 401（token 过期）时重登一次并重试。
+--- 统一封面接口取图；鉴权失败（401 / 400 NEED_LOGIN）时重登一次并重试。
+-- 后端对本地书取封面要求有效 token，未登录时返回 400 NEED_LOGIN 而不是 401，
+-- 只判 401 的话 token 过期后本地书封面会永久取不到，必须重新登录才恢复。
 function CoverCache:fetchViaProxy(url, _retried)
     local api_url, err = self:coverApiUrl(url)
     if not api_url then return nil, err end
-    local data, ferr = fetch(api_url)
-    if not data and ferr == "HTTP 401" and not _retried then
+    local data, ferr, body = fetch(api_url)
+    local needs_login = ferr == "HTTP 401" or ferr == "HTTP 403"
+        or (ferr == "HTTP 400" and tostring(body or ""):find("NEED_LOGIN", 1, true) ~= nil)
+    if not data and needs_login and not _retried then
         local client = self.client_getter and self.client_getter()
         if client and client.username and client.password then
             local ok = pcall(function() client:login(client.username, client.password) end)
@@ -264,11 +294,34 @@ function CoverCache:writeRawFile(book, data, max_w, max_h)
     return path
 end
 
+--- 子进程抓取失败时把原因写在旁边：主线程只看到「没文件」的话，
+--- 就没法区分「AVIF 永远解不了」还是「这次网络抖了一下」。
+function CoverCache:rawErrPath(book, max_w, max_h)
+    return self.dir .. "/.rawerr_" .. self:keyFor(book, max_w, max_h)
+end
+
+function CoverCache:writeRawError(book, err, max_w, max_h)
+    local f = io.open(self:rawErrPath(book, max_w, max_h), "w")
+    if f then f:write(tostring(err or "")); f:close() end
+end
+
+function CoverCache:readRawError(book, max_w, max_h)
+    local p = self:rawErrPath(book, max_w, max_h)
+    local f = io.open(p, "r")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    pcall(os.remove, p)
+    return s
+end
+
 --- 读原始字节文件并解码成缩略图 PNG（必须在主线程跑：RenderImage/Blitbuffer）
 function CoverCache:storeFromRawFile(book, max_w, max_h)
     local path = self:rawTempPath(book, max_w, max_h)
     local f = io.open(path, "rb")
-    if not f then return nil, "no raw file" end
+    if not f then
+        return nil, self:readRawError(book, max_w, max_h) or "no raw file"
+    end
     local data = f:read("*a")
     f:close()
     pcall(os.remove, path)
@@ -276,9 +329,47 @@ function CoverCache:storeFromRawFile(book, max_w, max_h)
     return self:storeFromData(book, data, max_w, max_h)
 end
 
+-- 失败负缓存：后端对部分书源原样透传 AVIF（KOReader 没有 libavif，永远解不了）、
+-- 或书源本身 404。这类书此前每 2 分钟重试一次，一本 170KB 的图反复拉，
+-- 低端机上是纯浪费。按失败原因分两档：确定性失败（格式不支持 / 404）30 分钟
+-- 不再试；临时失败（超时、断网）3 分钟后重试。
+local FAIL_TTL_HARD = 30 * 60
+local FAIL_TTL_SOFT = 3 * 60
+local failed_until = {}
+
+local function isHardFail(err)
+    local s = tostring(err or "")
+    return s:find("unsupported image format", 1, true) ~= nil
+        or s:find("not an image", 1, true) ~= nil
+        or s:find("HTTP 404", 1, true) ~= nil
+        or s:find("HTTP 400", 1, true) ~= nil
+        or s:find("no url", 1, true) ~= nil
+end
+
+function CoverCache:recentlyFailed(book, max_w, max_h)
+    local key = self:keyFor(book, max_w, max_h)
+    local until_t = failed_until[key]
+    if not until_t then return false end
+    if os.time() >= until_t then
+        failed_until[key] = nil
+        return false
+    end
+    return true
+end
+
+function CoverCache:markFailed(book, max_w, max_h, err)
+    local ttl = isHardFail(err) and FAIL_TTL_HARD or FAIL_TTL_SOFT
+    failed_until[self:keyFor(book, max_w, max_h)] = os.time() + ttl
+end
+
+function CoverCache:clearFailed(book, max_w, max_h)
+    failed_until[self:keyFor(book, max_w, max_h)] = nil
+end
+
 function CoverCache:fetchAndStore(book, url, max_w, max_h)
     local existing = self:pathFor(book, max_w, max_h)
     if existing then return existing end
+    if self:recentlyFailed(book, max_w, max_h) then return nil, "recently failed" end
 
     local key = self:keyFor(book, max_w, max_h)
     if inflight[key] then return nil, "inflight" end
@@ -292,7 +383,11 @@ function CoverCache:fetchAndStore(book, url, max_w, max_h)
 
     inflight[key] = nil
 
-    if not ok then return nil, tostring(path) end
+    if not ok then
+        self:markFailed(book, max_w, max_h, tostring(path))
+        return nil, tostring(path)
+    end
+    if not path then self:markFailed(book, max_w, max_h, err) end
     return path, err
 end
 

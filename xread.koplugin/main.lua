@@ -1169,7 +1169,36 @@ function XRead:init()
                 local books = self.client:getBookshelf()
                 if not books or #books == 0 then return end
                 if autotest == "shelf" then
-                    self:showBookshelf()
+                    -- 验收用：把 XREAD_AUTOTEST_BOOK 指定的书排到第一格。
+                    -- 触点固定是 (110,300)，书架一换顺序就撞上书源挂掉的书，
+                    -- 三次重试全耗在「目录超时」上，最后被 240s 上限杀掉（用例假失败）。
+                    local want_shelf = os.getenv("XREAD_AUTOTEST_BOOK")
+                    local pick_shelf
+                    if want_shelf and want_shelf ~= "" then
+                        for bi = 1, #books do
+                            if books[bi].name and tostring(books[bi].name):find(want_shelf, 1, true) then
+                                pick_shelf = bi
+                                break
+                            end
+                        end
+                    end
+                    -- 指定的书可能已被移出书架（用例会因此撞上书源挂掉的书，
+                    -- 三次重试全耗在「目录超时」上，最后被 240s 上限杀掉）。
+                    -- 退化策略：取前几本里第一本目录能取到的。
+                    if not pick_shelf then
+                        for bi = 1, math.min(#books, 4) do
+                            local ok_ch, ch = pcall(function() return self.client:getChapterList(books[bi]) end)
+                            if ok_ch and type(ch) == "table" and #ch > 0 then
+                                pick_shelf = bi
+                                break
+                            end
+                        end
+                    end
+                    if pick_shelf and pick_shelf ~= 1 then
+                        books[1], books[pick_shelf] = books[pick_shelf], books[1]
+                    end
+                    print("[XREAD_AUTOTEST] shelf_pick first=" .. tostring(books[1].name))
+                    self:showBookshelf(1, books)
                     print("[XREAD_AUTOTEST] mode=shelf done")
                 else
                     -- 可用 XREAD_AUTOTEST_BOOK 指定书名子串，避免测试撞上坏书/漫画
@@ -1697,8 +1726,8 @@ function XRead:refreshRecentBook()
         local cover_paths = self:prepareCovers({ hero_book }, 1, 1, layout, true)
         -- 本地还没缓存封面时，刷新后异步补一张；否则「刷新」只会把空白封面
         -- 再画一遍，看起来像按钮没生效。
-        if cover_paths[hero_book] == nil
-            and hero_book.coverUrl and hero_book.coverUrl ~= "" then
+        local hero_src = self.cover_cache:sourceFor(hero_book)
+        if cover_paths[hero_book] == nil and hero_src then
             self:_fetchCoverAsync(hero_book, layout.cover_w, layout.cover_h, function(p)
                 if not p or not MiuiHome.is_shown() or self._opening_book then return end
                 local hero2 = self:_makeHeroInfo(hero_book, { [hero_book] = p })
@@ -2106,7 +2135,7 @@ function XRead:showHome(page)
     -- hero 封面异步补救：不在当前书架页 / 首次打开时缓存还没好，
     -- 单独拉一张并在完成后只刷新「最近阅读」这一张卡（不动整页）。
     if hero and hero_book and not hero.cover_path
-        and hero_book.coverUrl and hero_book.coverUrl ~= "" then
+        and self.cover_cache:sourceFor(hero_book) then
         self:_fetchCoverAsync(hero_book, layout.cover_w, layout.cover_h, function(p)
             if not p or view._miu_closed or self._home_view ~= view then return end
             hero.cover_path, hero.home_cover_path = p, p
@@ -2247,11 +2276,12 @@ function XRead:prepareCovers(books, first, last, layout, skip_download)
     for i = first, last do
         local book = books[i]
         local path = self.cover_cache:pathFor(book, layout.cover_w, layout.cover_h)
-        if not path and not skip_download and book.coverUrl and book.coverUrl ~= "" then
+        local src = self.cover_cache:sourceFor(book)
+        if not path and not skip_download and src then
             done = done + 1
             logger.dbg("xread cover fetch", tostring(done), "/", tostring(total))
             local ok, p = pcall(function()
-                return self.cover_cache:fetchAndStore(book, book.coverUrl,
+                return self.cover_cache:fetchAndStore(book, src,
                     layout.cover_w, layout.cover_h)
             end)
             if ok and p then path = p end
@@ -2276,6 +2306,15 @@ function XRead:_fetchCoverAsync(book, max_w, max_h, callback)
         if callback then callback(existing) end
         return
     end
+    if not cc:sourceFor(book) then
+        if callback then callback(nil) end
+        return
+    end
+    -- 近期已确认取不到（AVIF / 书源 404）：别再 fork 一个子进程白跑
+    if cc:recentlyFailed(book, max_w, max_h) then
+        if callback then callback(nil) end
+        return
+    end
     -- 主线程维护的 inflight 去重：封面队列与重试循环可能同时瞄同一张图
     self._cover_inflight = self._cover_inflight or {}
     local key = cc:keyFor(book, max_w, max_h)
@@ -2286,8 +2325,12 @@ function XRead:_fetchCoverAsync(book, max_w, max_h, callback)
     self._cover_inflight[key] = true
     local raw = cc:rawTempPath(book, max_w, max_h)
     local ok_fork, pid = pcall(ffiutil.runInSubProcess, function()
-        local data = cc:fetchRaw(book, book.coverUrl)
-        if data then cc:writeRawFile(book, data, max_w, max_h) end
+        local data, ferr = cc:fetchRaw(book, book.coverUrl)
+        if data then
+            cc:writeRawFile(book, data, max_w, max_h)
+        else
+            cc:writeRawError(book, ferr, max_w, max_h)   -- 让主线程知道失败原因
+        end
     end, false)
     if not (ok_fork and type(pid) == "number") then
         self._cover_inflight[key] = nil
@@ -2301,9 +2344,10 @@ function XRead:_fetchCoverAsync(book, max_w, max_h, callback)
             return
         end
         self._cover_inflight[key] = nil
-        local ok2, p = pcall(function()
+        local ok2, p, perr = pcall(function()
             return cc:storeFromRawFile(book, max_w, max_h)
         end)
+        if not (ok2 and p) then cc:markFailed(book, max_w, max_h, perr) end
         if callback then callback(ok2 and p or nil) end
     end
     UIManager:scheduleIn(0.1, poll)
@@ -2323,7 +2367,7 @@ function XRead:_queueMissingCovers(books, first, last, layout, miui_books, view,
     for i = first, last do
         local book = books[i]
         if book and not self.cover_cache:pathFor(book, layout.cover_w, layout.cover_h)
-            and book.coverUrl and book.coverUrl ~= "" then
+            and self.cover_cache:sourceFor(book) then
             queue[#queue + 1] = { i = i, book = book }
         end
     end
@@ -2418,7 +2462,8 @@ function XRead:_startCoverRetryLoop(view, on_cover)
         local layout = GridShelf.computeLayout(#books)
         local queue = {}
         for _, b in ipairs(books) do
-            if not self.cover_cache:pathFor(b, layout.cover_w, layout.cover_h) then
+            if not self.cover_cache:pathFor(b, layout.cover_w, layout.cover_h)
+                and self.cover_cache:sourceFor(b) then
                 queue[#queue + 1] = b
             end
         end
@@ -2664,7 +2709,7 @@ function XRead:showBookCatalog(book, cover_path, page)
         cover_path = self.cover_cache:pathFor(book, layout.cover_w, layout.cover_h)
         -- 不在打开目录前同步下载封面：没有本地缓存的书要先卡 8~16s 才出目录。
         -- 先渲染占位块，目录出来后再在空闲时补一张（下次打开就直接命中）。
-        if not cover_path and book.coverUrl and book.coverUrl ~= "" then
+        if not cover_path and self.cover_cache:sourceFor(book) then
             UIManager:scheduleIn(1.5, function()
                 if self._opening_book or SHARED.open_path then return end
                 if self:_uiHasOverlay() then return end
@@ -4933,12 +4978,33 @@ function XRead:quietUpdateCheck(delay)
                 return require("xread/updater"):new{ client = self.client }
             end)
             if not ok then Trapper:clear() return end
+            -- 列目录要有效 token：未登录时后端直接 400 NEED_LOGIN，这一轮就白跑，
+            -- 而 _update_checked 已置位 → 整个会话都不再提示更新。
+            -- 首页走本地缓存渲染时恰好还没登录，所以这里静默补一次登录（不弹窗）。
+            if not self.client.accessToken then
+                local u = tostring(self:getSetting("username", "") or "")
+                local p = tostring(self:getSetting("password", "") or "")
+                local addr = tostring(self:getSetting("address", "") or "")
+                if u ~= "" and p ~= "" then
+                    pcall(function()
+                        self.client.address = addr
+                        self.client:login(u, p)
+                        self._token_addr = addr
+                        self._token_user = u
+                    end)
+                end
+            end
             local ok_check, manifest, info = pcall(function() return self:checkUpdateBest(updater) end)
             Trapper:clear()
             if not ok_check or not manifest or not info then
                 -- 静默失败，但留下可查的痕迹（离线/没登录是常态，不打扰用户）
                 logger.warn("xread quiet update check failed:", tostring(ok_check and "no manifest" or manifest))
                 return
+            end
+            if os.getenv("XREAD_AUTOTEST") then
+                print("[XREAD_AUTOTEST] update_checked newer=" .. tostring(info.newer)
+                    .. " local=" .. tostring(info.local_version)
+                    .. " remote=" .. tostring(info.remote_version))
             end
             if info.newer and self._update_notified ~= info.remote_version then
                 self._update_notified = info.remote_version
@@ -5980,6 +6046,7 @@ function XRead:applyServerAddress(ip, port)
     if changed then
         self.client.address = addr
         self.client.accessToken = nil   -- 换地址后需重登
+        if self.cover_cache then self.cover_cache.base_url = addr end
     end
     -- 地址改动后：立刻解除「连不上」冷却，并异步测一次新地址
     -- （以前要等到下一次点开页面才发现地址还是错的，且没有任何回执）
