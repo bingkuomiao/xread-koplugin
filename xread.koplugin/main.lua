@@ -593,6 +593,27 @@ function XRead:showConnectingToast(addr)
     end
 end
 
+--- 首页秒开后的「软失败」提示：与 notifyBackendDown 的模态卡片不同，
+-- 这里用原生 Notification（小横幅、不抢焦点、事件继续传播），且本次启动只提示一次。
+-- 只对「本地有缓存、之前连通过」的首页生效：无缓存时 withBackend 已经弹过模态引导。
+function XRead:notifyBackendSoftDownOnce()
+    if self._home_soft_down_notified then return end
+    -- 不依赖 openHome 是否走过（从书里返回首页走 showHome），直接看本地缓存：
+    -- 有缓存 = 之前连通过，这次连不上才需要软提示；无缓存时 withBackend 会弹窗。
+    local cached = self.meta_cache:getShelf(nil)
+    if not cached or #cached == 0 then return end
+    self._home_soft_down_notified = true
+    local ok, Notification = pcall(require, "ui/widget/notification")
+    if not (ok and Notification and Notification.notify) then return end
+    -- Notification 是单行横幅、不折行：文案必须短，长地址会溢出被截断。
+    -- 顶部状态本身可点进地址管理，所以这里只给「去哪改」的极简引导。
+    local msg = _("后端连不上，当前显示缓存书架 · 点顶部改地址")
+    -- 必须显式给 SOURCE_ALWAYS_SHOW：notify() 不传 source 时会被默认显示掩码
+    -- 过滤掉（SOURCE_OTHER 不在 mask 里），提示就被静默吞了。
+    pcall(function() Notification:notify(msg, Notification.SOURCE_ALWAYS_SHOW) end)
+    if os.getenv("XREAD_AUTOTEST") then print("[XREAD_AUTOTEST] soft_backend_down") end
+end
+
 --- 网络入口统一守卫：先探活，再执行 fn。
 -- @param fn     function() 探活通过后在主线程执行
 -- @param opts   { force=忽略冷却, timeout=探活秒数, silent=不显示正在连接 }
@@ -1166,6 +1187,35 @@ function XRead:init()
                 if self._local_back then self._local_back() end
 
                 autotest_mark("flow=local_back done")
+
+            end)
+
+        elseif flow == "soft_down" then
+
+            -- 验收：有缓存首页 + 后端不可达 → 首页照常渲染，软提示只发一次。
+            -- 只在本次进程里覆盖 backendAddress（不写盘、不污染后续用例），
+            -- 指向本机 1 端口必然 TCP 失败；延长通知时长仅为便于截图。
+            UIManager:scheduleIn(4, function()
+
+                self.backendAddress = function() return "http://127.0.0.1:1" end
+
+                self._backend_down = nil
+                self._home_soft_down_notified = nil
+                self._health_ok = nil
+
+                local okN, Notification = pcall(require, "ui/widget/notification")
+                if okN and Notification then Notification.timeout = 120 end
+
+                self:closeBookToHome()
+
+                UIManager:scheduleIn(8, function()
+
+                    -- 再调一次：一次性标记应挡住，日志里 soft_backend_down 只应出现一次
+                    self:notifyBackendSoftDownOnce()
+
+                    autotest_mark("flow=soft_down done")
+
+                end)
 
             end)
 
@@ -2970,17 +3020,21 @@ function XRead:_startHomeTicker(view)
                 -- 非阻塞 TCP 探活：原来 client:health 是同步 HTTP（2.5s），
                 -- 后端一慢就把首页冻住、还误判「已断开」并污染冷却状态。
                 -- 这里只改头部「已连接/已断开」的语义 = 网络可达，探活结果异步回调。
-                BackendProbe.check(self:backendAddress(), 2.5, function(ok)
+                    BackendProbe.check(self:backendAddress(), 2.5, function(ok)
 
-                    self._health_ok = ok
+                        self._health_ok = ok
 
-                    pcall(function()
+                        pcall(function()
 
-                        view:updateHeader{ sync_text = ok and _("已连接") or _("已断开") }
+                            view:updateHeader{ sync_text = ok and _("已连接") or _("已断开") }
+
+                        end)
+
+                        -- 之前连通过、这次却连不上：给一次不遮挡的软提示。
+                        -- 首页本身已经渲染完，用户仍可点书、翻页、去地址管理。
+                        if not ok then self:notifyBackendSoftDownOnce() end
 
                     end)
-
-                end)
 
             end
 
