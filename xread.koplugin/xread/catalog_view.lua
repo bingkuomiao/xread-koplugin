@@ -71,6 +71,8 @@ local CatalogView = FocusManager:extend{
     order = "asc",           -- "asc" 正序 / "desc" 倒序
     on_order_toggle = nil,    -- function(next_order) 点倒序/正序按钮时切顺序
 
+    selected_index = nil,     -- 刚点选、正在跳转的章节（1 基，chapters 真实下标）
+
     on_page_changed = nil,
 
     cache_fn = nil,          -- function(chapter_index) → "active" | nil（正在后台缓存）
@@ -144,58 +146,55 @@ local function wrapTitle(text, face, width)
     return lines[1] or "", lines[2] or ""
 
 end
--- 章节格子：双列方块，格子之间留缝隙（列表区底色透出来当缝）。
--- 日间：白块 + 浅灰缝 + 黑字；当前章黑底白字；已缓存块浅灰底。
--- 夜间整屏反色，这里写的是「反色前」的源色，屏幕上得到深底浅字。
+-- 章节行：一列排布，行之间留一条细缝（列表区底色透出来当缝）。
+-- 白天的三档状态：
+--   · 当前章 / 选中章：黑底白字（当前章加粗）
+--   · 已预加载：深灰底(GRAY_6)白字；预加载完成后加粗
+--   · 其它：白底黑字
+-- 夜间是整屏反色，这里只写白天的源色即可：黑底→白底、深灰底→浅灰底、
+-- 白底→黑底，正好得到「白底黑字加粗 / 浅灰底黑字 / 黑底白字」的效果。
 local ChapterRow = InputContainer:extend{
     text = nil, width = nil, height = nil, gap = 0,
-    is_current = false, cache_state = nil, callback = nil,
+    is_current = false, is_selected = false, cache_state = nil, callback = nil,
 }
 
 function ChapterRow:colors()
-    local night = Screen.night_mode == true
-    local is_caching = self.cache_state == "active"
-    if self.is_current or is_caching then
-        -- 日间黑底白字 / 夜间源色白底黑字（反色后仍是黑底白字）
-        return (night and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK),
-            (night and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE),
-            (night and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK)
+    if self.is_current or self.is_selected then
+        return Blitbuffer.COLOR_BLACK, Blitbuffer.COLOR_WHITE, Blitbuffer.COLOR_BLACK
     end
-    if self.cache_state == "cached" then
-        return (night and Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_GRAY_D),
-            Blitbuffer.COLOR_BLACK,
-            (night and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY_9)
+    if self.cache_state == "active" or self.cache_state == "cached" then
+        -- 深灰底白字：比普通行重，比当前章轻
+        return Blitbuffer.COLOR_GRAY_6, Blitbuffer.COLOR_WHITE, Blitbuffer.COLOR_GRAY_6
     end
-    return (night and Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_WHITE),
-        Blitbuffer.COLOR_BLACK,
-        (night and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY_B)
+    return Blitbuffer.COLOR_WHITE, Blitbuffer.COLOR_BLACK, Blitbuffer.COLOR_GRAY_D
 end
 
 function ChapterRow:init()
-    local pad = scaled(7)
-    local is_caching = self.cache_state == "active"
+    local pad = scaled(12)
     local bg, fg, border = self:colors()
-    local box_w = math.max(scaled(20), self.width - self.gap)
+    -- 当前章始终加粗；预加载完成的章节靠加粗和「还在预加载」区分
+    local bold = self.is_current or self.cache_state == "cached"
+    local box_w = math.max(scaled(20), self.width)
     local box_h = math.max(scaled(20), self.height - self.gap)
 
     local tw = TextWidget:new{
         text = self.text,
-        face = Font:getFace("cfont", scaled(12.5)),
-        bold = is_caching or self.is_current,
+        face = Font:getFace("cfont", scaled(14)),
+        bold = bold,
         fgcolor = fg,
         max_width = math.max(1, box_w - 2 * pad),
     }
+    local tw_h = tw:getSize().h
 
     self.frame = FrameContainer:new{
         bordersize = 1, color = border, radius = scaled(6),
         margin = 0, padding = 0,
         padding_left = pad, padding_right = pad,
+        padding_top = math.max(0, math.floor((box_h - tw_h) / 2)),
+        padding_bottom = 0,
         background = bg,
         width = box_w, height = box_h,
-        CenterContainer:new{
-            dimen = Geom:new{ w = box_w - 2 * pad, h = box_h },
-            tw,
-        },
+        tw,
     }
     self[1] = self.frame
     self.dimen = Geom:new{ w = self.width, h = self.height }
@@ -210,15 +209,15 @@ function ChapterRow:onTap()
 end
 
 function ChapterRow:onFocus()
-    if not self.is_current then
-        self.frame.background = Screen.night_mode and Blitbuffer.COLOR_GRAY_9 or Blitbuffer.COLOR_GRAY_E
+    if not (self.is_current or self.is_selected) then
+        self.frame.background = Blitbuffer.COLOR_GRAY_E
         UIManager:setDirty(self, "ui")
     end
     return true
 end
 
 function ChapterRow:onUnfocus()
-    self.frame.background = self:colors()
+    self.frame.background = (self:colors())
     UIManager:setDirty(self, "ui")
     return true
 end
@@ -234,13 +233,13 @@ function CatalogView.computeLayout()
     local right_w = sw - left_w - divider
     local right_header_h = scaled(34)
 
-    -- 双列方块网格：格子之间留 gap，视觉上是一张张卡片而不是连成一片的长条。
-    local cols = 2
-    local rows = 8
-    local gap = scaled(7)
+    -- 单列列表：一屏 14 章（与两列方块版之前的行高一致），行间只留一条细缝。
+    local cols = 1
+    local rows = 14
+    local gap = scaled(5)
     local list_h = body_h - 2 * pad - right_header_h - 1
-    local row_h = math.max(scaled(36), math.floor(list_h / rows))
-    local cell_w = math.floor((right_w - 2 * pad - gap * cols) / cols)
+    local row_h = math.max(scaled(30), math.floor(list_h / rows))
+    local cell_w = right_w - 2 * pad
 
     return {
         screen_w = sw, screen_h = sh,
@@ -249,7 +248,7 @@ function CatalogView.computeLayout()
         left_w = left_w, right_w = right_w,
         right_header_h = right_header_h,
         row_h = row_h, rows = rows, cols = cols, gap = gap, cell_w = cell_w,
-        page_size = rows * cols,
+        page_size = rows,
     }
 end
 
@@ -649,35 +648,29 @@ function CatalogView:init()
     end
 
     local grid = VerticalGroup:new{ align = "left" }
+    local selected = self.selected_index
     local pos = first
     while pos <= last do
-        local line = HorizontalGroup:new{ align = "top" }
-        for col = 1, L.cols do
-            if pos <= last then
-                local bi = bookIndex(pos)
-                local ch = chapters[bi] or {}
-                local label = ch.title or (_("第") .. bi .. _("章"))
-                local cache_state = self.cache_fn and self.cache_fn(bi) or nil
-                if cache_state == "active" then
-                    label = label .. " · " .. _("缓存中")
-                end
-                local row = ChapterRow:new{
-                    text = label,
-                    width = L.cell_w + L.gap,
-                    height = L.row_h,
-                    gap = L.gap,
-                    is_current = (bi - 1 == dur),
-                    cache_state = cache_state,
-                    callback = function() if self.on_select then self.on_select(bi) end end,
-                }
-                line[#line + 1] = row
-                table.insert(chapter_rows, row)
-                pos = pos + 1
-            else
-                line[#line + 1] = HorizontalSpan:new{ width = L.cell_w + L.gap }
-            end
+        local bi = bookIndex(pos)
+        local ch = chapters[bi] or {}
+        local label = ch.title or (_("第") .. bi .. _("章"))
+        local cache_state = self.cache_fn and self.cache_fn(bi) or nil
+        if cache_state == "active" then
+            label = label .. " · " .. _("缓存中")
         end
-        grid[#grid + 1] = line
+        local row = ChapterRow:new{
+            text = label,
+            width = L.cell_w,
+            height = L.row_h,
+            gap = L.gap,
+            is_current = (bi - 1 == dur),
+            is_selected = (selected ~= nil and bi == selected),
+            cache_state = cache_state,
+            callback = function() if self.on_select then self.on_select(bi) end end,
+        }
+        grid[#grid + 1] = row
+        chapter_rows[#chapter_rows + 1] = row
+        pos = pos + 1
     end
 
     -- 章节区底色比格子深一档：格子之间露出来的那条就是缝。

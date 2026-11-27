@@ -153,6 +153,19 @@ local SHARED = {
 
 local BG = { job = nil }
 
+-- 简繁转换模式：拼正文（textToHtmlParas / chapterBlock）时按它转字。
+-- 放在模块级是因为拼正文的函数是文件内 local，拿不到 self。
+local ZhConvert = require("xread/zh_convert")
+local ZH_MODE = "none"
+
+local function zhText(s)
+    if ZH_MODE == "s" or ZH_MODE == "t" then
+        local ok, out = pcall(ZhConvert.convert, tostring(s or ""), ZH_MODE)
+        if ok and out then return out end
+    end
+    return s
+end
+
 -- 前向声明：开书流程先于「后台静默缓存」段使用它
 local startBg
 -- ---------- 小工具 ----------
@@ -192,7 +205,7 @@ local function textToHtmlParas(text)
 
         line = line:gsub("^%s+", ""):gsub("%s+$", "")
 
-        if line ~= "" then out[#out + 1] = "<p>" .. htmlEscape(line) .. "</p>" end
+        if line ~= "" then out[#out + 1] = "<p>" .. htmlEscape(zhText(line)) .. "</p>" end
 
     end
 
@@ -204,7 +217,7 @@ end
 -- 也不写 </body>，方便后台缓存追加
 local function chapterBlock(title, text)
 
-    return '<h2>' .. htmlEscape(tostring(title or "")) .. '</h2>\n'
+    return '<h2>' .. htmlEscape(zhText(tostring(title or ""))) .. '</h2>\n'
 
         .. textToHtmlParas(text) .. '\n'
 
@@ -842,6 +855,9 @@ function XRead:init()
 
     self.settings = LuaSettings:open(SETTINGS_FILE)
 
+    -- 正文简繁转换模式（none / s 转简体 / t 转繁体）：拼正文时按这个模式转字
+    ZH_MODE = tostring(self:getSetting("zh_convert", "none") or "none")
+
     util.makePath(BOOK_DIR)
 
     -- 第三个参数是延迟 client getter：封面鉴权参数在本地书取图时才需要，
@@ -1051,6 +1067,36 @@ function XRead:init()
 
             end)
 
+        elseif flow == "book_settings" then
+
+            UIManager:scheduleIn(4, function()
+
+                self:showBookSettingsPanel()
+
+                autotest_mark("flow=book_settings done")
+
+            end)
+
+        elseif flow == "boot_manage" then
+
+            UIManager:scheduleIn(4, function()
+
+                self:showBootManage()
+
+                autotest_mark("flow=boot_manage done")
+
+            end)
+
+        elseif flow == "local_books" then
+
+            UIManager:scheduleIn(4, function()
+
+                self:showLocalBooks()
+
+                autotest_mark("flow=local_books done")
+
+            end)
+
         elseif flow == "home_btn" then
 
             -- 验收：正文工具栏「首页」按钮（closeBookToHome），而不是原生文件管理器
@@ -1198,6 +1244,9 @@ function XRead:init()
     end
 
     SHARED.fm = self
+
+    -- 「更多 → 启动管理」：开机后按设置自动进入 我的首页 / 我的书架 / 原生界面
+    pcall(function() self:applyBootTarget() end)
 
     -- 仅开发验收用：XREAD_AUTOTEST=shelf|open 自动打开书架/第一本书
 
@@ -4989,7 +5038,7 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
                 label = _("字号"), value = fontLabel(),
 
-                callback = function() self:showSettings() end,
+                callback = function() self:showBookSettingsPanel() end,
 
                 on_decrease = function() self:changeFontSize(-1); return fontLabel() end,
 
@@ -5001,7 +5050,7 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
                 label = _("行距"), value = spacingLabel(),
 
-                callback = function() self:showSettings() end,
+                callback = function() self:showBookSettingsPanel() end,
 
                 on_decrease = function() self:changeLineSpacing(-10); return spacingLabel() end,
 
@@ -5334,28 +5383,59 @@ function XRead:openLocalBook(path)
     UIManager:nextTick(doOpen)
 end
 
--- 「本地阅读」面板：本机导出的书 + 阅读统计入口。
--- 以前这个格子只能看阅读时长统计，导出的书得自己去文件管理器翻。
+-- 「本地阅读」：本机导出的书（正文「下载」导出的 EPUB）用书架同款网格页展示，
+-- 标题就叫「本地阅读」。以前是一个竖排列表弹窗，跟书架风格不统一。
 function XRead:showLocalBooks()
-    local dir, files = self:listExportedBooks()
-    local items = {
-        { label = _("阅读统计"), callback = function() self:showReadingStats() end },
-    }
-    for _i, f in ipairs(files) do
-        local title = tostring(f.name):gsub("%.epub$", "")
+    local _dir, files = self:listExportedBooks()
+
+    if self._local_view then
+        pcall(function() UIManager:close(self._local_view) end)
+        self._local_view = nil
+    end
+
+    if #files == 0 then
+        self:showInfo(_("暂无本机导出的书（在正文里按「下载」导出）"), 6)
+        return
+    end
+
+    local miui_books = {}
+    for i, f in ipairs(files) do
         local kb = math.max(1, math.floor((tonumber(f.size) or 0) / 1024 + 0.5))
-        local path = f.path
-        items[#items + 1] = {
-            label = title .. "　" .. T(_("%1 KB"), tostring(kb)),
-            callback = function() self:openLocalBook(path) end,
+        miui_books[i] = {
+            title = tostring(f.name):gsub("%.epub$", ""),
+            author = T(_("%1 KB"), tostring(kb)),
+            file = f.path,                 -- 有 file 就画「已下载」角标
+            bookId = tostring(f.path),
+            _xread_local = f.path,
         }
     end
-    if #files == 0 then
-        items[#items + 1] = { label = _("暂无本机导出的书（在正文里按「下载」导出）") }
+
+    local view
+    local function closeView()
+        self._local_view = nil
+        if view then pcall(function() UIManager:close(view) end) end
+        UIManager:setDirty("all", "full")
     end
-    self:showMoreListPanel(_("本地阅读"), items, {
-        hint = dir ~= "" and T(_("导出的书存放在：%1"), dir) or nil,
-    })
+
+    view = MiuiShelf.show{
+        books = miui_books,
+        title = _("本地阅读"),
+        page = 1,
+        show_actions = true,
+        left_action_label = _("统计"),
+        on_left_action = function() self:showReadingStats() end,
+        right_action_label = _("返回"),
+        on_right_action = function() closeView() end,
+        on_select = function(mbook)
+            local path = mbook and mbook._xread_local
+            closeView()
+            self:openLocalBook(path)
+        end,
+        on_back = function() closeView() end,
+        on_close = function() self._local_view = nil end,
+    }
+
+    self._local_view = view
 end
 
 function XRead:showReadingStats()
@@ -5703,6 +5783,12 @@ function XRead:onReaderReady()
     -- 底部状态栏：左对齐章节名 / 右对齐页码，去掉进度条
     self:_applyReaderFooter()
 
+    -- 正文排版的用户偏好（段落缩进 / 字体粗细）在每次文档就绪后重新套一遍：
+    -- crengine 换文档会丢掉 setStyleSheet 追加的覆盖规则
+    pcall(function() self:applyParaIndent() end)
+
+    pcall(function() self:applyFontBold() end)
+
     -- 后台扫描正文 "== 章节标题 ==" 注入 TOC，章节名随翻页自动更新
     self:_injectTocFromText()
 
@@ -5870,6 +5956,17 @@ function XRead:_restoreReaderFooter()
 
         if footer.updateFooterTextGenerator then footer:updateFooterTextGenerator() end
 
+        -- 还原原来的显示模式（xread 里可能被切成 off / page_progress）
+        local orig_mode = self._footer_orig_mode
+
+        self._footer_orig_mode = nil
+
+        if footer.applyFooterMode and orig_mode ~= nil then
+
+            footer:applyFooterMode(orig_mode)
+
+        end
+
         if footer.updateFooterContainer then footer:updateFooterContainer() end
 
         if footer.resetLayout then footer:resetLayout(true) end
@@ -5906,6 +6003,10 @@ function XRead:_applyReaderFooter()
         if not self._footer_orig_settings then
 
             self._footer_orig_settings = shallowCopyTable(footer.settings)
+
+            -- 记下原始显示模式：关掉「页尾页码」时会把 mode 切成 off，
+            -- 离开本书时必须还原，否则再打开原生 EPUB 底栏就再也出不来
+            self._footer_orig_mode = footer.mode
 
         end
 
@@ -5955,8 +6056,22 @@ function XRead:_applyReaderFooter()
         footer:updateFooterContainer()
 
         -- 强制把底栏置为可见（切到 page_progress 模式），并触发可见性变化通知，
-        -- 让 ReaderView 重新为底栏分配显示空间
-        if footer.applyFooterMode and footer.mode_list.page_progress then
+        -- 让 ReaderView 重新为底栏分配显示空间；
+        -- 「正文设置 → 页面管理 → 页尾页码」关掉时改切 off 模式（footer_visible=false，
+        -- 正文会把这一行的高度收回去）。
+        if self:getSetting("reader_footer", "1") == "0" then
+
+            if footer.mode_list and footer.mode_list.off ~= nil then
+
+                footer:applyFooterMode(footer.mode_list.off)
+
+            elseif footer.applyFooterMode then
+
+                footer:applyFooterMode(0)
+
+            end
+
+        elseif footer.applyFooterMode and footer.mode_list.page_progress then
 
             footer:applyFooterMode(footer.mode_list.page_progress)
 
@@ -6747,8 +6862,107 @@ function XRead:showMorePanel()
         { label = _("我的书架"), callback = function() self:openShelf() end },
         { label = _("地址管理"), callback = function() self:showServerManage() end },
         { label = _("账号管理"), callback = function() self:showAccountManage() end },
+        { label = _("启动管理"), callback = function() self:showBootManage() end },
         { label = _("关于本机"), callback = function() self:showAboutPanel() end },
     }, { hint = _("点击条目进入；点空白处返回。") })
+
+end
+
+-- ---------- 启动管理：系统启动后自动进入哪个界面 ----------
+
+-- 三选一：我的首页（默认）/ 我的书架 / 进入 KOReader（保持原生文件管理器）
+local BOOT_TARGETS = {
+    { key = "home",     label = _("我的首页"), desc = _("默认") },
+    { key = "shelf",    label = _("我的书架"), desc = _("直接进书架网格") },
+    { key = "koreader", label = _("进入 KOReader"), desc = _("保持原生界面") },
+}
+
+function XRead:bootTarget()
+
+    local v = tostring(self:getSetting("boot_target", "home") or "home")
+
+    for _i, t in ipairs(BOOT_TARGETS) do
+
+        if t.key == v then return v end
+
+    end
+
+    return "home"
+
+end
+
+function XRead:showBootManage()
+
+    local cur = self:bootTarget()
+
+    local items = {}
+
+    for _i, t in ipairs(BOOT_TARGETS) do
+
+        local key = t.key
+
+        items[#items + 1] = {
+
+            label = (key == cur and "● " or "○ ") .. t.label .. "　" .. t.desc,
+
+            callback = function()
+
+                self:saveSetting("boot_target", key)
+
+                self:showBootManage()   -- 重建回显当前选择
+
+            end,
+
+        }
+
+    end
+
+    self:showMoreListPanel(_("启动管理"), items, {
+
+        hint = _("系统启动后自动进入的界面，改完立即生效（下次开机）。"),
+    })
+
+end
+
+-- 开机时自动进入：等 FileManager 首帧画完再切，避免被它的首帧盖住。
+-- 验收脚本（XREAD_AUTOTEST）自己控制进入方式，这里不抢。
+function XRead:applyBootTarget()
+
+    if os.getenv("XREAD_AUTOTEST") then return end
+
+    if self._boot_applied then return end
+
+    self._boot_applied = true
+
+    local target = self:bootTarget()
+
+    if target == "koreader" then return end
+
+    local function go()
+
+        -- 已经进正文 / 用户已经点开了别的东西：不抢
+        if SHARED.open_path or self._opening_book then return end
+
+        if self._home_view or self._shelf_view then return end
+
+        -- 此时栈顶应该是 FileManager 自己（self.ui）；别的 widget 在上面说明
+        -- 用户已经打开了菜单/对话框，这次就不自动跳了
+        local top = UIManager:getTopmostVisibleWidget()
+        if top and top ~= self.ui then return end
+
+        if target == "shelf" then
+
+            self:openShelf()
+
+        else
+
+            self:openHome()
+
+        end
+
+    end
+
+    UIManager:scheduleIn(1.5, go)
 
 end
 
@@ -8566,11 +8780,110 @@ function XRead:showSettings()
 
 end
 
--- ---------- 齿轮「设置」：预加载 + 字体（即改即存，无保存按钮） ----------
+-- ---------- 正文排版偏好：段落缩进 / 字体粗细 / 简繁转换 ----------
+
+function XRead:paraIndentEnabled()
+    return tostring(self:getSetting("para_indent", "1") or "1") ~= "0"
+end
+
+-- 段落缩进：正文 HTML 头部自带 p{text-indent:2em}，关掉时用用户样式表里的一条
+-- !important 覆盖掉；改完立刻重排当前页，不用重建正文文件。
+function XRead:applyParaIndent()
+    local ui = self.ui
+    if not (ui and ui.document) then return end
+    pcall(function()
+        local extra = ""
+        if not self:paraIndentEnabled() then
+            extra = "p { text-indent: 0 !important; }"
+        end
+        -- 保留用户原有的样式表与样式微调，只在末尾追加我们这一条
+        local tweaks = ""
+        pcall(function() tweaks = ui.styletweak:getCssText() or "" end)
+        local css = ui.typeset and ui.typeset.css
+        if not css then css = ui.document.default_css end
+        if not css then return end
+        ui.document:setStyleSheet(css, tweaks .. extra)
+        ui:handleEvent(require("ui/event"):new("UpdatePos"))
+    end)
+end
+
+function XRead:fontBoldEnabled()
+    return tostring(self:getSetting("font_bold", "0") or "0") == "1"
+end
+
+-- 字体粗细：0 = 常规(400)，1.5 = 偏粗（没有对应字重时由引擎合成）。
+-- force=true 用于关闭时把字重还原成 0；文档就绪时只在开启状态下覆盖，
+-- 避免把用户在原生菜单里调过的字重改回去。
+function XRead:applyFontBold(force)
+    local ui = self.ui
+    if not (ui and ui.document) then return end
+    local on = self:fontBoldEnabled()
+    if not on and not force then return end
+    pcall(function()
+        if ui.document.setFontBaseWeight then
+            ui.document:setFontBaseWeight(on and 1.5 or 0)
+        end
+        ui:handleEvent(require("ui/event"):new("UpdatePos"))
+    end)
+end
+
+function XRead:zhMode()
+    local v = tostring(self:getSetting("zh_convert", "none") or "none")
+    if v ~= "s" and v ~= "t" then return "none" end
+    return v
+end
+
+-- 简繁切换：切完要把当前正文文件按新模式重拼一遍再热重载，
+-- 否则已经在看的这一章还是旧字形（下一章才会生效）。
+function XRead:applyZhConvert(mode)
+    mode = (mode == "s" or mode == "t") and mode or "none"
+    self:saveSetting("zh_convert", mode)
+    ZH_MODE = mode
+
+    local ui = self.ui
+    local book, chapters, index = SHARED.book, SHARED.chapters, SHARED.index
+    if not (ui and ui.document and book and chapters and index) then return end
+    if SHARED.txt_path ~= ui.document.file then return end   -- 不是从阅读X打开的书
+
+    local ok = pcall(function()
+        local max_chapters = tonumber(self:getSetting("max_chapters", "3")) or 3
+        local last = math.min(index + max_chapters - 1, #chapters)
+        local parts = { chapterHtmlHead(book.name or "") }
+        local n = 0
+        for i = index, last do
+            local text = self.chapter_cache:get(book, i)
+            if not text then break end
+            local ch = chapters[i]
+            parts[#parts + 1] = chapterBlock(ch and ch.title or ("第" .. i .. "章"), text)
+            n = n + 1
+        end
+        if n == 0 then error("no cached text") end
+        local f = io.open(SHARED.txt_path, "w")
+        if not f then error("open failed") end
+        f:write(table.concat(parts))
+        f:close()
+        SHARED.txt_size = fileSize(SHARED.txt_path)
+    end)
+
+    if not ok then
+        logger.warn("xread zh convert rewrite failed")
+        self:showInfo(_("简繁切换失败，重新打开本章后生效"), 5)
+        return
+    end
+
+    UIManager:nextTick(function() hotReload(ui, SHARED.txt_path) end)
+end
+
+-- ---------- 正文里的「设置」：页面管理 / 字体管理 / 翻页管理（卡片分组） ----------
+
+local BOOK_PAGE_MODE_TEXT = {
+    default = { label = _("上下分区"), desc = _("上点上一页 · 下点下一页") },
+    left_right = { label = _("左右分区"), desc = _("左点上一页 · 右点下一页") },
+}
 
 function XRead:showBookSettingsPanel()
 
-    -- 防重叠：已有面板开着先关掉（选字体/字号后会重建面板）
+    -- 防重叠：已有面板开着先关掉（改任意一项都会重建面板回显）
     if self._book_settings_dialog then
 
         pcall(function() UIManager:close(self._book_settings_dialog) end)
@@ -8582,11 +8895,14 @@ function XRead:showBookSettingsPanel()
     local VerticalGroup = require("ui/widget/verticalgroup")
     local HorizontalGroup = require("ui/widget/horizontalgroup")
     local HorizontalSpan = require("ui/widget/horizontalspan")
+    local VerticalSpan = require("ui/widget/verticalspan")
     local FrameContainer = require("ui/widget/container/framecontainer")
     local CenterContainer = require("ui/widget/container/centercontainer")
     local LeftContainer = require("ui/widget/container/leftcontainer")
+    local RightContainer = require("ui/widget/container/rightcontainer")
     local InputContainer = require("ui/widget/container/inputcontainer")
     local TextWidget = require("ui/widget/textwidget")
+    local Button = require("ui/widget/button")
     local LineWidget = require("ui/widget/linewidget")
     local GestureRange = require("ui/gesturerange")
     local Font = require("ui/font")
@@ -8597,6 +8913,7 @@ function XRead:showBookSettingsPanel()
 
     local function refreshDialog()
         if dialog then UIManager:close(dialog) end
+        -- 只换波形、不整屏深刷，避免每改一项就全屏黑白闪一次
         UIManager:setDirty("all", "ui")
         self:showBookSettingsPanel()
     end
@@ -8606,96 +8923,127 @@ function XRead:showBookSettingsPanel()
         UIManager:setDirty("all", "full")   -- 整屏重绘，防残影
     end
 
-    local function currentFontSize()
-        local v = nil
-        pcall(function()
-            local f = self.ui and self.ui.font
-            v = f and f.configurable and tonumber(f.configurable.font_size)
-        end)
-        return tostring(v or 22)
-    end
-
     local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local W = math.min(sw - 80, 700)
-    local pad = math.floor(sw * 0.03)
+    local W = math.min(sw - Screen:scaleBySize(56), Screen:scaleBySize(880))
+    local pad = Screen:scaleBySize(18)
     local inner_w = W - pad * 2
+    local hpad = Screen:scaleBySize(16)
+    local content_w = inner_w - 2 * hpad
+    local row_h = math.max(Screen:scaleBySize(44),
+        math.min(Screen:scaleBySize(58), math.floor(sh * 0.05)))
     local face_title = Font:getFace("cfont", 22)
-    local face_row = Font:getFace("cfont", 18)
+    local face_group = Font:getFace("cfont", 15)
+    local face_row = Font:getFace("cfont", 17)
+    local face_value = Font:getFace("cfont", 16)
+    local face_desc = Font:getFace("cfont", 13)
     local face_hint = Font:getFace("smallinfofont", 13)
 
-    local row_h = Screen:scaleBySize(52)
-    local gap = Screen:scaleBySize(12)
+    -- ---------- 版式零件（与首页「设置」同一套） ----------
+    local function groupTitle(text)
+        return VerticalGroup:new{ align = "left",
+            VerticalSpan:new{ width = Screen:scaleBySize(16) },
+            TextWidget:new{
+                text = text, face = face_group, bold = true,
+                fgcolor = Blitbuffer.COLOR_GRAY_6,
+                max_width = inner_w,
+            },
+            VerticalSpan:new{ width = Screen:scaleBySize(7) },
+        }
+    end
 
-    -- 步进按钮：直接挂 ges_events（与 FieldRow 同机制），点按即生效并重建面板
-    local function stepBtn(text, on_step)
-        local btn = InputContainer:extend{}
-        function btn:init()
-            self.dimen = Geom:new{ w = Screen:scaleBySize(64), h = Screen:scaleBySize(44) }
-            self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
-            self[1] = TextWidget:new{
-                text = text, face = face_row, bold = true,
-                fgcolor = Blitbuffer.COLOR_BLACK,
-            }
+    local function rowLine()
+        return HorizontalGroup:new{ align = "center",
+            HorizontalSpan:new{ width = hpad },
+            LineWidget:new{
+                dimen = Geom:new{ w = content_w, h = 1 },
+                background = Blitbuffer.COLOR_GRAY_D,
+            },
+            HorizontalSpan:new{ width = hpad },
+        }
+    end
+
+    local function card(rows)
+        local box = VerticalGroup:new{ align = "left" }
+        for i = 1, #rows do
+            box[#box + 1] = rows[i]
+            if i < #rows then box[#box + 1] = rowLine() end
         end
-        function btn:onTap() on_step(); return true end
-        return btn:new{}
-    end
-
-    local function valueText(text)
-        return CenterContainer:new{
-            dimen = Geom:new{ w = Screen:scaleBySize(70), h = row_h },
-            TextWidget:new{ text = text, face = face_row, bold = true,
-                fgcolor = Blitbuffer.COLOR_BLACK },
+        return FrameContainer:new{
+            bordersize = 1, color = Blitbuffer.COLOR_GRAY_B, radius = 8,
+            padding = 0, margin = 0,
+            background = Blitbuffer.COLOR_WHITE,
+            width = inner_w,
+            box,
         }
     end
 
-    local function labelRow(text)
-        return TextWidget:new{
-            text = text, face = face_row, bold = true,
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        }
-    end
+    local label_w = math.floor(content_w * 0.46)
+    local ctl_w = math.max(1, content_w - label_w)
 
-    -- 行1：默认预加载章节数（进书时先拼这么多章立即打开）
-    local chapter_row = HorizontalGroup:new{ align = "center",
-        LeftContainer:new{ dimen = Geom:new{ w = inner_w - 220, h = row_h },
-            labelRow(_("默认预加载章节数")) },
-        stepBtn("－", function()
-            local v = (tonumber(self:getSetting("max_chapters", "3")) or 3) - 1
-            if v < 1 then v = 1 end
-            self:saveSetting("max_chapters", tostring(v))
-            refreshDialog()
-        end),
-        HorizontalSpan:new{ width = Screen:scaleBySize(8) },
-        valueText(tostring(self:getSetting("max_chapters", "3"))),
-        HorizontalSpan:new{ width = Screen:scaleBySize(8) },
-        stepBtn("＋", function()
-            local v = (tonumber(self:getSetting("max_chapters", "3")) or 3) + 1
-            if v > 200 then v = 200 end
-            self:saveSetting("max_chapters", tostring(v))
-            refreshDialog()
-        end),
+    local ParamRow = InputContainer:extend{
+        label = nil, value = nil, height = nil,
+        callback = nil, arrow = nil, value_face = nil,
+        value_bold = nil, selected = false,
     }
+    function ParamRow:init()
+        local label_tw = TextWidget:new{
+            text = tostring(self.label or ""), face = face_row, bold = true,
+            max_width = label_w, fgcolor = Blitbuffer.COLOR_BLACK,
+        }
+        local value_text = tostring(self.value or "")
+        if self.arrow then value_text = value_text .. "   ›" end
+        local value_tw = TextWidget:new{
+            text = value_text, face = self.value_face or face_value,
+            bold = self.value_bold == true,
+            max_width = ctl_w,
+            fgcolor = self.value_bold and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY_6,
+        }
+        self[1] = FrameContainer:new{
+            bordersize = 0, padding = 0, margin = 0,
+            background = self.selected and Blitbuffer.COLOR_GRAY_D or Blitbuffer.COLOR_WHITE,
+            width = inner_w, height = self.height,
+            HorizontalGroup:new{ align = "center",
+                HorizontalSpan:new{ width = hpad },
+                LeftContainer:new{ dimen = Geom:new{ w = label_w, h = self.height }, label_tw },
+                RightContainer:new{ dimen = Geom:new{ w = ctl_w, h = self.height }, value_tw },
+                HorizontalSpan:new{ width = hpad },
+            },
+        }
+        self.dimen = Geom:new{ w = inner_w, h = self.height }
+        self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
+    end
+    function ParamRow:onTap()
+        if self.callback then self.callback() end
+        return true
+    end
 
-    -- 下拉框按钮：右侧显示当前值 + ▾，点击弹出选择列表
-    local function dropdownBtn(shown_text, on_open)
-        local btn = InputContainer:extend{}
-        function btn:init()
-            self.dimen = Geom:new{ w = Screen:scaleBySize(210), h = row_h }
-            self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
-            self[1] = TextWidget:new{
-                text = tostring(shown_text) .. " ▾", face = face_row, bold = true,
-                fgcolor = Blitbuffer.COLOR_BLACK,
-                max_width = Screen:scaleBySize(200),
-            }
-        end
-        function btn:onTap() on_open(); return true end
-        return btn:new{}
+    local function row(label, value, on_tap, opts)
+        opts = opts or {}
+        return ParamRow:new{
+            label = label, value = value, height = row_h,
+            callback = on_tap, arrow = opts.arrow,
+            value_face = opts.value_face, value_bold = opts.value_bold,
+            selected = opts.selected,
+        }
+    end
+
+    -- 一行「左侧标签 + 右侧自定义控件」（分段按钮等）
+    local function ctlRow(label_text, ctl)
+        return HorizontalGroup:new{ align = "center",
+            HorizontalSpan:new{ width = hpad },
+            LeftContainer:new{ dimen = Geom:new{ w = label_w, h = row_h },
+                TextWidget:new{
+                    text = label_text, face = face_row, bold = true,
+                    max_width = label_w, fgcolor = Blitbuffer.COLOR_BLACK,
+                } },
+            RightContainer:new{ dimen = Geom:new{ w = ctl_w, h = row_h }, ctl },
+            HorizontalSpan:new{ width = hpad },
+        }
     end
 
     local function pickFromList(title, items)
         local entries = {}
-        for _, it in ipairs(items) do
+        for _i, it in ipairs(items) do
             entries[#entries + 1] = {
                 label = (it.current and "● " or "○ ") .. tostring(it.label),
                 callback = function()
@@ -8708,27 +9056,81 @@ function XRead:showBookSettingsPanel()
         self:showMoreListPanel(title, entries, { hint = _("点击选择；点空白处返回。") })
     end
 
+    -- 三段选择（简繁这种三态）：与首页缓存深度同款
+    local function segmented(options, current, on_pick)
+        local gap = Screen:scaleBySize(8)
+        local seg_w = math.max(Screen:scaleBySize(48),
+            math.floor((ctl_w - gap * (#options - 1)) / #options))
+        local seg_h = row_h - Screen:scaleBySize(14)
+        local group = HorizontalGroup:new{ align = "center" }
+        for _i, opt in ipairs(options) do
+            local key = opt.key
+            local active = key == current
+            group[#group + 1] = Button:new{
+                text = opt.label, text_font_face = "cfont", text_font_size = 15,
+                text_font_bold = active == true,
+                bordersize = active and 3 or 1,
+                radius = 6,
+                width = seg_w, height = seg_h,
+                callback = function()
+                    if active then return end
+                    on_pick(key)
+                end,
+            }
+            if _i < #options then
+                group[#group + 1] = HorizontalSpan:new{ width = gap }
+            end
+        end
+        return group
+    end
+
+    -- ---------- 页面管理 ----------
+    local function toggleRow(label, on, on_tap)
+        return row(label, on and _("开") or _("关"), function()
+            on_tap()
+            refreshDialog()
+        end, { value_bold = true })
+    end
+
+    local indent_row = toggleRow(_("段落缩进"), self:paraIndentEnabled(), function()
+        self:saveSetting("para_indent", self:paraIndentEnabled() and "0" or "1")
+        pcall(function() self:applyParaIndent() end)
+    end)
+
+    local footer_row = toggleRow(_("页尾页码"), tostring(self:getSetting("reader_footer", "1")) ~= "0", function()
+        local on = tostring(self:getSetting("reader_footer", "1")) ~= "0"
+        self:saveSetting("reader_footer", on and "0" or "1")
+        pcall(function() self:_applyReaderFooter() end)
+    end)
+
+    -- ---------- 字体管理 ----------
     local function currentFontFace()
         local v = nil
         pcall(function() v = self.ui and self.ui.font and self.ui.font.font_face end)
         return tostring(v or "")
     end
 
-    -- 行2：设置字体（下拉选择正文字体，即选即生效）
-    local font_face_row = HorizontalGroup:new{ align = "center",
-        LeftContainer:new{ dimen = Geom:new{ w = inner_w - 220, h = row_h },
-            labelRow(_("设置字体")) },
-        dropdownBtn(currentFontFace() ~= "" and currentFontFace() or _("系统默认"), function()
+    local function currentFontSize()
+        local v = nil
+        pcall(function()
+            local f = self.ui and self.ui.font
+            v = f and f.configurable and tonumber(f.configurable.font_size)
+        end)
+        return tostring(v or 22)
+    end
+
+    local font_face_row = row(_("字体"),
+        currentFontFace() ~= "" and currentFontFace() or _("系统默认"),
+        function()
             local items = {}
             local ok_f, faces = pcall(function()
                 -- engineInit 返回 cre 库本体；字体列表是库级函数，必须点号调用
-                -- （readerfont.lua 同款用法）；冒号调用传错参数会拿不到列表
                 local cre = require("document/credocument"):engineInit()
                 return cre and cre.getFontFaces()
             end)
             local cur = currentFontFace()
             if ok_f and type(faces) == "table" then
-                for _, f in ipairs(faces) do
+                for _i, f in ipairs(faces) do
                     items[#items + 1] = {
                         label = tostring(f),
                         current = tostring(f) == cur,
@@ -8749,82 +9151,123 @@ function XRead:showBookSettingsPanel()
             if #items == 0 then
                 items[#items + 1] = { label = _("无法获取字体列表"), on_pick = function() end }
             end
-            pickFromList(_("设置字体"), items)
-        end),
-    }
+            pickFromList(_("字体"), items)
+        end, { arrow = true })
 
-    -- 行3：提高字体（下拉选择字号，即选即生效）
-    local font_size_row = HorizontalGroup:new{ align = "center",
-        LeftContainer:new{ dimen = Geom:new{ w = inner_w - 220, h = row_h },
-            labelRow(_("提高字体")) },
-        dropdownBtn((currentFontSize()) .. "px", function()
-            local items = {}
-            local cur = tonumber(currentFontSize()) or 22
-            for _, s in ipairs({16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38}) do
-                items[#items + 1] = {
-                    label = tostring(s),
-                    current = s == cur,
-                    on_pick = function()
-                        pcall(function()
-                            local fo = self.ui and self.ui.font
-                            if fo then
-                                fo.configurable.font_size = s
-                                self.ui.document:setFontSize(Screen:scaleBySize(s))
-                                local Event = require("ui/event")
-                                self.ui:handleEvent(Event:new("UpdatePos"))
-                            end
-                        end)
-                    end,
-                }
-            end
-            pickFromList(_("提高字体"), items)
-        end),
+    local font_size_row = row(_("字号"), currentFontSize() .. "px", function()
+        local items = {}
+        local cur = tonumber(currentFontSize()) or 22
+        for _i, s in ipairs({16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38}) do
+            items[#items + 1] = {
+                label = tostring(s),
+                current = s == cur,
+                on_pick = function()
+                    pcall(function()
+                        local fo = self.ui and self.ui.font
+                        if fo then
+                            fo.configurable.font_size = s
+                            self.ui.document:setFontSize(Screen:scaleBySize(s))
+                            local Event = require("ui/event")
+                            self.ui:handleEvent(Event:new("UpdatePos"))
+                        end
+                    end)
+                end,
+            }
+        end
+        pickFromList(_("字号"), items)
+    end, { arrow = true })
+
+    local bold_row = toggleRow(_("字体加粗"), self:fontBoldEnabled(), function()
+        local on = self:fontBoldEnabled()
+        self:saveSetting("font_bold", on and "0" or "1")
+        pcall(function() self:applyFontBold(true) end)
+    end)
+
+    local ZH_OPTIONS = {
+        { key = "none", label = _("原文") },
+        { key = "s", label = _("简体") },
+        { key = "t", label = _("繁体") },
     }
+    local zh_row = ctlRow(_("简繁转换"), segmented(ZH_OPTIONS, self:zhMode(), function(key)
+        -- 改完立刻重拼当前正文并热重载，这一章马上换字形
+        self:applyZhConvert(key)
+        refreshDialog()
+    end))
+
+    -- ---------- 翻页管理：两种分区方案，选中即生效 ----------
+    local cur_mode = self:currentPageMode()
+    local page_keys = {}
+    for key in pairs(PAGE_MODES) do page_keys[#page_keys + 1] = key end
+    table.sort(page_keys, function(a, b)
+        if (a == "default") ~= (b == "default") then return a == "default" end
+        return tostring(a) < tostring(b)
+    end)
+    local page_rows = {}
+    for _i, key in ipairs(page_keys) do
+        local info = BOOK_PAGE_MODE_TEXT[key] or {}
+        local chosen = key == cur_mode
+        local mode_key = key
+        page_rows[#page_rows + 1] = row(
+            (chosen and "● " or "○ ") .. tostring(info.label or key),
+            tostring(info.desc or ""),
+            function()
+                self:saveSetting("page_mode", mode_key)
+                pcall(function() self:setupCenterTap() end)   -- 阅读中即时生效
+                refreshDialog()
+            end,
+            { value_face = face_desc, selected = chosen })
+    end
 
     local rows = VerticalGroup:new{ align = "left" }
-    rows[#rows + 1] = chapter_row
-    rows[#rows + 1] = HorizontalSpan:new{ width = gap }
+    rows[#rows + 1] = groupTitle(_("页面管理"))
+    rows[#rows + 1] = card({ indent_row, footer_row })
+    rows[#rows + 1] = groupTitle(_("字体管理"))
+    rows[#rows + 1] = card({ font_face_row, font_size_row, bold_row, zh_row })
+    rows[#rows + 1] = groupTitle(_("翻页管理"))
+    rows[#rows + 1] = card(page_rows)
+    rows[#rows + 1] = VerticalSpan:new{ width = Screen:scaleBySize(14) }
     rows[#rows + 1] = TextWidget:new{
-        text = _("打开书后后台静默预加载这么多章（1-200）"),
-        face = face_hint, width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
-    }
-    rows[#rows + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(20) }
-    rows[#rows + 1] = font_face_row
-    rows[#rows + 1] = HorizontalSpan:new{ width = gap }
-    rows[#rows + 1] = font_size_row
-    rows[#rows + 1] = HorizontalSpan:new{ width = gap }
-    rows[#rows + 1] = TextWidget:new{
-        text = _("字体与字号即选即生效；预加载越多开书越快，但占用存储也越多"),
-        face = face_hint, width = inner_w, fgcolor = Blitbuffer.COLOR_GRAY,
+        text = _("改动即时生效并自动保存；点空白处或右上角 ✕ 关闭。"),
+        face = face_hint, fgcolor = Blitbuffer.COLOR_GRAY_6,
+        max_width = inner_w,
     }
 
-    local card = VerticalGroup:new{ align = "left" }
+    local card_box = VerticalGroup:new{ align = "left" }
 
-    -- 标题行右侧加「✕」：点击分区（上/中/下 1/3）会抢走全屏 tap，
-    -- 点空白关闭收不到手势，必须有可见的关闭按钮（与地址/账号管理一致）
     local title_tw = TextWidget:new{
-        text = _("书籍设置"), face = face_title, bold = true,
+        text = _("正文设置"), face = face_title, bold = true,
         fgcolor = Blitbuffer.COLOR_BLACK,
     }
     local close_w = Screen:scaleBySize(44)
     local stretch = inner_w - title_tw:getSize().w - close_w
     if stretch < 0 then stretch = 0 end
-    card[#card + 1] = HorizontalGroup:new{ align = "center",
+    card_box[#card_box + 1] = HorizontalGroup:new{ align = "center",
         title_tw, HorizontalSpan:new{ width = stretch },
         UICommon.closeButtonAtEdge(closePanel, pad, close_w) }
-    card[#card + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(14) }
-    card[#card + 1] = LineWidget:new{
-        dimen = Geom:new{ w = inner_w, h = 1 },
-        background = Blitbuffer.COLOR_GRAY_D,
-    }
-    card[#card + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(14) }
-    card[#card + 1] = rows
+    card_box[#card_box + 1] = rows
+
+    -- 内容比屏幕高时套一层滚动容器（小屏/大字号下不至于把首尾行挤出屏幕）
+    local body = card_box
+    local max_body_h = sh - pad * 2 - Screen:scaleBySize(48)
+    local ok_size, card_size = pcall(function() return card_box:getSize() end)
+    if ok_size and card_size and tonumber(card_size.h) and card_size.h > max_body_h then
+        local ok_scroll, ScrollableContainer = pcall(require, "ui/widget/container/scrollablecontainer")
+        if ok_scroll and ScrollableContainer then
+            body = ScrollableContainer:new{
+                dimen = Geom:new{ w = inner_w, h = math.max(1, max_body_h) },
+                _show_v_scrollbar = true,
+                card_box,
+            }
+        end
+    end
 
     local frame = FrameContainer:new{
-        bordersize = 2, color = Blitbuffer.COLOR_BLACK,
-        background = Blitbuffer.COLOR_WHITE, radius = 8,
-        padding = pad, margin = 0,
-        card,
+        bordersize = 2,
+        radius = 10,
+        padding = pad,
+        background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_DARK_GRAY,
+        body,
     }
 
     local overlay_dimen = Geom:new{ w = sw, h = sh }
