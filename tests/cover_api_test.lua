@@ -48,12 +48,15 @@ check(last.url == c:coverApiUrl(net_src), "代理请求 URL 不符")
 check(last.headers["Referer"] == BASE, "Referer header 缺失")
 
 -- 5) 本地书 401：重登一次后用新 token 重试
+-- 注意 socket.http / KOReader 的约定：成功时第一个返回值是 1，第二个才是 HTTP 状态码。
+-- mock 成 `nil, 401` 会被 HttpClient 当成「请求失败」而不是「HTTP 401」，
+-- 覆盖不到 401 重登分支（之前这条用例一直是这么写的，等于没在测）。
 local calls = 0
 package.loaded["socket.http"].request = function(t)
     calls = calls + 1
     seen[calls] = t
-    if calls == 1 then return nil, 401 end
-    return nil, 404
+    if calls == 1 then return 1, 401 end
+    return 1, 404
 end
 client.login = function()
     client.accessToken = "tok2"

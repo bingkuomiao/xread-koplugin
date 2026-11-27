@@ -1,0 +1,94 @@
+# 测试覆盖矩阵
+
+> 用途：改动插件后，先看这张表判断「改了哪块 → 该跑哪几个用例」。
+> 全部用例都在 WSL + KOReader SDL 模拟器（1072×1448 / dpi300）内跑，
+> 入口 `bash tests/run_all.sh [--quick|--only <id> ...]`。
+
+## 一、按功能域
+
+| 功能域 | 覆盖内容 | 用例 |
+|---|---|---|
+| 静态质量 | 全部 `.lua` 可被 LuaJIT 解析 | 09_syntax |
+| 交付一致性 | zip / 源码 / 部署三方 md5 完全一致 | 10_package_consistency |
+| 书架 | 加载、网格、空/异常数据、翻页 | 01_shelf_smoke、25_layout_edge、26_shelf_paging |
+| 首页 | 首屏渲染、hero 卡、刷新按钮、简介清洗 | 06_home、22_home_hero_cache |
+| 首页按钮 | 更新/搜索/同步/夜晚/设置 逐个点击 | 15a_home_buttons |
+| 首页 ↔ 书架 | 进入书架、返回首页、不叠层 | 20_shelf_back、05_back_to_shelf |
+| 开书 / 正文 | 点书进入、正文渲染、翻页 | 02_reading_open、14_full_flow_touch |
+| 阅读工具栏 | 呼出、按钮布局、目录图标、返回书架 | 03_toolbar、08_toolbar_catalog_tap、15b_toolbar_buttons |
+| 目录 | 打开、跳章、缓存态高亮、翻章后章节名同步 | 04_catalog、22_home_hero_cache（chapter_sync） |
+| 更多菜单 | 我的书架/地址/账号/翻页/关于本机 | 15c_more_menu |
+| 设置面板 | 地址、账号、翻页、缓存章节数单选 | 22_home_hero_cache（settings / cache_none） |
+| 阅读统计 | 统计页渲染 | 07_stats |
+| 缓存 | 整本预缓存、未设置章节数时的引导、缓存失败常驻卡 | 15b_toolbar_buttons（cache）、22_home_hero_cache |
+| 夜晚模式 | 首页全局 / 正文书籍级，两者互不干扰 | 21_night_buttons |
+| 消息与弹窗 | 提示卡、确认框、原生 ConfirmBox | 22（msgbox/msgconfirm）、15c |
+| 本地阅读 | 本地书列表、返回 | 15a（local_books / local_back） |
+| 热更新 | zip / tar.gz / 本地包 / 列目录取最新 / 留存策略 | 12、16、18、19、13 |
+| 封面接口 | 编码、鉴权、Referer、401 重登 | 17_cover_api |
+| 界面字号 | standard / compact / large 三档布局 | 23_display_size |
+| 屏幕旋转 | 横屏 ↔ 竖屏重建 | 24_rotate |
+| 搜索加书 | 搜索输入框弹出/关闭 | 27_search_panel |
+| 内存档位 | low 档：图层缓存 1 层 + 封面不进全局缓存 | 28_memory_low |
+| 关于本机 | 后端版本从「检测中」更新为具体版本号 | 29_about_version |
+| 测试连接 | 成功后顶部状态立即变「已连接」 | 30_test_connection_status |
+| 触摸全流程 | 阅读X → 书架 → 开书 → 目录 → 跳章 → 返回 | 14_full_flow_touch |
+
+## 二、按改动类型该跑什么
+
+| 改了 | 至少跑 |
+|---|---|
+| 任意 `.lua` 语法/结构 | 09_syntax、10_package_consistency |
+| `ui_scale.lua`、字号/间距常量 | 23_display_size、06_home、25_layout_edge |
+| `home_view.lua` | 06_home、22_home_hero_cache、15a_home_buttons、23 |
+| `full_shelf_view.lua` / `shelf_grid.lua` | 01_shelf_smoke、25_layout_edge、26_shelf_paging、20_shelf_back |
+| `catalog_view.lua` | 04_catalog、08_toolbar_catalog_tap、22（chapter_sync） |
+| `reader_toolbar.lua` | 03_toolbar、15b_toolbar_buttons |
+| `main.lua` 开书/跳章/缓存 | 02_reading_open、04_catalog、14_full_flow_touch、22 |
+| `memory.lua` / 缓存策略 | 28_memory_low、26_shelf_paging、06_home |
+| `updater.lua` / 打包脚本 | 12、16、18、19、13、10 |
+| `cover_cache.lua` | 17_cover_api、06_home、22 |
+
+## 三、自动化测不到的部分（必须真机/人工）
+
+| 项 | 原因 |
+|---|---|
+| 真实 e-ink 刷新残影 | Xvfb 瞬时重绘，没有残影累积 |
+| 实际耗时/帧感 | 模拟器 CPU 比 PW3 快一个数量级 |
+| 内存水位 | 宿主机 GB 级；低内存策略靠 `XREAD_MEM_TIER=low` 强制走分支，但真实 OOM 边界测不到 |
+| 固件相关（前光、电源、休眠恢复） | 无固件层 |
+| `isKindle()` 分支 | 模拟器 `model = Emulator` |
+| 前端滑动惯性、长按手感 | 只有 `xdotool` 合成点击 |
+
+## 四、新增用例说明（v0.6.28）
+
+`23`~`28` 是为「覆盖所有基本功能」补的一批，全部不依赖后端可达性：
+
+- **23_display_size**：`UiScale` 是唯一会改全局几何的开关（compact/standard/large 三套 font/icon/spacing 因子）。
+  三档各重建一次首页，任何一档溢出/崩溃都会被抓到。
+- **24_rotate**：横屏重建 + 竖屏还原。模拟器旋转行为与真机有差异，因此硬断言只要求
+  「两次重建都完成」，尺寸记录在日志里供人工核对。
+- **25_layout_edge**：直接喂假 books（超长书名、空作者、无封面、进度 0、13 本跨页），
+  不碰网络。用于回归「占位封面文字压到进度徽标上」这类布局缺陷。
+- **26_shelf_paging**：30 本 = 3 页，逐页前进再后退。这是 Batch 4 封面内存回收
+  （旧 widget 树 `free()`）的主验收路径——翻页重建不崩即说明释放没踩到野指针。
+- **27_search_panel**：只验 UI 弹出与关闭，不发请求，所以后端挂着也能跑。
+- **28_memory_low**：`XREAD_MEM_TIER=low` 强制低内存档位，断言
+  `tier=low` + `layers=1` + `cover_cache=false`，同时首页必须能正常打开。
+  真机（PW3 512MB）走的就是这条路径，而模拟器本身永远不会自然触发。
+- **29_about_version**：回归「关于本机」后端版本。根因是 `showAboutPanel` 用了
+  `_scheduleNetJob`（弹层让路 → 面板本身就是弹层 → 请求永久挂起），改为直接
+  `scheduleIn`；且未登录时静默补登录再取 `getVersionUpdate`。
+- **30_test_connection_status**：回归「测试连接」成功后顶部状态。根因是 `testConnection`
+  成功分支只弹提示、不回写 `_health_ok` 与 header，导致顶部要到下一轮 60s 心跳或手动刷新
+  才变「已连接」。现在成功即回写。
+
+## 五、与首页/阅读器的 flow 约定
+
+- `XREAD_AUTOTEST=home|shelf|open|update|opentime|shelfback` → 决定启动后自动进哪个界面。
+- `XREAD_AUTOTEST_FLOW=<name>`：
+  - 已开书（`self.ui.document` 存在）时才跑的：`panel`、`catalog`、`settings`、`stats`、`more*`、
+    `cache`、`chapter_sync`、`catalog_jump`、`reload`、`night_seq`、`msgbox` 等；
+  - 首页上下文跑的（没有已开文档）：`display_size`、`rotate`、`layout_edge`、`shelf_paging`、
+    `search_panel`、`memory_info`，入口 `XRead:_runHomeAutotestFlow()`。
+- 所有验收标记形如 `[XREAD_AUTOTEST] flow=<name> ...`，只在这些环境变量存在时打印，生产无副作用。

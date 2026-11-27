@@ -28,6 +28,7 @@ local Config = require("xread.miui.config")
 local UiScale = require("xread.miui.ui_scale")
 local Ui = require("xread.miui.ui_components")
 local HeaderLayout = require("xread.miui.home_header_layout")
+local Memory = require("xread.miui.memory")
 
 local Screen = Device.screen
 local live_widget
@@ -184,7 +185,10 @@ local function image_widget(path, width, height, ink_boost)
             -- Always use MuPDF scaling for covers. Legacy scaling is faster on
             -- a few old devices but visibly softer at small e-ink sizes.
             use_legacy_image_scaling = false,
-            file_do_cache = true,
+            -- 低内存设备不进全局 ImageCache：缓存里每张封面都是一份常驻
+            -- Blitbuffer，首页+书架+翻过的页会一直堆着；交给 widget 自己
+            -- 持有，widget 树 free() 时立刻回收。
+            file_do_cache = Memory.cover_do_cache(),
         }
         image:getSize()
     end)
@@ -201,23 +205,26 @@ local function image_widget(path, width, height, ink_boost)
     return nil
 end
 
-local function placeholder(width, height, title, author)
+local function placeholder(width, height, title, author, top_inset)
     title = U.trim(tostring(title or "未命名"))
     author = U.trim(tostring(author or ""))
     if title == "" then title = "未命名" end
     local pad = UiScale.dp(3, 2, 5)
+    -- 有进度/已读徽标时把文字区整体下移，否则长书名会直接压在百分比上
+    local reserve = math.max(0, tonumber(top_inset) or 0)
     local content_w = math.max(1, width - pad * 2)
-    local content_h = math.max(1, height - pad * 2)
+    local content_h = math.max(1, height - pad * 2 - reserve)
     local title_h = math.max(1, math.floor(content_h * (author ~= "" and .58 or .78)))
     local author_h = math.max(1, content_h - title_h)
-    local body = VerticalGroup:new{
-        align = "center",
-        TextBoxWidget:new{
-            text = U.utf8_truncate(title, 24, "…"),
-            face = face("cfont", 10.8, 15.5), bold = true,
-            width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = title_h,
-            height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
-        },
+    local body = VerticalGroup:new{align = "center"}
+    if reserve > 0 then
+        body[#body + 1] = VerticalSpan:new{width = reserve}
+    end
+    body[#body + 1] = TextBoxWidget:new{
+        text = U.utf8_truncate(title, 24, "…"),
+        face = face("cfont", 10.8, 15.5), bold = true,
+        width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = title_h,
+        height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
     }
     if author ~= "" then
         body[#body + 1] = TextBoxWidget:new{
@@ -400,7 +407,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     -- 封面右侧信息，按参考图自上而下分行：
     --   书名（第一行，两行高）/ 作者 · 书源 / 阅读至 N% / 上次读到第 X 章
     -- 简介移到卡片底部（原来书名标题的位置），横贯全宽。
-    local intro_text = U.trim(tostring(book.description or book.intro or book.summary or ""))
+    local intro_text = U.plain_text(book.description or book.intro or book.summary or "")
     if intro_text == "" then intro_text = "暂无简介" end
     local meta_line = U.trim(tostring(book.meta_line or ""))
     local progress_line = U.trim(tostring(book.progress_line or ""))
@@ -604,7 +611,9 @@ local function hero_card_classic(book, width, height, callback, hold_callback, s
     if clean(book.last_read_text) ~= '' then progress_text = progress_text .. ' · ' .. clean(book.last_read_text) end
     -- Book metadata and introductory prose are not interchangeable. In
     -- particular, do not display a translator/language fallback as an intro.
-    local description = clean(book.description or book.intro or book.summary)
+    -- 简介是富文本（可能带标签/实体/零宽字符），必须走 plain_text 清洗；
+    -- clean() 只做 trim，直接用它会让 "&; &; &;" 原样画到首页上。
+    local description = U.plain_text(book.description or book.intro or book.summary)
     local intro_available = description ~= ''
     if not intro_available then description = '暂无简介' end
 
@@ -799,7 +808,7 @@ local function welcome_card(width, height, callback)
         }, VerticalGroup:new{
             align = "center",
             TextWidget:new{text = "开始阅读", face = UiScale.iconFace("cfont", 18, 24), bold = true},
-            VerticalSpan:new{height = UiScale.dp(7, 5, 10)},
+            VerticalSpan:new{width = UiScale.dp(7, 5, 10)},
             TextWidget:new{
                 text = "从书架选择一本内容",
                 face = face("smallinfofont", 11, 14),
@@ -836,7 +845,7 @@ local function shelf_folder_card(folder, width, height, callback)
     local body = VerticalGroup:new{
         align = "center",
         cover,
-        VerticalSpan:new{height = vgap},
+        VerticalSpan:new{width = vgap},
         TextBoxWidget:new{
             text = tostring(folder.title or "文件夹"), face = face("cfont", 11.8, 16.5), bold = true,
             width = inner_w, height = title_h, height_adjust = false,
@@ -947,7 +956,10 @@ local function shelf_book_card(book, width, height, callback, hold_callback, sho
     local extra_gaps = (status_h > 0 and 1 or 0) + (download_h > 0 and 1 or 0)
     local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - extra_h - vgap * (1 + extra_gaps))
     local cover_w = math.max(UiScale.dp(54, 46, 78), math.min(math.floor(inner_w * .995), math.floor(cover_h * .715)))
-    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .06) or placeholder(cover_w, cover_h, book.title, book.author)
+    local badge_reserve = (downloaded or reading_badge ~= "")
+        and (UiScale.dp(18, 16, 25) + UiScale.dp(2, 1, 4) * 2) or 0
+    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .06)
+        or placeholder(cover_w, cover_h, book.title, book.author, badge_reserve)
 
     local cover_layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
     cover_layer[#cover_layer + 1] = cover
@@ -971,14 +983,14 @@ local function shelf_book_card(book, width, height, callback, hold_callback, sho
         }
     end
 
-    local body = VerticalGroup:new{align = "center", cover_layer, VerticalSpan:new{height = vgap}}
+    local body = VerticalGroup:new{align = "center", cover_layer, VerticalSpan:new{width = vgap}}
     body[#body + 1] = TextBoxWidget:new{
         text = tostring(book.title or "未命名"),
         face = face("cfont", 11.5, 16), bold = true, width = inner_w, height = title_h,
         height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
     }
     if download_h > 0 then
-        body[#body + 1] = VerticalSpan:new{height = vgap}
+        body[#body + 1] = VerticalSpan:new{width = vgap}
         body[#body + 1] = CenterContainer:new{
             dimen = Geom:new{w = inner_w, h = download_h},
             progress_bar(math.max(UiScale.dp(44, 38, 68), math.floor(cover_w * .86)), download_h, download_progress),
@@ -1011,7 +1023,7 @@ local function action_button(entry, width, height)
     local body = VerticalGroup:new{
         align = "center",
         home_action_icon(tostring(entry.icon_key or entry.icon or "•"), width, icon_h, enabled),
-        VerticalSpan:new{height = gap_h},
+        VerticalSpan:new{width = gap_h},
         CenterContainer:new{
             dimen = Geom:new{w = width, h = label_h},
             TextWidget:new{
@@ -1918,7 +1930,9 @@ function HomeWidget:_remember_section_layer(cache_id,layer,region,slots)
     }
     local count=0
     for _ in pairs(self._section_layer_cache) do count=count+1 end
-    local max_layers=math.max(1,tonumber(Config.HOME_SECTION_CACHE_LAYERS) or 3)
+    -- 每层缓存是一整块屏幕大小的图层（1072x1448 @32bpp ≈ 6MB），
+    -- 低内存设备只保留当前节，切节时重排一次换取内存。
+    local max_layers=math.max(1,tonumber(Memory.section_cache_layers()) or tonumber(Config.HOME_SECTION_CACHE_LAYERS) or 3)
     while count>max_layers do
         local oldest_id,oldest_entry
         for id,entry in pairs(self._section_layer_cache) do

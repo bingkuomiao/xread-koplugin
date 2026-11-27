@@ -827,6 +827,10 @@ function CatalogView:onCloseWidget()
 
     self._closed = true
 
+    -- 目录页每次翻页都整页重建，旧页的封面 Blitbuffer 归 widget 所有，
+    -- 不在这里回收就会一直堆着（翻几十页后低内存设备明显变卡）。
+    UiKit.release_tree(self[1])
+
 end
 
 function CatalogView:onClose()

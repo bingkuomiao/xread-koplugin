@@ -59,4 +59,16 @@ function M.wrap_title(text, face, width)
     return lines[1] or "", lines[2] or ""
 end
 
+-- 递归释放一棵 widget 树。
+-- KOReader 的 UIManager:close() 只会给「被关的那个顶层 widget」发 CloseWidget，
+-- 不会遍历它的子控件；而 ImageWidget 解码出来的 Blitbuffer 是挂在子控件上的，
+-- 所以「关掉旧视图 + 建新视图」这种最普通的刷新会一直泄漏封面内存。
+-- 必须在确定不会再 paintTo 之后调用（close 之后、或重建时替换 self[1] 之前）。
+function M.release_tree(widget)
+    if not widget or widget == M then return end
+    if type(widget.free) == "function" then
+        pcall(widget.free, widget)
+    end
+end
+
 return M

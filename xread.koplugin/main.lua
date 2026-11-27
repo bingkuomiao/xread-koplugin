@@ -51,6 +51,8 @@ local GridShelf = require("xread.shelf_grid")
 -- miuread 视觉层（第一步：书架 / 第二步：首页 / 第三步：阅读工具栏）；数据层仍走 xread.client
 local MiuiShelf = require("xread.miui.full_shelf_view")
 local MiuiHome = require("xread.miui.home_view")
+local Repaint = require("xread.miui.repaint")
+local MiuiUtil = require("xread.miui.util")
 local ReaderToolbar = require("xread.miui.reader_toolbar")
 local CatalogView = require("xread.catalog_view")
 local QuickPanel = require("xread.quick_panel")
@@ -1000,6 +1002,11 @@ function XRead:init()
         autotest_go(function()
             self:openHome()
             print("[XREAD_AUTOTEST] mode=home done")
+            -- 首页上下文的验收 flow（书架/布局/旋转/搜索），不依赖已开书
+            local home_flow = os.getenv("XREAD_AUTOTEST_FLOW")
+            if home_flow and home_flow ~= "" then
+                self:_runHomeAutotestFlow(home_flow)
+            end
         end)
     elseif autotest == "update" then
         -- 在线热更新全流程验收：依赖 XREAD_UPDATER_URL 指向测试更新服务
@@ -1250,6 +1257,14 @@ function XRead:testConnection()
         local good = ok and type(res) == "table" and res.isSuccess ~= false
         if good then
             logger.info("xread health ok", ms, "ms")
+            -- 连接成功：立刻把顶部「已断开」纠正为「已连接」，别等下一轮心跳。
+            -- 原来只弹提示，头部要等 60s 一轮的心跳或手动刷新才变，于是出现
+            -- 「弹窗说已连接、顶部却显示已断开」的矛盾。
+            self._health_ok = true
+            self:clearBackendDown()
+            if self._home_view and not self._home_view._miu_closed then
+                pcall(function() self._home_view:updateHeader{ sync_text = _("已连接") } end)
+            end
             -- 成功也给回执：结论 + 地址 + 耗时，能判断是否连错了机器
             self:showInfo(T(_("已连接：%1（%2 ms）"), addr, tostring(ms)), 6)
             if os.getenv("XREAD_AUTOTEST") then print("[XREAD_AUTOTEST] health_ok") end
@@ -1432,13 +1447,212 @@ function XRead:openHome()
     end)
 end
 -- 首页顶栏信息（昵称等）保存后，若首页正开着就立即重建（实时生效）
-function XRead:_refreshHomeIfOpen()
-    if self._home_view and not self._home_view._miu_closed then
-        self:_stopHomeTicker()
-        UIManager:close(self._home_view)
-        self._home_view = nil
-        pcall(function() self:showHome(self._home_shelf_page or 1) end)
+-- 首页上下文的验收 flow。
+-- 阅读器里的 flow 走 XRead:init() 里 self.ui.document 那一支；书架/首页/布局
+-- 这几类验收没有已开文档，必须在 XREAD_AUTOTEST=home 之后单独跑。
+function XRead:_runHomeAutotestFlow(flow)
+    flow = tostring(flow or "")
+    local function mark(tag) print("[XREAD_AUTOTEST] " .. tag) end
+    if flow == "display_size" then
+        -- 三档界面字号依次重建首页：验证 compact/standard/large 都不溢出、不崩。
+        -- 这是 UiScale 唯一会改变全局几何的开关，改动布局常量时必须跑一遍。
+        UIManager:scheduleIn(4, function()
+            local UiScale = require("xread.miui.ui_scale")
+            local modes = { "standard", "compact", "large" }
+            local i = 0
+            local step
+            step = function()
+                i = i + 1
+                if i > #modes then
+                    UiScale.setDisplayMode("standard")
+                    mark("flow=display_size done")
+                    return
+                end
+                local mode = modes[i]
+                UiScale.setDisplayMode(mode)
+                pcall(function()
+                    if self._home_view then
+                        UIManager:close(self._home_view)
+                        self._home_view = nil
+                    end
+                    self:showHome(1)
+                end)
+                mark("flow=display_size mode=" .. mode
+                    .. " sw=" .. tostring(Screen:getWidth())
+                    .. " sh=" .. tostring(Screen:getHeight()))
+                UIManager:scheduleIn(4, step)
+            end
+            step()
+        end)
+    elseif flow == "rotate" then
+        -- 横屏/竖屏各重建一次首页：布局必须按新尺寸重算，封面不能越界。
+        UIManager:scheduleIn(6, function()
+            local function rebuild()
+                if self._home_view then
+                    UIManager:close(self._home_view)
+                    self._home_view = nil
+                end
+                pcall(function() self:showHome(1) end)
+            end
+            pcall(function() Screen:setRotationMode(1) end)
+            UIManager:scheduleIn(3, function()
+                rebuild()
+                UIManager:scheduleIn(4, function()
+                    mark("flow=rotate landscape=" .. tostring(Screen:getWidth())
+                        .. "x" .. tostring(Screen:getHeight()))
+                    pcall(function() Screen:setRotationMode(0) end)
+                    UIManager:scheduleIn(3, function()
+                        rebuild()
+                        UIManager:scheduleIn(4, function()
+                            mark("flow=rotate done portrait=" .. tostring(Screen:getWidth())
+                                .. "x" .. tostring(Screen:getHeight()))
+                        end)
+                    end)
+                end)
+            end)
+        end)
+    elseif flow == "layout_edge" then
+        -- 边界数据：超长书名 / 空作者 / 无封面 / 进度 0 / 超过一页，
+        -- 直接用假 books 开全屏书架，不依赖后端。
+        UIManager:scheduleIn(5, function()
+            local books = {}
+            for i = 1, 13 do
+                books[i] = {
+                    bookUrl = "edge://" .. tostring(i),
+                    title = (i == 1) and string.rep("超长书名压测", 10) or ("边界书 " .. tostring(i)),
+                    author = (i == 2) and "" or ("作者" .. tostring(i)),
+                    progress = (i == 3) and 0 or ((i * 7) % 101),
+                }
+            end
+            local ok, view = pcall(function()
+                return MiuiShelf.show{
+                    books = books,
+                    title = _("边界测试"),
+                    page = 1,
+                    show_actions = true,
+                    on_back = function(v) pcall(function() UIManager:close(v) end) end,
+                }
+            end)
+            self._edge_view = ok and view or nil
+            mark("flow=layout_edge done ok=" .. tostring(ok) .. " n=" .. tostring(#books))
+        end)
+    elseif flow == "shelf_paging" then
+        -- 全屏书架翻页：每页重建整棵树，验证旧树被释放后不崩、翻页数正确。
+        UIManager:scheduleIn(5, function()
+            local books = {}
+            for i = 1, 30 do
+                books[i] = {
+                    bookUrl = "page://" .. tostring(i),
+                    title = "翻页测试 " .. tostring(i),
+                    author = "作者",
+                    progress = i % 100,
+                }
+            end
+            local ok, view = pcall(function()
+                return MiuiShelf.show{
+                    books = books,
+                    title = _("翻页测试"),
+                    page = 1,
+                    show_actions = true,
+                    on_back = function(v) pcall(function() UIManager:close(v) end) end,
+                }
+            end)
+            self._paging_view = ok and view or nil
+            mark("flow=shelf_paging open ok=" .. tostring(ok)
+                .. " pages=" .. tostring(ok and view and view.pages or 0))
+            if not ok or not view then return end
+            UIManager:scheduleIn(3, function()
+                pcall(function() view:_change_page(1) end)
+                UIManager:scheduleIn(3, function()
+                    pcall(function() view:_change_page(1) end)
+                    UIManager:scheduleIn(3, function()
+                        pcall(function() view:_change_page(-1) end)
+                        UIManager:scheduleIn(2, function()
+                            mark("flow=shelf_paging done page=" .. tostring(view.page)
+                                .. " pages=" .. tostring(view.pages))
+                        end)
+                    end)
+                end)
+            end)
+        end)
+    elseif flow == "memory_info" then
+        -- 内存档位与缓存策略快照（供 XREAD_MEM_TIER=low 的低内存路径验收）
+        UIManager:scheduleIn(3, function()
+            local Memory = require("xread.miui.memory")
+            Memory.reset()
+            mark("flow=memory_info " .. Memory.describe())
+        end)
+    elseif flow == "search_panel" then
+        -- 搜索加书入口：只验 UI（输入框 + 取消/搜索按钮），不发请求。
+        UIManager:scheduleIn(5, function()
+            local ok = pcall(function() self:searchAndAddBook() end)
+            mark("flow=search_panel done ok=" .. tostring(ok))
+            -- 留足时间让测试先截图再关闭（之前 3s 关掉，截图只剩首页）
+            UIManager:scheduleIn(14, function()
+                local top = UIManager:getTopmostVisibleWidget()
+                mark("flow=search_panel top=" .. tostring(top and (top.name or top.id or "widget") or "nil")
+                    .. " shown=" .. tostring(top ~= nil))
+                pcall(function() if top then UIManager:close(top) end end)
+            end)
+        end)
+    elseif flow == "test_conn" then
+        -- 验收：首页顶部「已断开」时点「测试连接」，成功后顶部应立即变「已连接」，
+        -- 而不是等下一轮 60s 心跳或手动刷新（见 testConnection 成功分支的 header 回写）。
+        UIManager:scheduleIn(5, function()
+            self._health_ok = false
+            pcall(function()
+                if self._home_view then self._home_view:updateHeader{ sync_text = _("已断开") } end
+            end)
+            mark("flow=test_conn disconnected")
+            UIManager:scheduleIn(2, function()
+                self:testConnection()
+                UIManager:scheduleIn(6, function()
+                    mark("flow=test_conn health_ok=" .. tostring(self._health_ok))
+                    mark("flow=test_conn done")
+                end)
+            end)
+        end)
+    else
+        mark("flow=unknown name=" .. flow)
     end
+end
+
+-- 首页整页重建的最小间隔。
+-- 保存设置/切账号/同步进度这几条路径都会调 _refreshHomeIfOpen，用户很快
+-- 连做两步时（改地址→保存，再改昵称→保存）原来会连续重建两次整页：
+-- 每次都要关掉旧首页、重新 prepareCovers、重新排整棵树，PW3 上肉眼可见地
+-- 顿一下并黑闪。间隔内的请求合并成一次延迟重建，用户看到的是「保存后一次刷新」。
+local HOME_REBUILD_MIN_INTERVAL = 0.6
+
+local function precise_now()
+    local ok, socket = pcall(require, "socket")
+    if ok and socket and socket.gettime then return socket.gettime() end
+    return os.time()
+end
+
+function XRead:_rebuildHomeNow()
+    if not (self._home_view and not self._home_view._miu_closed) then return end
+    self._home_rebuild_at = precise_now()
+    self:_stopHomeTicker()
+    UIManager:close(self._home_view)
+    self._home_view = nil
+    pcall(function() self:showHome(self._home_shelf_page or 1) end)
+end
+
+function XRead:_refreshHomeIfOpen()
+    if not (self._home_view and not self._home_view._miu_closed) then return end
+    local now = precise_now()
+    local last = tonumber(self._home_rebuild_at) or 0
+    local elapsed = now - last
+    if elapsed < HOME_REBUILD_MIN_INTERVAL then
+        -- 刚重建过：撤销上一个待执行的合并重建，按最新状态再排一次
+        Repaint.debounce("home.rebuild", HOME_REBUILD_MIN_INTERVAL - elapsed, function()
+            self:_rebuildHomeNow()
+        end)
+        return
+    end
+    Repaint.cancel("home.rebuild")
+    self:_rebuildHomeNow()
 end
 -- 最近阅读卡片右上角刷新：只更新 hero 一张卡，不重建整页、不打断心跳/封面循环。
 -- 与现有「更新」按钮（整页重建）和 30s 心跳（只刷时间/连接）职责分离；
@@ -2325,9 +2539,10 @@ function XRead:_makeHeroInfo(hero_book, cover_paths)
             "bookIntro", "introduction", "brief", "introText" }) do
         local v = tostring(hero_book[key] or "")
         if v ~= "" then
-            v = v:gsub("<[^>]+>", " "):gsub("&nbsp;", " ")
-                :gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-            if v ~= "" then intro_text = v break end
+            -- 后端简介常带 HTML 标签与实体；`&;`、`&#8203;`、`&nbsp;` 这类
+            -- 如果不清掉，首页会直接显示成一串 "&; &; &;"。
+            local clean = MiuiUtil.plain_text(v)
+            if clean ~= "" then intro_text = clean break end
         end
     end
     hero.description = intro_text
@@ -4771,11 +4986,41 @@ function XRead:showAboutPanel()
         self._about_panel_loading = false
         self:_showAboutPanel()
     end)
-    -- 后台补后端版本：拿到后就地改那一行文字
-    if not self:_backendUsable() then return end
-    self:_scheduleNetJob(0.2, function()
+    -- 后台补后端版本：拿到后就地改那一行文字。
+    -- 注意不能走 _scheduleNetJob：它会在「有弹层时让路」，而「关于本机」面板
+    -- 本身就是弹层，于是版本请求永远排不上队，界面一直停在「检测中…」。
+    -- 这里直接用 scheduleIn，getServerVersion 的 2.5s 超时阻塞可接受（用户在等结果）。
+    -- 也不因短暂冷却期就跳过：用户主动点开就是想看版本，给一次强制尝试。
+    UIManager:scheduleIn(0.3, function()
+        -- getVersionUpdate 需要 accessToken；首页有缓存时 openHome 会直接渲染不登录，
+        -- 此时 client 还没有 token。账号密码已配置的话先静默补一次登录，再取版本。
+        if self.client.accessToken == nil then
+            local user = tostring(self:getSetting("username", "") or "")
+            local pass = tostring(self:getSetting("password", "") or "")
+            if user ~= "" and pass ~= "" then
+                pcall(function()
+                    self.client.address = self:backendAddress()
+                    self.client:login(user, pass)
+                    self._token_addr = self:backendAddress()
+                    self._token_user = user
+                end)
+            end
+        end
         local v = self.client:getServerVersion()
-        if not v then return end
+        if not v then
+            -- 拿不到时把「检测中…」就地改成「未知」，别一直挂着让人以为还在转
+            self._about_info = self._about_info or {}
+            self._about_info.server_v = nil
+            local row = self._about_server_row
+            if row and row.text_widget and not row._miu_closed then
+                pcall(function()
+                    row.text_widget:setText(T(_("后端版本：%1"), _("未知")))
+                    if self._more_panel_view then UIManager:setDirty(self._more_panel_view, "ui") end
+                end)
+            end
+            if os.getenv("XREAD_AUTOTEST") then print("[XREAD_AUTOTEST] about_server_version nil") end
+            return
+        end
         self._about_info = self._about_info or {}
         self._about_info.server_v = v
         local row = self._about_server_row

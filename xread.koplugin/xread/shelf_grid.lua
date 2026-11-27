@@ -51,6 +51,7 @@ local _             = require("gettext")
 
 local T             = require("ffi/util").template
 local UiKit = require("xread.miui.ui_kit")
+local Memory = require("xread.miui.memory")
 local GridShelf = FocusManager:extend{
 
     books = nil,
@@ -193,6 +194,8 @@ function CoverCell:init()
                 width = L.cover_w,
 
                 height = L.cover_h,
+
+                file_do_cache = Memory.cover_do_cache(),
 
             }
 
@@ -616,6 +619,10 @@ function GridShelf:init()
 
     table.insert(focus_rows, self._page_buttons)
 
+    -- 旧树必须在替换成新树之前释放：ImageWidget 的解码结果在
+    -- file_do_cache=false 时归 widget 所有，不释放就随每次翻页累积。
+    local previous_root = self[1]
+
     self[1] = FrameContainer:new{
 
         background = Blitbuffer.COLOR_WHITE,
@@ -641,6 +648,12 @@ function GridShelf:init()
     self.layout = focus_rows
 
     self._focus_rows = focus_rows
+
+    if previous_root and previous_root ~= self[1] and type(previous_root.free) == "function" then
+
+        pcall(previous_root.free, previous_root)
+
+    end
 
     -- 触摸为主的设备不预设焦点，避免打开时第一本被灰底高亮。
 

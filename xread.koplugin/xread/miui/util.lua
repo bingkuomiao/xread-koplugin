@@ -136,6 +136,31 @@ function U.safe_name(s,f) local v=U.trim(tostring(s or ""):gsub("[%z%c/\\:%*%?\"
 function U.id_name(s) local v=tostring(s or ""):gsub("[^%w%._%-]","_"); return v~="" and v or "unknown" end
 function U.xml(s) return (tostring(s or ""):gsub("&","&amp;"):gsub("<","&lt;"):gsub(">","&gt;"):gsub('"',"&quot;"):gsub("'","&apos;")) end
 function U.url_decode(s) return (tostring(s or ""):gsub("+"," "):gsub("%%(%x%x)",function(h) return string.char(tonumber(h,16)) end)) end
+-- 把后端返回的富文本简介压成纯文本：去标签、解实体、折空白。
+-- 实际数据里踩到过的坑（都会原样画到首页上）：
+--   · "& ; & ; ..."  —— '&' 与 ';' 之间夹了空格，残缺实体；
+--   · "&lrm;\n正文"  —— 命名实体 + 换行；
+--   · "<p>…</p>", "&nbsp;", "&#8203;"（零宽空格，直接写成 UTF-8）。
+function U.plain_text(s)
+    local v = tostring(s or "")
+    if v == "" then return "" end
+    -- 先清零宽字符：它们肉眼不可见，但会让后面所有实体匹配失手。
+    -- U+200B/200C/200D/2060/FEFF，按 UTF-8 字节序列匹配。
+    v = v:gsub("\226\128\139", ""):gsub("\226\128\140", "")
+        :gsub("\226\128\141", ""):gsub("\226\129\160", "")
+        :gsub("\239\187\191", "")
+    v = v:gsub("<[^>]+>", " ")
+        :gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
+        :gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'")
+        :gsub("&#%d+;", " "):gsub("&#[xX]%x+;", " ")
+        :gsub("&[#%w]+;", " ")
+        -- 后端数据里实际出现过 "& ;"（'&' 与 ';' 之间夹空格）这种残缺实体，
+        -- 只按 "&;" 匹配是清不掉的，这里连空格一起吞；末尾还可能只剩一个裸 '&'。
+        :gsub("&%s*;", " ")
+        :gsub("&%s*$", " ")
+        :gsub("%s+", " ")
+    return (v:gsub("^%s+", ""):gsub("%s+$", ""))
+end
 local function raw_file_exists(p)
     local f=io.open(p,"rb")
     if not f then return false end

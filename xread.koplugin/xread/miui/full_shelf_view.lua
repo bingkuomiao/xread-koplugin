@@ -21,6 +21,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UiScale = require("xread.miui.ui_scale")
 local U = require("xread.miui.util")
 local Ui = require("xread.miui.ui_components")
+local Memory = require("xread.miui.memory")
 
 local Screen = Device.screen
 
@@ -130,7 +131,7 @@ local function image_widget(path, width, height)
             width = width,
             height = height,
             scale_factor = 0,
-            file_do_cache = true,
+            file_do_cache = Memory.cover_do_cache(),
         }
         image:getSize()
         image.width = nil
@@ -150,19 +151,26 @@ local function image_widget(path, width, height)
     return rounded
 end
 
-local function placeholder(width, height, title, author)
+local function placeholder(width, height, title, author, top_inset)
     title = U.trim(tostring(title or "未命名"))
     author = U.trim(tostring(author or ""))
     if title == "" then title = "未命名" end
     local pad = UiScale.dp(3, 2, 5)
+    -- 右上角要画「已读/xx%」徽标时，标题必须避开它：原来两都画在同一块
+    -- 区域，长书名会直接压在百分比上，看起来像「铁血残1%」。
+    local reserve = math.max(0, tonumber(top_inset) or 0)
     local content_w = math.max(1, width - pad * 2)
-    local content_h = math.max(1, height - pad * 2)
+    local content_h = math.max(1, height - pad * 2 - reserve)
     local title_h = math.max(1, math.floor(content_h * (author ~= "" and .60 or .80)))
-    local body = VerticalGroup:new{align = "center", TextBoxWidget:new{
+    local body = VerticalGroup:new{align = "center"}
+    if reserve > 0 then
+        body[#body + 1] = VerticalSpan:new{width = reserve}
+    end
+    body[#body + 1] = TextBoxWidget:new{
         text = U.utf8_truncate(title, 24, "…"), face = face("cfont", 10.8, 15.5), bold = true,
         width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = title_h,
         height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
-    }}
+    }
     if author ~= "" then
         body[#body + 1] = TextBoxWidget:new{
             text = U.utf8_truncate(author, 18, "…"), face = face("smallinfofont", 7.8, 10.8),
@@ -201,29 +209,31 @@ local function book_card(book, width, height, on_select, on_hold)
     local gap = UiScale.dp(3, 2, 5)
     local cover_h = math.max(UiScale.dp(116, 98, 190), height - title_h - gap)
     local cover_w = math.max(UiScale.dp(76, 65, 126), math.min(math.floor(width * .92), math.floor(cover_h * .715)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h) or placeholder(cover_w, cover_h, book.title, book.author)
-    local layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
-    layer[#layer + 1] = cover
-
+    local badge_h = UiScale.dp(18, 16, 25)
+    local badge_inset = UiScale.dp(3, 2, 5)
+    local progress = math.max(0, math.min(100, tonumber(book.progress) or 0))
     local status = U.trim(tostring(book.status_text or book.download_status or ""))
     local downloaded = book.generated == true or book.downloaded == true
         or tostring(book.shelf_section or "") == "generated"
         or status == "已生成" or status == "已下载"
         or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))
-    local progress = math.max(0, math.min(100, tonumber(book.progress) or 0))
+    -- 有徽标时把占位封面的文字往下让，避免书名压在百分比上
+    local badge_reserve = (downloaded or progress > 0) and (badge_h + badge_inset * 2) or 0
+    local cover = image_widget(book.cover_path, cover_w, cover_h)
+        or placeholder(cover_w, cover_h, book.title, book.author, badge_reserve)
+    local layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
+    layer[#layer + 1] = cover
+
     if downloaded then
         local badge = UiScale.dp(20, 18, 28)
-        local inset = UiScale.dp(3, 2, 5)
-        layer[#layer + 1] = OffsetContainer:new{x_off = inset, y_off = inset, outlined_badge("✓", badge, badge)}
+        layer[#layer + 1] = OffsetContainer:new{x_off = badge_inset, y_off = badge_inset, outlined_badge("✓", badge, badge)}
     end
     if progress > 0 then
         local text = progress >= 100 and "已读" or tostring(math.floor(progress + .5)) .. "%"
         local badge_w = math.max(UiScale.dp(29, 25, 43), U.utf8_len(text) * UiScale.dp(7.4, 6.4, 10) + UiScale.dp(10, 8, 14))
-        local badge_h = UiScale.dp(18, 16, 25)
-        local inset = UiScale.dp(3, 2, 5)
         layer[#layer + 1] = OffsetContainer:new{
-            x_off = math.max(0, cover_w - badge_w - inset),
-            y_off = inset,
+            x_off = math.max(0, cover_w - badge_w - badge_inset),
+            y_off = badge_inset,
             outlined_badge(text, badge_w, badge_h),
         }
     end
@@ -231,7 +241,7 @@ local function book_card(book, width, height, on_select, on_hold)
     local body = VerticalGroup:new{
         align = "center",
         layer,
-        VerticalSpan:new{height = gap},
+        VerticalSpan:new{width = gap},
         TextBoxWidget:new{
             text = tostring(book.title or "未命名"),
             face = face("cfont", 11.6, 16.5),
@@ -417,7 +427,15 @@ function GridShelfWidget:_build()
         }, self.page < self.pages and function() self:_change_page(1) end or nil),
     }
     self:_add(layers, margin, sh - margin - footer_h, footer)
+    -- 每次翻页/刷新都重建整棵树。旧树不释放的话，它下面的每张封面
+    -- Blitbuffer 都会一直挂着（file_do_cache=false 时归 widget 所有），
+    -- PW3 上翻十几页就能把可用内存吃光。free() 在 WidgetContainer 上是
+    -- 递归的，一次调用即可回收整棵树。
+    local previous = self[1]
     self[1] = layers
+    if previous and previous ~= layers and type(previous.free) == "function" then
+        pcall(previous.free, previous)
+    end
 end
 
 function GridShelfWidget:init()
