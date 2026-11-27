@@ -569,17 +569,34 @@ function XRead:markBackendDown(reason)
     self._backend_down = { at = os.time(), reason = tostring(reason or "") }
 end
 
---- 统一的后端不可达提示：说清楚「连的是哪台、为什么、去哪改」
+--- 后端类问题的统一弹窗：与「移除书籍」确认框同一张居中卡片，
+--- 底部固定「取消 / 修改」，点修改直达地址管理；右上角另有 ✕ 关闭。
+--- 这样用户看到「连不上」就能一键去修，而不是只给一句无从下手的提示。
+function XRead:showBackendIssue(opts)
+    opts = opts or {}
+    MessageBox.confirm{
+        title = opts.title or _("连不上服务器"),
+        text = opts.text or "",
+        sticky = true,
+        cancel_text = _("取消"),
+        ok_text = _("修改"),
+        callback = function(ok)
+            if ok then self:showServerManage() end
+        end,
+    }
+end
+
+--- 统一的后端不可达提示：说清楚「连的是哪台、为什么」，并给可操作的按钮
 function XRead:notifyBackendDown(reason, silent)
     self:markBackendDown(reason)
-    local msg = T(_("无法连接后端 %1\n原因：%2\n\n请检查「阅读X → 地址管理」里的地址和端口，\n以及后端服务是否已启动。"),
+    local msg = T(_("连不上 %1：%2\n可以先看缓存内容；点「修改」检查地址和端口。"),
         display_address(self:backendAddress()), readable_error(reason))
     logger.warn("xread backend unreachable:", self:backendAddress(), tostring(reason))
     if os.getenv("XREAD_AUTOTEST") then
         print("[XREAD_AUTOTEST] backend_down " .. tostring(reason))
     end
     if not silent then
-        self:showInfo(msg, 10)
+        self:showBackendIssue{ title = _("无法连接后端"), text = msg }
     end
 end
 
@@ -599,18 +616,16 @@ end
 function XRead:notifyBackendSoftDownOnce()
     if self._home_soft_down_notified then return end
     -- 不依赖 openHome 是否走过（从书里返回首页走 showHome），直接看本地缓存：
-    -- 有缓存 = 之前连通过，这次连不上才需要软提示；无缓存时 withBackend 会弹窗。
+    -- 有缓存 = 之前连通过，这次连不上才提示；无缓存时 withBackend 会弹窗。
     local cached = self.meta_cache:getShelf(nil)
     if not cached or #cached == 0 then return end
     self._home_soft_down_notified = true
-    local ok, Notification = pcall(require, "ui/widget/notification")
-    if not (ok and Notification and Notification.notify) then return end
-    -- Notification 是单行横幅、不折行：文案必须短，长地址会溢出被截断。
-    -- 顶部状态本身可点进地址管理，所以这里只给「去哪改」的极简引导。
-    local msg = _("后端连不上，当前显示缓存书架 · 点顶部改地址")
-    -- 必须显式给 SOURCE_ALWAYS_SHOW：notify() 不传 source 时会被默认显示掩码
-    -- 过滤掉（SOURCE_OTHER 不在 mask 里），提示就被静默吞了。
-    pcall(function() Notification:notify(msg, Notification.SOURCE_ALWAYS_SHOW) end)
+    -- 与「移除书籍」确认框同一张居中卡片：说明现状 + 给出路，
+    -- 点「修改」直达地址管理，点「取消」或 ✕ 则继续看缓存书架。
+    self:showBackendIssue{
+        title = _("后端连不上"),
+        text = _("当前显示的是缓存书架，仍可正常阅读。\n点「修改」改地址，或稍后再试。"),
+    }
     if os.getenv("XREAD_AUTOTEST") then print("[XREAD_AUTOTEST] soft_backend_down") end
 end
 
@@ -622,7 +637,10 @@ function XRead:withBackend(fn, opts)
     opts = opts or {}
     local addr = self:backendAddress()
     if addr == "" or addr:match("^%s*$") then
-        self:showInfo(_("还没有设置后端地址。\n到「更多 → 地址管理」填写 IP 和端口。"), 8)
+        self:showBackendIssue{
+            title = _("还没有设置后端地址"),
+            text = _("现在显示的是本地缓存，填好地址就能同步书架。\n点「修改」填写 IP 和端口。"),
+        }
         return false
     end
 
@@ -1138,7 +1156,10 @@ function XRead:init()
             -- 验收：统一提示框样式（白底 + 2px 黑边 + 居中文字）
             UIManager:scheduleIn(4, function()
 
-                self:showInfo(_("首页加载失败\n请检查后端地址和账号"), 60)
+                self:showBackendIssue{
+                    title = _("首页加载失败"),
+                    text = _("暂时取不到书架，可以先看本地缓存。\n点「修改」检查地址和账号。"),
+                }
 
                 autotest_mark("flow=msgbox done")
 
@@ -1152,6 +1173,7 @@ function XRead:init()
                 MessageBox.confirm{
 
                     text = _("移除「老子是马超」？\n服务器书架、服务器缓存和本地缓存都会删除。"),
+
 
                     ok_text = _("移除"),
 
@@ -1192,9 +1214,9 @@ function XRead:init()
 
         elseif flow == "soft_down" then
 
-            -- 验收：有缓存首页 + 后端不可达 → 首页照常渲染，软提示只发一次。
+            -- 验收：有缓存首页 + 后端不可达 → 首页照常渲染，居中卡片提示只发一次。
             -- 只在本次进程里覆盖 backendAddress（不写盘、不污染后续用例），
-            -- 指向本机 1 端口必然 TCP 失败；延长通知时长仅为便于截图。
+            -- 指向本机 1 端口必然 TCP 失败。
             UIManager:scheduleIn(4, function()
 
                 self.backendAddress = function() return "http://127.0.0.1:1" end
@@ -1202,9 +1224,6 @@ function XRead:init()
                 self._backend_down = nil
                 self._home_soft_down_notified = nil
                 self._health_ok = nil
-
-                local okN, Notification = pcall(require, "ui/widget/notification")
-                if okN and Notification then Notification.timeout = 120 end
 
                 self:closeBookToHome()
 
@@ -2205,7 +2224,12 @@ function XRead:refreshRecentBook()
     self:runQuiet(function()
         local ok, books = pcall(function() return self.client:getBookshelf(true) end)
         if not ok or type(books) ~= "table" or #books == 0 then
-            UIManager:nextTick(function() self:showInfo(_("刷新最近阅读失败，请检查服务端")) end)
+            UIManager:nextTick(function()
+                self:showBackendIssue{
+                    title = _("刷新失败"),
+                    text = _("最近阅读暂时取不到，先看缓存内容。\n点「修改」检查地址和服务端。"),
+                }
+            end)
             return
         end
 
@@ -2286,7 +2310,10 @@ function XRead:syncProgressFromHome()
 
         if not ok_remote or type(remote) ~= "table" then
 
-            self:showInfo(_("同步失败，请检查服务端"))
+            self:showBackendIssue{
+                title = _("同步失败"),
+                text = _("这次没同步成功，缓存书架仍可阅读。\n点「修改」检查地址和服务端。"),
+            }
 
             return
 
@@ -2560,7 +2587,12 @@ function XRead:buildHomeActions()
 
                     self:showHome(self._home_shelf_page or 1)
 
-                    UIManager:nextTick(function() self:showInfo(_("更新失败，显示本地缓存书架")) end)
+                    UIManager:nextTick(function()
+                        self:showBackendIssue{
+                            title = _("更新失败"),
+                            text = _("书架暂时更新不了，当前显示缓存内容。\n点「修改」检查地址和服务端。"),
+                        }
+                    end)
 
                 end
 
@@ -2689,7 +2721,10 @@ function XRead:showHome(page)
 
             else
 
-                self:showInfo(_("首页加载失败\n请检查后端地址和账号"), 8)
+                self:showBackendIssue{
+                    title = _("首页加载失败"),
+                    text = _("暂时取不到书架，可以先看本地缓存。\n点「修改」检查地址和账号。"),
+                }
 
             end
 
@@ -2707,7 +2742,10 @@ function XRead:showHome(page)
 
     if not books or #books == 0 then
 
-        self:showInfo(_("首页加载失败：书架为空或获取失败"))
+        self:showBackendIssue{
+            title = _("首页加载失败"),
+            text = _("书架暂时是空的，可能还没同步。\n点「修改」检查地址和账号。"),
+        }
 
         return
 
@@ -3081,7 +3119,10 @@ function XRead:showBookshelf(page, cached_books)
 
     if not ok then
 
-        self:showInfo(_("获取书架失败：") .. tostring(books))
+        self:showBackendIssue{
+            title = _("获取书架失败"),
+            text = tostring(books) .. "\n" .. _("点「修改」检查地址和服务端。"),
+        }
 
         -- 书架没开起来：恢复首页心跳（openShelf 开头为让路停掉了它）
         local home = self._home_view

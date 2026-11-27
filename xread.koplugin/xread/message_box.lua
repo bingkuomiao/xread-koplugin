@@ -23,6 +23,9 @@ local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
+local OverlapGroup = require("ui/widget/overlapgroup")
+local RightContainer = require("ui/widget/container/rightcontainer")
+local UICommon = require("xread/ui_common")
 local Screen = Device.screen
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
@@ -150,11 +153,20 @@ local Box = InputContainer:extend{
     dismissable = true,
     full_refresh = false,
     on_close = nil,
+    -- sticky=true：这类卡片要等用户亲自处理（取消/修改/✕），
+    -- 不能被后台任务的普通 showInfo 顶掉。
+    sticky = false,
     _miuread_transient = true,
-    _miuread_modal_surface = false,
+    _miuread_modal_surface = true,
 }
 
 function Box:init()
+    -- 置顶卡片（后端不可达等）在首页停留：首页的尺寸刷新会主动关闭
+    -- _miuread_transient 的浮层，必须把自己标成非瞬态的模态表面；
+    -- 同时首页也就不会在延迟重绘时盖到这张卡片上面。
+    if self.sticky then
+        self._miuread_transient = false
+    end
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     self.full_dimen = Geom:new{ x = 0, y = 0, w = sw, h = sh }
     self.dimen = self.full_dimen
@@ -166,6 +178,10 @@ function Box:init()
     local inner_w = card_w - pad * 2
     local face_body = Font:getFace("cfont", FACE_BODY)
     local content = VerticalGroup:new{ align = "center" }
+
+    -- 顶部给 ✕ 预留一行，正文整体下移，避免文字压到关闭按钮
+    local close_w = UICommon.closeButtonSize()
+    content[#content + 1] = VerticalSpan:new{ width = close_w }
 
     -- 标题 + 分隔线（可选）
     if self.title and self.title ~= "" then
@@ -229,11 +245,24 @@ function Box:init()
         content,
     }
 
+    -- 右上角关闭按钮：与其它弹窗同一套纯黑 ✕，叠在内容层之上贴右上角内侧。
+    -- 正文已在顶部预留一行，两者不重叠。
+    local close_mark = UICommon.closeButtonAtEdge(function() self:close() end, 0)
+    local layered = OverlapGroup:new{
+        dimen = Geom:new{ w = inner_w, h = content:getSize().h },
+        allow_mirroring = false,
+        holder,
+        RightContainer:new{
+            dimen = Geom:new{ w = inner_w, h = close_w },
+            close_mark,
+        },
+    }
+
     local card = FrameContainer:new{
         bordersize = 2, color = C_LINE,
         background = C_BG, radius = 8,
         padding = pad, margin = 0,
-        holder,
+        layered,
     }
 
     -- 略高于正中，不压住底部工具栏 / 页码
@@ -278,6 +307,8 @@ function M.show(opts)
     opts = opts or {}
     local text = tostring(opts.text or "")
     if text == "" and not (opts.title and opts.title ~= "") then return nil end
+    -- 后端不可达这类卡片必须等用户处理，后台失败提示不能把它冲掉
+    if live and live.sticky then return nil end
 
     M.close()
 
@@ -289,6 +320,7 @@ function M.show(opts)
             dismissable = opts.dismissable ~= false,
             full_refresh = opts.full_refresh == true,
             on_close = opts.on_close,
+            sticky = opts.sticky == true,
         }
     end)
     if not ok or not box then
@@ -298,6 +330,9 @@ function M.show(opts)
 
     live = box
     UIManager:show(box)
+    -- sticky 卡片出现在首页时，首页可能还有排队的 dirty 回调；
+    -- 只靠 show() 的标脏会被随后一次首页重绘盖住，这里补一次整屏刷新。
+    if box.sticky then UIManager:setDirty("all", "full") end
 
     local timeout = tonumber(opts.timeout)
     if timeout and timeout > 0 then
@@ -334,6 +369,7 @@ function M.confirm(opts)
         timeout = nil,
         dismissable = false,
         full_refresh = opts.full_refresh == true,
+        sticky = opts.sticky == true,
         buttons = {
             { text = opts.cancel_text or "取消", callback = function() finish(false) end },
             { text = opts.ok_text or "确定", callback = function() finish(true) end },
