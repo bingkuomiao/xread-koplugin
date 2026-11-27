@@ -148,9 +148,9 @@ local function wrapTitle(text, face, width)
 end
 -- 章节行：一列排布，行之间留一条细缝（列表区底色透出来当缝）。
 -- 白天的三档状态：
---   · 当前章 / 选中章：黑底白字（当前章加粗）
---   · 已预加载：深灰底(GRAY_6)白字；预加载完成后加粗
---   · 其它：白底黑字
+--   · 当前章 / 选中章：黑底白字，仅这两类加粗
+--   · 已预加载：深灰底(GRAY_6)白字，常规字重（不再靠加粗区分）
+--   · 其它：白底黑字，常规字重
 -- 夜间是整屏反色，这里只写白天的源色即可：黑底→白底、深灰底→浅灰底、
 -- 白底→黑底，正好得到「白底黑字加粗 / 浅灰底黑字 / 黑底白字」的效果。
 local ChapterRow = InputContainer:extend{
@@ -172,8 +172,9 @@ end
 function ChapterRow:init()
     local pad = scaled(12)
     local bg, fg, border = self:colors()
-    -- 当前章始终加粗；预加载完成的章节靠加粗和「还在预加载」区分
-    local bold = self.is_current or self.cache_state == "cached"
+    -- 只有当前章、以及刚点选正要跳过去的那一章加粗；
+    -- 普通章（哪怕已预加载）一律常规字重，避免整列看起来都加粗。
+    local bold = self.is_current or self.is_selected
     local box_w = math.max(scaled(20), self.width)
     local box_h = math.max(scaled(20), self.height - self.gap)
 
@@ -668,7 +669,12 @@ function CatalogView:init()
             is_current = (bi - 1 == dur),
             is_selected = (selected ~= nil and bi == selected),
             cache_state = cache_state,
-            callback = function() if self.on_select then self.on_select(bi) end end,
+            callback = function()
+                -- 点中的这一章立刻记为「打算跳转的章节」，让它单独加粗；
+                -- 当前章由 is_current 负责，其它普通章保持常规字重。
+                self.selected_index = bi
+                if self.on_select then self.on_select(bi) end
+            end,
         }
         grid[#grid + 1] = row
         chapter_rows[#chapter_rows + 1] = row

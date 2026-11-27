@@ -330,7 +330,9 @@ function GridShelfWidget:_build()
     local back_w = UiScale.dp(54, 49, 78)
     local action_w = self.opts.show_actions and UiScale.dp(62, 56, 92) or 0
     local action_gap = self.opts.show_actions and UiScale.dp(5, 4, 8) or 0
-    local right_w = self.opts.show_actions and (action_w * 2 + action_gap) or 0
+    -- 本地阅读页隐藏左侧「统计」：右侧只留「返回」，标题可以占满腾出的宽度
+    local hide_left = self.opts.hide_left_action == true
+    local right_w = self.opts.show_actions and (action_w * (hide_left and 1 or 2) + (hide_left and 0 or action_gap)) or 0
     local title_gap = UiScale.dp(5, 4, 8)
     local title_w = math.max(1, inner_w - back_w - title_gap - right_w)
     local header = HorizontalGroup:new{
@@ -345,20 +347,22 @@ function GridShelfWidget:_build()
             }),
     }
     if self.opts.show_actions then
-        local left_label=tostring(self.opts.left_action_label or "")
         local right_label=tostring(self.opts.right_action_label or "筛选")
-        local left_child
-        if left_label=="" or left_label=="搜索" then
-            left_child=Ui.icon("search", action_w, header_h, UiScale.dp(19, 17, 27), {
-                face = UiScale.iconFace("cfont", 17, 24),
-            })
-        else
-            left_child=Ui.text(left_label, action_w, header_h, face("smallinfofont", 9.6, 13.5), {
-                bold=true, halign="center", valign="center",
-            })
+        if not hide_left then
+            local left_label=tostring(self.opts.left_action_label or "")
+            local left_child
+            if left_label=="" or left_label=="搜索" then
+                left_child=Ui.icon("search", action_w, header_h, UiScale.dp(19, 17, 27), {
+                    face = UiScale.iconFace("cfont", 17, 24),
+                })
+            else
+                left_child=Ui.text(left_label, action_w, header_h, face("smallinfofont", 9.6, 13.5), {
+                    bold=true, halign="center", valign="center",
+                })
+            end
+            header[#header + 1] = tappable(action_w, header_h, left_child, self.opts.on_left_action)
+            header[#header + 1] = HorizontalSpan:new{width = action_gap}
         end
-        header[#header + 1] = tappable(action_w, header_h, left_child, self.opts.on_left_action)
-        header[#header + 1] = HorizontalSpan:new{width = action_gap}
         header[#header + 1] = tappable(action_w, header_h,
             Ui.text(right_label, action_w, header_h, face("smallinfofont", 9.6, 13.5), {
                 bold = true, halign = "center", valign = "center",

@@ -331,7 +331,9 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     end
     local title_h = math.max(UiScale.dp(38, 34, 52), title_line_h * 2 + UiScale.dp(2, 1, 3))
     local progress_h = math.max(UiScale.dp(29, 26, 40), math.min(UiScale.dp(38, 33, 48), math.floor(inner_h * .11)))
-    local body_h = math.max(1, inner_h - title_h - progress_h - section_gap * 2)
+    -- 简介比书名多留一行高度，正文简介能多显示内容；相应压缩封面区，简介整体上移。
+    local intro_h = title_h + UiScale.dp(14, 12, 20)
+    local body_h = math.max(1, inner_h - intro_h - progress_h - section_gap * 2)
 
     local baseline_h = math.max(0, tonumber(shelf_cover_h) or 0)
     local baseline_w = math.max(0, tonumber(shelf_cover_w) or 0)
@@ -430,7 +432,8 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
         width = title_w, height = title_h, height_adjust = false,
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     }}
-    info_line(meta_line, intro_top, false)
+    -- 作者 · 书源：作者名加大加粗（用户反馈右上角详情里作者字太小）
+    info_line(meta_line, intro_top, true, mini and 9.8 or 10.6)
     if meta_line ~= "" then intro_top = intro_top + line_h + meta_gap end
     info_line(progress_line, intro_top, true)
     if progress_line ~= "" then intro_top = intro_top + line_h + meta_gap end
@@ -443,7 +446,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     local intro = TextBoxWidget:new{
         text = intro_text,
         face = face("smallinfofont", mini and 9.0 or 9.6, mini and 12.2 or 13.0, mini and 7.6 or 8.0),
-        width = inner_w, height = title_h, height_adjust = false,
+        width = inner_w, height = intro_h, height_adjust = false,
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     }
 
@@ -480,7 +483,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     end
     local intro_y = body_h + section_gap
     body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = intro_y, intro}
-    local progress_y = intro_y + title_h + section_gap
+    local progress_y = intro_y + intro_h + section_gap
     body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = progress_y, VerticalGroup:new{
         align = "left",
         Ui.textbox(progress_label, inner_w, progress_label_h,
@@ -1521,7 +1524,7 @@ local function dashboard_week_cells(stats, width, height)
     return VerticalGroup:new{align = "left", marks, labels}
 end
 
-local function dashboard_stats_card(title, stats, width, height, callback, expanded)
+local function dashboard_stats_card(title, stats, width, height, callback, expanded, body_callback)
     stats = type(stats) == "table" and stats or {}
     local pad = math.max(UiScale.dp(5, 4, 8), math.floor(math.min(width, height) * .025))
     local inner_w = math.max(1, width - pad * 2)
@@ -1585,6 +1588,19 @@ local function dashboard_stats_card(title, stats, width, height, callback, expan
         bordersize = UiScale.line("thin"), radius = UiScale.radius(9, 6, 15),
         padding = pad, background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_GRAY,
     }, body)
+    if type(body_callback) == "function" and type(callback) == "function" then
+        -- 卡片分两个热区：标题「本地阅读 ›」仍进本地书架；
+        -- 下面的时长/今日/打卡等数据区进阅读记录，不再整卡都跳本地书架。
+        local root = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+        root[1] = card
+        root[2] = tappable(width, math.max(1, pad + title_h),
+            Widget:new{dimen = Geom:new{w = width, h = 1}}, callback)
+        local body_y = pad + title_h
+        root[3] = OffsetContainer:new{x_off = 0, y_off = body_y,
+            tappable(width, math.max(1, height - body_y),
+                Widget:new{dimen = Geom:new{w = width, h = 1}}, body_callback)}
+        return root
+    end
     return tappable(width, height, card, callback)
 end
 
@@ -1670,7 +1686,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
                     local title=show_weread and "微信读书" or "本地阅读"
                     local data=show_weread and self.opts.weread_stats or self.opts.local_stats
                     local callback=show_weread and self.opts.on_weread_stats or self.opts.on_local_stats
-                    local card=dashboard_stats_card(title,data,dashboard_w,stats_total_h,callback,true)
+                    local card=dashboard_stats_card(title,data,dashboard_w,stats_total_h,callback,true,self.opts.on_weread_stats)
                     self:_add(children,dashboard_x,stats_y,card)
                     local slot_key=show_weread and "weread" or "local_stats"
                     self._dashboard_card_slots[slot_key]={parent=children,index=#children,x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_total_h,title=title,callback=callback,expanded=true}
@@ -1683,7 +1699,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
                     self._dashboard_card_slots.weread={parent=children,index=#children,x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h,title="微信读书",callback=self.opts.on_weread_stats}
                     self._dashboard_field_dimens.weread=Geom:new{x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h}
                     local local_y=stats_y+stats_h+dash_gap
-                    local local_card=dashboard_stats_card("本地阅读",self.opts.local_stats,dashboard_w,final_stats_h,self.opts.on_local_stats)
+                    local local_card=dashboard_stats_card("本地阅读",self.opts.local_stats,dashboard_w,final_stats_h,self.opts.on_local_stats,false,self.opts.on_weread_stats)
                     self:_add(children,dashboard_x,local_y,local_card)
                     self._dashboard_card_slots.local_stats={parent=children,index=#children,x=dashboard_x,y=local_y,w=dashboard_w,h=final_stats_h,title="本地阅读",callback=self.opts.on_local_stats}
                     self._dashboard_field_dimens.local_stats=Geom:new{x=dashboard_x,y=local_y,w=dashboard_w,h=final_stats_h}
@@ -1791,7 +1807,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
                     local title=show_weread and "微信读书" or "本地阅读"
                     local data=show_weread and self.opts.weread_stats or self.opts.local_stats
                     local callback=show_weread and self.opts.on_weread_stats or self.opts.on_local_stats
-                    local card=dashboard_stats_card(title,data,dashboard_w,stats_h,callback,true)
+                    local card=dashboard_stats_card(title,data,dashboard_w,stats_h,callback,true,self.opts.on_weread_stats)
                     self:_add(children,dashboard_x,stats_y,card)
                     local slot_key=show_weread and "weread" or "local_stats"
                     self._dashboard_card_slots[slot_key]={parent=children,index=#children,x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h,title=title,callback=callback,expanded=true}
@@ -1805,7 +1821,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
                     self:_add(children,dashboard_x,stats_y,weread_card)
                     self._dashboard_card_slots.weread={parent=children,index=#children,x=dashboard_x,y=stats_y,w=weread_w,h=stats_h,title="微信读书",callback=self.opts.on_weread_stats}
                     self._dashboard_field_dimens.weread=Geom:new{x=dashboard_x,y=stats_y,w=weread_w,h=stats_h}
-                    local local_card=dashboard_stats_card("本地阅读",self.opts.local_stats,local_w,stats_h,self.opts.on_local_stats)
+                    local local_card=dashboard_stats_card("本地阅读",self.opts.local_stats,local_w,stats_h,self.opts.on_local_stats,false,self.opts.on_weread_stats)
                     self:_add(children,local_x,stats_y,local_card)
                     self._dashboard_card_slots.local_stats={parent=children,index=#children,x=local_x,y=stats_y,w=local_w,h=stats_h,title="本地阅读",callback=self.opts.on_local_stats}
                     self._dashboard_field_dimens.local_stats=Geom:new{x=local_x,y=stats_y,w=local_w,h=stats_h}
@@ -2133,7 +2149,8 @@ function HomeWidget:updateDashboard(fields)
             changed=true
             local slot=slots[slot_key]
             if slot and slot.parent and slot.index and slot.w and slot.h then
-                local card=dashboard_stats_card(slot.title,fields[key],slot.w,slot.h,slot.callback,slot.expanded==true)
+                local card=dashboard_stats_card(slot.title,fields[key],slot.w,slot.h,slot.callback,
+                    slot.expanded==true,self.opts.on_weread_stats)
                 local old=slot.parent[slot.index]
                 slot.parent[slot.index]=OffsetContainer:new{x_off=slot.x,y_off=slot.y,card}
                 if old and old~=slot.parent[slot.index] and old.free then pcall(old.free,old) end

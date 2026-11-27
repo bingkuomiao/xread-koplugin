@@ -241,6 +241,24 @@ local function fit_two_lines(text, width, face, bold)
     return first .. "\n" .. fit_line(rest, width, face, bold, true)
 end
 
+-- 状态行每个格子的自然宽度：图标 + 图标/文字间距 + 文字 + 左右内边距。
+-- 用它替代「按 weight 平分」，让相邻格子之间的空白完全一致。
+local function status_intrinsic_width(entry, height)
+    entry = type(entry) == "table" and entry or {}
+    if entry.icon_only == true and entry.icon then
+        return Skin.dp(24, 21, 32)
+    end
+    local icon_w = entry.icon and Skin.dp(29, 25, 38) or 0
+    local gap = entry.icon and Skin.dp(4, 3, 6) or 0
+    local face = entry.multiline
+        and Skin.face("cfont", 9.8, 12.8, 8.4)
+        or Skin.face("cfont", 10.5, 13.8, 8.9)
+    local label = tostring(entry.label or ""):gsub("[\r\n]+", " ")
+    local tw = text_pixel_width(label, face, entry.bold ~= false or entry.alert == true)
+    if entry.multiline then tw = math.ceil(tw * 0.62) end
+    return icon_w + gap + tw + Skin.dp(6, 5, 9) * 2
+end
+
 local function status_item(entry, width, height, callback, hold_callback, owner, ref_key)
     entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
@@ -449,7 +467,7 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
     if has_bluetooth then
         entries = {
             {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true, weight = 1.0},
-            {label = header.nickname_label or "", enabled = true, text_align = "left", bold = true, weight = 1.2},
+            {label = header.nickname_label or "", enabled = true, text_align = "center", bold = true, weight = 1.2},
             {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true, weight = 1.1},
             {icon = "bluetooth", label = header.bluetooth_label or "蓝牙", enabled = type(header.bluetooth_callback) == "function", bold = true, weight = 1.0},
             {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true, weight = 1.15},
@@ -477,7 +495,7 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
     else
         entries = {
             {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true, weight = 1.0},
-            {label = header.nickname_label or "", enabled = true, text_align = "left", bold = true, weight = 1.2},
+            {label = header.nickname_label or "", enabled = true, text_align = "center", bold = true, weight = 1.2},
             {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true, weight = 1.1},
             {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true, weight = 1.15},
             {label = header.time_label or "", enabled = true, text_align = "center", bold = true, weight = 0.9},
@@ -500,27 +518,40 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
         }
         ref_keys = {"home","nickname","wifi","sync","time","battery","more"}
     end
-    -- 按 weight 分配格宽：昵称/已连接这种要宽一点，⋯ 只留图标要窄一点。
-    -- 原来一律 width/count 平分，短格子里的文字只能折行，长格子又空一大块。
+    -- 统一间距布局：每格按自己的自然宽度占位，剩余的空白平均分配到相邻格子之间。
+    -- 原来按 weight 分格，昵称格比「首页/Wi-Fi」宽，图标之间的空白就忽大忽小；
+    -- 现在「首页」「昵称」「Wi-Fi」「同步」「时间」「电量」「⋯」两两间距一致。
     local count = #entries
-    local total_weight = 0
-    for _i, entry in ipairs(entries) do
-        total_weight = total_weight + (tonumber(entry.weight) or 1)
+    local min_gap = Skin.dp(6, 5, 9)
+    local widths, content_total = {}, 0
+    for i, entry in ipairs(entries) do
+        widths[i] = status_intrinsic_width(entry, height)
+        content_total = content_total + widths[i]
     end
-    local used, acc_weight = 0, 0
-    for index, entry in ipairs(entries) do
-        local w
-        if index == count then
-            w = width - used
-        else
-            acc_weight = acc_weight + (tonumber(entry.weight) or 1)
-            w = math.floor(width * acc_weight / total_weight) - used
+    local gap = count > 1 and math.floor((width - content_total) / (count - 1)) or 0
+    if gap < min_gap then
+        -- 窄屏放不下：先压到最小间距，再按比例缩窄每格（status_item 内部会截断文字）
+        gap = min_gap
+        local need = content_total + gap * (count - 1)
+        if need > width then
+            local scale = width / math.max(1, need)
+            content_total = 0
+            for i = 1, count do
+                widths[i] = math.max(Skin.dp(22, 20, 28), math.floor(widths[i] * scale))
+                content_total = content_total + widths[i]
+            end
+            gap = count > 1 and math.max(0, math.floor((width - content_total) / (count - 1))) or 0
         end
+    end
+    local used = 0
+    for index, entry in ipairs(entries) do
+        local w = widths[index]
+        if index == count then w = math.max(1, width - used) end
         root[#root + 1] = OffsetContainer:new{
             x_off = x + used, y_off = y,
             status_item(entry, w, height, callbacks[index], holds[index], self, ref_keys[index]),
         }
-        used = used + w
+        used = used + w + gap
     end
 end
 
@@ -969,6 +1000,22 @@ function M.refreshFrontlight()
         return live_toolbar:refreshFrontlightState()
     end
     return false
+end
+-- 换书/切书源后同步标题：面板还开着时，用最新的 header 原地刷新文本，
+-- 不必关掉再重建（重建会让用户觉得工具栏闪了一下）。签名不变时只更新文字。
+function M.refreshHeader(header)
+    if not (live_toolbar and not live_toolbar.closed and type(live_toolbar.updateFromOptions)=="function") then
+        return false
+    end
+    local opts = live_toolbar.opts or {}
+    local merged = {}
+    for k, v in pairs(opts) do merged[k] = v end
+    local h = {}
+    for k, v in pairs(type(opts.header) == "table" and opts.header or {}) do h[k] = v end
+    for k, v in pairs(type(header) == "table" and header or {}) do h[k] = v end
+    merged.header = h
+    local ok = pcall(live_toolbar.updateFromOptions, live_toolbar, merged)
+    return ok and true or false
 end
 function M.invalidate()
     M.close()

@@ -1151,6 +1151,17 @@ function XRead:init()
 
             end)
 
+        elseif flow == "progress" then
+
+            -- 验收：带「取消 / 确定」的下载进度卡片（只展示几秒，不真的下书）
+            UIManager:scheduleIn(4, function()
+
+                ProgressToast.show(T(_("正在下载 %1%（%2/%3）"), "38", "8", "21"), { buttons = true })
+
+                autotest_mark("flow=progress done")
+
+            end)
+
         elseif flow == "msgbox" then
 
             -- 验收：统一提示框样式（白底 + 2px 黑边 + 居中文字）
@@ -2891,8 +2902,9 @@ function XRead:showHome(page)
 
         date_text = os.date("%m月%d日 ") .. ({ "周日", "周一", "周二", "周三", "周四", "周五", "周六" })[(tonumber(os.date("%w")) or 0) + 1],
 
-        -- 「本地阅读」：先列出本机导出的书，再给一个阅读统计入口
+        -- 「本地阅读」卡片：标题进本地书架，数据区进阅读记录
         on_local_stats = function() self:showLocalBooks() end,
+        on_weread_stats = function() self:showReadingStats() end,
 
         on_open_book = function(mbook) self:openBook(mbook._xread_book) end,
 
@@ -3885,6 +3897,11 @@ end
 -- ---------- 阅读器内：目录 / 跳章 ----------
 
 function XRead:showReaderCatalog(page, order)
+
+    -- 跳章切文档期间：目录只是等新文档就绪的遮罩，缓存轮询/翻页回调会重建它。
+    -- onCloseDocument 此时把 SHARED.txt_path 清成 nil，下面的守卫会误判成
+    -- 「从别处打开的普通文件」，闪一下「请从书架打开书籍」。切换期间静默跳过。
+    if self._switch_overlay then return end
 
     local doc = self.ui.document
 
@@ -5115,7 +5132,7 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
     end
 
-    -- 行距：crengine 的 setInterlineSpacePercent，100 就是「原生」行距。
+    -- 行距：crengine 的 setInterlineSpacePercent，100% 就是原生行距。
     -- 原来这里的 ± 没有回调，只有文字「原生」两个字，点了没有任何反应。
     local function currentLineSpacing()
 
@@ -5137,8 +5154,8 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
 
         local v = currentLineSpacing()
 
-        if v == 100 then return _("原生") end
-
+        -- 100% 就是原生行距，但统一显示成百分比，避免出现「原生」这种
+        -- 和其它档位不同类的文案（用户反馈菜单里应显示为 100%）。
         return tostring(v) .. "%"
 
     end
@@ -5660,8 +5677,10 @@ function XRead:showLocalBooks()
         title = _("本地阅读"),
         page = 1,
         show_actions = true,
-        left_action_label = _("统计"),
-        on_left_action = function() self:showReadingStats() end,
+        -- 统计入口已收进首页仪表盘的数据区，本地书架右上角只留「返回」
+        left_action_label = "",
+        hide_left_action = true,
+        on_left_action = nil,
         right_action_label = _("返回"),
         on_right_action = function()
             local back = self._local_back
@@ -5704,7 +5723,18 @@ end
 
 function XRead:toggleNightMode()
 
-    UIManager:broadcastEvent(Event:new("ToggleNightMode"))
+    -- 用绝对状态 SetNightMode 代替相对 ToggleNightMode：
+    -- broadcastEvent 会把 ToggleNightMode 发给窗口栈里每个 widget，若有多个
+    -- 监听者各自翻转一次就抵消了，表现为「点了夜晚按钮没反应」（偶发）。
+    -- SetNightMode 是幂等的：DeviceListener:onSetNightMode 会先比对当前状态，
+    -- 已到位就不再翻转，无论广播到几个监听者结果都一致。
+    local cur = false
+    pcall(function()
+        cur = (G_reader_settings and G_reader_settings:isTrue("night_mode"))
+            or (Screen and Screen.night_mode) or false
+    end)
+
+    UIManager:broadcastEvent(Event:new("SetNightMode", not cur))
 
     UIManager:setDirty("all", "full")
 
@@ -6040,6 +6070,26 @@ function XRead:onReaderReady()
     -- 必须在文档就绪后重新注册，否则跳章后点正文中央无法呼出工具栏、回不了书架。
     -- onReaderReady 在文档加载完成后触发，是补注册的正确时机。
     self:setupCenterTap()
+
+    -- 换书/切书源/跳章后，工具栏若还开着，标题仍是上一本书的名字（正文已变）。
+    -- 用当前 SHARED.book 原地刷新标题/章节名，不必关掉重建。
+    if SHARED.book and SHARED.chapters then
+        local total = #SHARED.chapters
+        local idx = SHARED.index or 1
+        local ch = SHARED.chapters[idx] or {}
+        local ch_title = ch.title or ch.name
+        if not ch_title or ch_title == "" then
+            ch_title = T(_("第 %1 章"), tostring(idx))
+        end
+        pcall(function()
+            ReaderToolbar.refreshHeader({
+                title = SHARED.book.name or _("未知书籍"),
+                chapter_label = tostring(ch_title),
+                location_label = T(_("第 %1 / %2 章"), tostring(idx), tostring(total)),
+                progress_label = (total > 0 and tostring(math.floor(idx / total * 100 + 0.5)) or "0") .. "%",
+            })
+        end)
+    end
 
     -- 目录跳章：目录一直盖在正文上，等新文档就绪才收起来。
     -- 这样「关目录 → switchDocument 关旧文档」的中间空档不会露出底层书架。
@@ -9714,7 +9764,7 @@ function XRead:_doDownloadBook(book)
         -- 原来是每轮 Trapper:info(nil) —— 它会新建一个空文字 InfoMessage，
         -- 真机上就是「进度框不停闪 + 反复出现空框」。
         ProgressToast.show(ProgressToast.hint(T(_("正在下载 %1%（%2/%3）"),
-            "0", "0", tostring(total))))
+            "0", "0", tostring(total))), { buttons = true })
         local deadline = os.time() + math.max(180, total * 30)
         local last_done, last_t = -1, 0
         local user_aborted = false
@@ -9995,7 +10045,8 @@ function XRead:doCacheBook(book, count)
         Trapper:clear()
 
         -- 进度框：只建一次，文字原地刷新（避免每轮新建空 InfoMessage 导致闪屏）
-        ProgressToast.show(ProgressToast.hint(T(_("正在缓存到服务器：已处理 %1 章"), "0")))
+        ProgressToast.show(ProgressToast.hint(T(_("正在缓存到服务器：已处理 %1 章"), "0")),
+            { buttons = true })
         local last_cached, last_t = -1, 0
 
         local user_aborted = false
