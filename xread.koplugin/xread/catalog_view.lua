@@ -331,6 +331,8 @@ function CatalogView:init()
 
     local page_size = L.page_size
 
+    self._page_size = page_size   -- 报活签名要用（self.layout 后面会被换成 focus_rows）
+
     local page_count = math.max(1, math.ceil(#chapters / page_size))
 
     if self.page < 1 then self.page = 1 end
@@ -814,7 +816,7 @@ function CatalogView:_cacheSignature()
 
     local chapters = self.chapters or {}
 
-    local page_size = self.layout.page_size or 14
+    local page_size = self._page_size or 14
 
     local first = (self.page - 1) * page_size + 1
 
