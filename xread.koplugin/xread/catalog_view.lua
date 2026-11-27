@@ -50,6 +50,7 @@ local util          = require("util")
 local _             = require("gettext")
 
 local T             = require("ffi/util").template
+local UiKit = require("xread.miui.ui_kit")
 local CatalogView = FocusManager:extend{
 
     book = nil,
@@ -81,71 +82,11 @@ local CatalogView = FocusManager:extend{
 
 }
 
-local function scaled(px)
+local scaled = UiKit.scaled
 
-    return math.floor(px * (Screen:scaleBySize(1000) / 1000) + 0.5)
 
-end
+local wrapTitle = UiKit.wrap_title
 
-local function wrapTitle(text, face, width)
-
-    local chars = util.splitToChars(text or "")
-
-    local lines, cur = {}, ""
-
-    local overflow = false
-
-    for _i, ch in ipairs(chars) do
-
-        local test = cur .. ch
-
-        if cur == "" or TextWidget.getTextWidth(test, face, false, 0) <= width then
-
-            cur = test
-
-        else
-
-            lines[#lines + 1] = cur
-
-            cur = ch
-
-            if #lines == 2 then
-
-                overflow = true
-
-                break
-
-            end
-
-        end
-
-    end
-
-    if #lines < 2 then
-
-        lines[#lines + 1] = cur
-
-    end
-
-    if overflow and lines[2] then
-
-        local second = util.splitToChars(lines[2])
-
-        while #second > 0
-
-            and TextWidget.getTextWidth(table.concat(second) .. "…", face, false, 0) > width do
-
-            table.remove(second)
-
-        end
-
-        lines[2] = table.concat(second) .. "…"
-
-    end
-
-    return lines[1] or "", lines[2] or ""
-
-end
 -- 章节行：一列排布，行之间留一条细缝（列表区底色透出来当缝）。
 -- 白天的三档状态：
 --   · 当前章 / 选中章：黑底白字，仅这两类加粗

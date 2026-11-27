@@ -23,9 +23,21 @@ local function clamp(value, minimum, maximum)
     return value
 end
 
+-- metrics() 原来每次调用都要读屏幕尺寸 + pcall(scaleBySize) + 开方，
+-- 而 dp/face/line/radius 全都会调它，一次布局要跑上千次。
+-- 屏幕尺寸与显示模式是唯一变量，按它做一级缓存即可。
+local metrics_cache, metrics_key
+local dp_cache = {}
+
+local function invalidate_layout_cache()
+    metrics_cache, metrics_key = nil, nil
+    dp_cache = {}
+end
+
 function UiScale.setDisplayMode(mode)
     mode = tostring(mode or "standard")
     if not MODE_FACTORS[mode] then mode = "standard" end
+    if mode ~= display_mode then invalidate_layout_cache() end
     display_mode = mode
 end
 
@@ -58,6 +70,10 @@ end
 
 function UiScale.metrics()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local key = sw .. "x" .. sh .. ":" .. display_mode
+    if metrics_cache and metrics_key == key then return metrics_cache end
+    -- 尺寸或模式变了：dp 的缓存键里没有这两项，必须一起清掉
+    if metrics_key ~= nil and metrics_key ~= key then dp_cache = {} end
     local short = math.max(1, math.min(sw, sh))
     local long = math.max(sw, sh)
     local density = 1
@@ -76,7 +92,7 @@ function UiScale.metrics()
     -- element with a single global factor.
     ratio = clamp(ratio * 1.16, .98, 1.30)
     local portrait = sw < sh
-    return {
+    local result = {
         sw = sw,
         sh = sh,
         short = short,
@@ -87,10 +103,15 @@ function UiScale.metrics()
         aspect = long / short,
         display_mode = display_mode,
     }
+    metrics_cache, metrics_key = result, key
+    return result
 end
 
 function UiScale.dp(value, minimum, maximum)
     local m = UiScale.metrics()
+    local key = (tonumber(value) or 0) .. "|" .. tostring(minimum) .. "|" .. tostring(maximum)
+    local hit = dp_cache[key]
+    if hit then return hit end
     local factor = MODE_FACTORS[display_mode] or MODE_FACTORS.standard
     local logical = (tonumber(value) or 0) * m.ratio * factor.spacing
     logical = clamp(logical, minimum, maximum)
@@ -99,7 +120,9 @@ function UiScale.dp(value, minimum, maximum)
         local ok, scaled = pcall(Screen.scaleBySize, Screen, logical)
         if ok and tonumber(scaled) then raw = tonumber(scaled) end
     end
-    return math.max(0, math.floor(raw + .5))
+    local result = math.max(0, math.floor(raw + .5))
+    dp_cache[key] = result
+    return result
 end
 
 function UiScale.raw(value, minimum, maximum)

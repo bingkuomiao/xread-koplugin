@@ -50,6 +50,7 @@ local util          = require("util")
 local _             = require("gettext")
 
 local T             = require("ffi/util").template
+local UiKit = require("xread.miui.ui_kit")
 local GridShelf = FocusManager:extend{
 
     books = nil,
@@ -70,73 +71,13 @@ local GridShelf = FocusManager:extend{
 
 }
 
-local function scaled(px)
+local scaled = UiKit.scaled
 
-    return math.floor(px * (Screen:scaleBySize(1000) / 1000) + 0.5)
-
-end
 
 -- 自己按字符宽度折成两行，避免 TextBoxWidget 在固定高度下只显示一行。
 
-local function wrapTitle(text, face, width)
+local wrapTitle = UiKit.wrap_title
 
-    local chars = util.splitToChars(text or "")
-
-    local lines, cur = {}, ""
-
-    local overflow = false
-
-    for _i, ch in ipairs(chars) do
-
-        local test = cur .. ch
-
-        if cur == "" or TextWidget.getTextWidth(test, face, false, 0) <= width then
-
-            cur = test
-
-        else
-
-            lines[#lines + 1] = cur
-
-            cur = ch
-
-            if #lines == 2 then
-
-                overflow = true
-
-                break
-
-            end
-
-        end
-
-    end
-
-    if #lines < 2 then
-
-        lines[#lines + 1] = cur
-
-    end
-
-    if overflow and lines[2] then
-
-        local second = util.splitToChars(lines[2])
-
-        while #second > 0
-
-            and TextWidget.getTextWidth(table.concat(second) .. "…", face, false, 0) > width do
-
-            table.remove(second)
-
-        end
-
-        lines[2] = table.concat(second) .. "…"
-
-    end
-
-    return lines[1] or "", lines[2] or ""
-
-end
 
 -- 统一给 main.lua 的封面预取使用，避免两边算出的每页数量不一致。
 

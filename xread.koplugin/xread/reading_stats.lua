@@ -55,6 +55,7 @@ local logger          = require("logger")
 local _               = require("gettext")
 
 local T               = require("ffi/util").template
+local UiKit = require("xread.miui.ui_kit")
 -- 分章 TXT 名（贪欢_5 / 妖神记_7）归并成书名
 
 local function normalizeTitle(s)
@@ -85,31 +86,14 @@ local function openLog()
 end
 local ReadingStats = InputContainer:extend{}
 
-local function scaled(px)
+local scaled = UiKit.scaled
 
-    return math.floor(px * (Screen:scaleBySize(1000) / 1000) + 0.5)
 
-end
+local clamp = UiKit.clamp
 
-local function clamp(v, a, b)
 
-    if v < a then return a end
+local fillRound = UiKit.fill_round
 
-    if v > b then return b end
-
-    return v
-
-end
-
-local function fillRound(bb, x, y, w, h, color, r)
-
-    if w <= 0 or h <= 0 then return end
-
-    local fn = Blitbuffer.isColor8(color) and bb.paintRoundedRect or bb.paintRoundedRectRGB32
-
-    fn(bb, x, y, w, h, color, r or 0)
-
-end
 
 local function fmtDuration(sec)
 

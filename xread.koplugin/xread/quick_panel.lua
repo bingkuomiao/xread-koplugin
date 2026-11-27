@@ -41,6 +41,7 @@ local UIManager       = require("ui/uimanager")
 local _               = require("gettext")
 
 local T               = require("ffi/util").template
+local UiKit = require("xread.miui.ui_kit")
 
 local QuickPanel = InputContainer:extend{
 
@@ -82,31 +83,14 @@ local QuickPanel = InputContainer:extend{
 
 }
 
-local function scaled(px)
+local scaled = UiKit.scaled
 
-    return math.floor(px * (Screen:scaleBySize(1000) / 1000) + 0.5)
 
-end
+local fillRound = UiKit.fill_round
 
-local function fillRound(bb, x, y, w, h, color, r)
 
-    if w <= 0 or h <= 0 then return end
+local clamp = UiKit.clamp
 
-    local fn = Blitbuffer.isColor8(color) and bb.paintRoundedRect or bb.paintRoundedRectRGB32
-
-    fn(bb, x, y, w, h, color, r or 0)
-
-end
-
-local function clamp(v, a, b)
-
-    if v < a then return a end
-
-    if v > b then return b end
-
-    return v
-
-end
 -- ---------- 可点击的小图标 / 文字 ----------
 
 local TapBox = InputContainer:extend{ widget = nil, width = nil, height = nil, callback = nil }
