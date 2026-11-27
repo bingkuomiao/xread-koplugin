@@ -658,7 +658,8 @@ function ReadingStats.getHomeStats() return getHomeStats() end
 
 function ReadingStats:init()
 
-    self.tab = "Day"
+    -- 默认展示「周」：日视图对大部分人只有今天一根柱子，周视图才能看出这周读了多少
+    self.tab = "Week"
 
     self.data = loadData()
 

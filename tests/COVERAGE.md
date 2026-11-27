@@ -92,3 +92,15 @@
   - 首页上下文跑的（没有已开文档）：`display_size`、`rotate`、`layout_edge`、`shelf_paging`、
     `search_panel`、`memory_info`，入口 `XRead:_runHomeAutotestFlow()`。
 - 所有验收标记形如 `[XREAD_AUTOTEST] flow=<name> ...`，只在这些环境变量存在时打印，生产无副作用。
+
+## 六、v0.6.30 新增用例与 flow
+
+- `32_book_night_footer`：书内夜晚（只改正文色）时页脚必须一起变深。
+  断言 `chrome_night dark=true`，flow=`book_night`。
+- `33_catalog_jump_range`：目录跳章后章节号必须落在当前文档范围内。
+  flow=`diag_chapter`（默认跳到「当前章 + 100」，可用 `XREAD_DIAG_JUMP` 指定），
+  断言打出 `after_jump_<n> index=<n>`，且日志中不得出现 `chapter_index_out_of_range`。
+- `XREAD_DIAG=1` 打开详细诊断：章节表首尾标题、条目原始字段、页码→章节换算过程。
+  （只在排查问题时打开，生产无副作用。）
+- 15c_more_menu / 29_about_version 的点击坐标按 6 项更多面板更新
+  （我的书架 495 / 地址管理 596 / 账号管理 697 / 首页管理 798 / 升级管理 899 / 关于本机 1000）。

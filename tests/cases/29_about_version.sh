@@ -12,7 +12,7 @@ emu_start "home"
 emu_wait_mark "mode=home done" 180
 emu_settle 8
 emu_tap 1005 45; sleep 4     # 开更多面板
-emu_tap 400 950; sleep 12    # 点「关于本机」（第5项）
+emu_tap 400 1000; sleep 12   # 点「关于本机」（第6项）
 emu_wait_mark "about_server_version" 40
 assert_log_contains "about_server_version v[0-9]" "后端版本已获取到具体版本号"
 assert_no_fatal

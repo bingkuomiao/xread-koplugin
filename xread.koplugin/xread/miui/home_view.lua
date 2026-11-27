@@ -1652,7 +1652,12 @@ function HomeWidget:_build_sections(children, m, compact, mode)
 
     local action_h = math.max(UiScale.dp(58, 54, 76), math.min(UiScale.dp(76, 64, 86), math.floor(m.body_h * .070)))
     local actions = self.opts.home_actions or {}
-    local tabs_h = math.max(UiScale.dp(34, 31, 44), math.min(UiScale.dp(46, 37, 52), math.floor(m.body_h * .050)))
+    -- 没有分类页签时不要占位：以前空 tabs 仍留一行高度 + 缝隙，
+    -- 表现就是「中部操作行下面空一大块才到我的书架」。
+    local tabs_list = self.opts.tabs or {}
+    local tabs_h = #tabs_list > 0
+        and math.max(UiScale.dp(34, 31, 44), math.min(UiScale.dp(46, 37, 52), math.floor(m.body_h * .050)))
+        or 0
     local shelf_subtabs = self.opts.shelf_subtabs or {}
     -- A second shelf-level selector is used by 本地书库 only. The root row is
     -- hidden when only one view is enabled; inside a child folder one compact
@@ -1678,7 +1683,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         local shelf_x = dashboard_x + (dashboard_visible and dashboard_w + gap or 0)
         local shelf_w = math.max(1, w - hero_w - (dashboard_visible and dashboard_w + gap * 2 or gap))
         if build_static then
-            local shelf_sy = y + tabs_h + math.max(3, math.floor(gap * .35))
+            local shelf_sy = y + (tabs_h > 0 and (tabs_h + math.max(3, math.floor(gap * .35))) or 0)
             if subtabs_h > 0 then shelf_sy = shelf_sy + subtabs_h + math.max(2, math.floor(gap * .25)) end
             if section_h > 0 then shelf_sy = shelf_sy + section_h + math.max(2, math.floor(gap * .25)) end
             local shelf_footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
@@ -1870,7 +1875,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     end
     self.section_dimen = Geom:new{x = x, y = y, w = w, h = math.max(1, bottom - y)}
     if not build_section then return end
-    if y + tabs_h < bottom then
+    if tabs_h > 0 and y + tabs_h < bottom then
         self:_add(children, x, y, category_tabs(self.opts.tabs, w, tabs_h, self.opts.on_shelf_all))
         y = y + tabs_h + math.max(3, math.floor(gap * .35))
     end

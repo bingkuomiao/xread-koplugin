@@ -109,28 +109,53 @@ local SHARED = {
 -- @return number|nil
 local function pageChapterIndex(ui, pageno, chapters, doc_first, doc_last)
     local toc = ui and ui.toc and ui.toc.toc
-    if type(toc) ~= "table" or #toc == 0 then return nil end
-    pageno = tonumber(pageno) or 1
-    local lo, hi, idx = 1, #toc, 0
-    while lo <= hi do
-        local mid = math.floor((lo + hi) / 2)
-        if (tonumber(toc[mid].page) or 0) <= pageno then
-            idx = mid
-            lo = mid + 1
-        else
-            hi = mid - 1
-        end
-    end
-    if idx == 0 then idx = 1 end
+    local has_toc = type(toc) == "table" and #toc > 0
     local total = type(chapters) == "table" and #chapters or 0
-    -- 当前 TXT 只拼了「起始章 .. 起始章+N」这一段，TOC 也只覆盖这一段：
-    -- 文档内第 idx 章 = 全书第 doc_first + idx - 1 章。
     local first = tonumber(doc_first) or 1
     local doc_count = (tonumber(doc_last) or 0) - first + 1
-    if doc_count > 0 and #toc == doc_count then
-        idx = first + idx - 1
-    elseif total > 0 and #toc ~= total then
-        idx = math.max(1, math.min(total, math.floor(idx / #toc * total + .5)))
+    pageno = tonumber(pageno) or 1
+    local toc_idx = 0
+    if has_toc then
+        local lo, hi = 1, #toc
+        while lo <= hi do
+            local mid = math.floor((lo + hi) / 2)
+            if (tonumber(toc[mid].page) or 0) <= pageno then
+                toc_idx = mid
+                lo = mid + 1
+            else
+                hi = mid - 1
+            end
+        end
+        if toc_idx == 0 then toc_idx = 1 end
+    end
+    -- 当前文件只拼了「起始章 .. 起始章+N」这一段，TOC 也只覆盖这一段：
+    -- 文档内第 idx 章 = 全书第 doc_first + idx - 1 章。
+    local idx
+    if doc_count > 0 then
+        if has_toc and #toc == doc_count then
+            idx = first + toc_idx - 1
+        else
+            -- TOC 条目数和写进文件的章数对不上（换文档瞬间还挂着旧 TOC、
+            -- 或原生 TOC 里有标题被过滤）。以前这里按「全书章节数」做比例换算，
+            -- 换文档的一瞬间会算出 349 这种完全不存在的章节号，工具栏/底栏
+            -- 于是显示成另一章。现在改成按当前页在本文件里的相对位置换算，
+            -- 结果一定落在 [first, doc_last] 之内，最多差一两章，不会跳到别处。
+            local pages = 1
+            pcall(function()
+                local footer = ui and ui.view and ui.view.footer
+                pages = tonumber(footer and footer.pages) or 1
+            end)
+            local pos = math.max(0, math.min(1, (pageno - 1) / math.max(1, pages)))
+            idx = first + math.floor(pos * doc_count)
+        end
+    elseif has_toc then
+        idx = toc_idx
+        -- 没有文档范围信息（非 xread 文档）：条目数与章节数不符时按比例映射
+        if total > 0 and #toc ~= total then
+            idx = math.max(1, math.min(total, math.floor(idx / #toc * total + .5)))
+        end
+    else
+        return nil
     end
     if total > 0 then idx = math.max(1, math.min(total, idx)) end
     return idx
@@ -419,16 +444,14 @@ end
 function XRead:markBackendDown(reason)
     self._backend_down = { at = os.time(), reason = tostring(reason or "") }
 end
---- 后端类问题的统一弹窗：与「移除书籍」确认框同一张居中卡片，
---- 底部固定「取消 / 修改」，点修改直达地址管理；右上角另有 ✕ 关闭。
---- 这样用户看到「连不上」就能一键去修，而不是只给一句无从下手的提示。
+--- 后端类问题的统一弹窗：居中等宽卡片，一句话说明现状，
+--- 底部「修改」直达地址管理，右边「忽略」继续用缓存；右上角另有 ✕。
 function XRead:showBackendIssue(opts)
     opts = opts or {}
     MessageBox.confirm{
         title = opts.title or _("连不上服务器"),
         text = opts.text or "",
         sticky = true,
-        cancel_text = _("取消"),
         ok_text = _("修改"),
         callback = function(ok)
             if ok then self:showServerManage() end
@@ -438,7 +461,7 @@ end
 --- 统一的后端不可达提示：说清楚「连的是哪台、为什么」，并给可操作的按钮
 function XRead:notifyBackendDown(reason, silent)
     self:markBackendDown(reason)
-    local msg = T(_("连不上 %1：%2\n可以先看缓存内容；点「修改」检查地址和端口。"),
+    local msg = T(_("连不上 %1：%2，点「修改」改地址。"),
         display_address(self:backendAddress()), readable_error(reason))
     logger.warn("xread backend unreachable:", self:backendAddress(), tostring(reason))
     if os.getenv("XREAD_AUTOTEST") then
@@ -467,11 +490,11 @@ function XRead:notifyBackendSoftDownOnce()
     local cached = self.meta_cache:getShelf(nil)
     if not cached or #cached == 0 then return end
     self._home_soft_down_notified = true
-    -- 与「移除书籍」确认框同一张居中卡片：说明现状 + 给出路，
-    -- 点「修改」直达地址管理，点「取消」或 ✕ 则继续看缓存书架。
+    -- 与「移除书籍」确认框同一张居中卡片：一句话说现状 + 给出路，
+    -- 点「修改」直达地址管理，点「忽略」或 ✕ 则继续看缓存书架。
     self:showBackendIssue{
         title = _("后端连不上"),
-        text = _("当前显示的是缓存书架，仍可正常阅读。\n点「修改」改地址，或稍后再试。"),
+        text = _("当前显示的是缓存书架，仍可正常阅读。"),
     }
     if os.getenv("XREAD_AUTOTEST") then print("[XREAD_AUTOTEST] soft_backend_down") end
 end
@@ -485,7 +508,7 @@ function XRead:withBackend(fn, opts)
     if addr == "" or addr:match("^%s*$") then
         self:showBackendIssue{
             title = _("还没有设置后端地址"),
-            text = _("现在显示的是本地缓存，填好地址就能同步书架。\n点「修改」填写 IP 和端口。"),
+            text = _("现在显示的是本地缓存，点「修改」填写 IP 和端口。"),
         }
         return false
     end
@@ -797,6 +820,11 @@ function XRead:init()
                 self:showPageManage()
                 autotest_mark("flow=more_page done")
             end)
+        elseif flow == "more_update" then
+            UIManager:scheduleIn(4, function()
+                self:showUpdateManage()
+                autotest_mark("flow=more_update done")
+            end)
         elseif flow == "more_about" then
             UIManager:scheduleIn(4, function()
                 self:showAboutPanel()
@@ -850,12 +878,18 @@ function XRead:init()
                     end)
                 end)
             end)
+        elseif flow == "book_night" then
+            -- 验收：书内夜晚（只改正文颜色）时页脚要跟着变深，不能留一条白
+            UIManager:scheduleIn(5, function()
+                self:toggleBookNightMode()
+                autotest_mark("flow=book_night done")
+            end)
         elseif flow == "msgbox" then
             -- 验收：统一提示框样式（白底 + 2px 黑边 + 居中文字）
             UIManager:scheduleIn(4, function()
                 self:showBackendIssue{
                     title = _("首页加载失败"),
-                    text = _("暂时取不到书架，可以先看本地缓存。\n点「修改」检查地址和账号。"),
+                    text = _("暂时取不到书架，可以先看本地缓存。"),
                 }
                 autotest_mark("flow=msgbox done")
             end)
@@ -944,6 +978,61 @@ function XRead:init()
                     autotest_mark("flow=catalog_jump done")
                 end)
             end)
+        elseif flow == "diag_chapter" then
+            -- 诊断：开书位置 / 目录跳章后的章节号、文档范围、TOC 条目数是否一致
+            UIManager:scheduleIn(4, function()
+                local function dump(tag)
+                    local ui = self.ui
+                    local footer = ui and ui.view and ui.view.footer
+                    local toc = ui and ui.toc and ui.toc.toc
+                    local chapters = SHARED.chapters or {}
+                    local cur = tonumber(SHARED.index) or 1
+                    local ch = chapters[cur] or {}
+                    print(string.format(
+                        "[XREAD_DIAG] %s index=%s first=%s last=%s toc=%s page=%s pages=%s total=%s title=%s next=%s",
+                        tag, tostring(SHARED.index), tostring(SHARED.doc_first), tostring(SHARED.doc_last),
+                        tostring(toc and #toc), tostring(footer and footer.pageno),
+                        tostring(footer and footer.pages), tostring(#chapters),
+                        tostring(ch.title), tostring((chapters[cur + 1] or {}).title)))
+                end
+                dump("at_open")
+                if os.getenv("XREAD_DIAG") == "1" then
+                    local cps = SHARED.chapters or {}
+                    for i = 1, math.min(8, #cps) do
+                        print("[XREAD_DIAG] head " .. i .. " = " .. tostring(cps[i] and cps[i].title))
+                    end
+                    for i = math.max(1, #cps - 2), #cps do
+                        print("[XREAD_DIAG] tail " .. i .. " = " .. tostring(cps[i] and cps[i].title))
+                    end
+                    local function dumpEntry(tag, i)
+                        local e = cps[i] or {}
+                        local parts = {}
+                        for k, v in pairs(e) do
+                            parts[#parts + 1] = tostring(k) .. "=" .. tostring(v)
+                        end
+                        table.sort(parts)
+                        print("[XREAD_DIAG] entry " .. tag .. " " .. table.concat(parts, " "))
+                    end
+                    dumpEntry("1", 1)
+                    dumpEntry("2", 2)
+                    dumpEntry("3", 3)
+                    dumpEntry("cur", tonumber(SHARED.index) or 1)
+                end
+                local nchap = #(SHARED.chapters or {})
+                local target = tonumber(os.getenv("XREAD_DIAG_JUMP") or "")
+                    or math.min(nchap, (tonumber(SHARED.index) or 1) + 100)
+                if nchap > 0 then target = math.max(1, math.min(nchap, target)) end
+                local book, chapters = SHARED.book, SHARED.chapters
+                if book and chapters then
+                    self:openAtChapter(book, chapters, target)
+                    UIManager:scheduleIn(8, function()
+                        dump("after_jump_" .. tostring(target))
+                        autotest_mark("flow=diag_chapter done")
+                    end)
+                else
+                    autotest_mark("flow=diag_chapter done")
+                end
+            end)
         elseif flow == "panel_stats" then
             UIManager:scheduleIn(4, function()
                 self:showQuickPanel()
@@ -976,7 +1065,7 @@ function XRead:init()
         restoreEndPopup()
     end
     SHARED.fm = self
-    -- 「更多 → 启动管理」：开机后按设置自动进入 我的首页 / 我的书架 / 原生界面
+    -- 「更多 → 首页管理」：开机后按设置自动进入 我的首页 / 我的书架 / 原生界面
     pcall(function() self:applyBootTarget() end)
     -- 冷启动预热：开机空闲时把书架缓存读进内存（只读本地文件，不联网）
     pcall(function() self:warmup() end)
@@ -1698,7 +1787,7 @@ function XRead:refreshRecentBook()
             UIManager:nextTick(function()
                 self:showBackendIssue{
                     title = _("刷新失败"),
-                    text = _("最近阅读暂时取不到，先看缓存内容。\n点「修改」检查地址和服务端。"),
+                    text = _("最近阅读暂时取不到，先看缓存内容。"),
                 }
             end)
             return
@@ -1745,17 +1834,23 @@ function XRead:refreshRecentBook()
 end
 -- 首页点左上角标题：呼出 KOReader 菜单（阅读X 入口所在）；无菜单上下文时退回更多面板
 function XRead:openReaderMenuFromHome()
-    pcall(function()
-        local Event = require("ui/event")
-        local ui = (self.ui and self.ui.menu) and self.ui
-            or ((SHARED.ui and SHARED.ui.menu) and SHARED.ui)
-            or ((SHARED.fm and SHARED.fm.ui and SHARED.fm.ui.menu) and SHARED.fm)
-        if ui then
-            ui:handleEvent(Event:new("ShowMenu"))
-        else
-            self:showMorePanel()
+    -- 直接调菜单对象的 onShowMenu：以前广播 Event("ShowMenu")，
+    -- 但 FileManager/ReaderUI 本身都不处理这个事件（只有菜单模块处理），
+    -- 事件走空 → 点标题毫无反应。这里按「菜单对象」逐层找，找到就开。
+    local candidates = { self.ui, SHARED.ui, SHARED.fm,
+        SHARED.fm and SHARED.fm.ui or nil }
+    for _i, ui in ipairs(candidates) do
+        local menu = type(ui) == "table" and ui.menu or nil
+        if menu and type(menu.onShowMenu) == "function" then
+            local ok = pcall(function() menu:onShowMenu() end)
+            if ok then return end
         end
-    end)
+    end
+    -- 兜底：没有可用菜单（例如刚退回、FM 已拆）时直接弹「更多」，别让点击石沉大海
+    if os.getenv("XREAD_AUTOTEST") then
+        print("[XREAD_AUTOTEST] header_title fallback more_panel")
+    end
+    self:showMorePanel()
 end
 -- 首页「同步」：把插件本地记录的书籍进度推到后端。
 -- 本地进度来自 meta_cache 的书架缓存（开书/手动同步时 updateShelfProgress 写入），
@@ -1770,7 +1865,7 @@ function XRead:syncProgressFromHome()
         if not ok_remote or type(remote) ~= "table" then
             self:showBackendIssue{
                 title = _("同步失败"),
-                text = _("这次没同步成功，缓存书架仍可阅读。\n点「修改」检查地址和服务端。"),
+                text = _("这次没同步成功，缓存书架仍可阅读。"),
             }
             return
         end
@@ -1918,7 +2013,7 @@ function XRead:buildHomeActions()
                     UIManager:nextTick(function()
                         self:showBackendIssue{
                             title = _("更新失败"),
-                            text = _("书架暂时更新不了，当前显示缓存内容。\n点「修改」检查地址和服务端。"),
+                            text = _("书架暂时更新不了，当前显示缓存内容。"),
                         }
                     end)
                 end
@@ -1992,7 +2087,7 @@ function XRead:showHome(page)
             else
                 self:showBackendIssue{
                     title = _("首页加载失败"),
-                    text = _("暂时取不到书架，可以先看本地缓存。\n点「修改」检查地址和账号。"),
+                    text = _("暂时取不到书架，可以先看本地缓存。"),
                 }
             end
         end, { on_fail = function() self._home_loading = false end })
@@ -2004,7 +2099,7 @@ function XRead:showHome(page)
     if not books or #books == 0 then
         self:showBackendIssue{
             title = _("首页加载失败"),
-            text = _("书架暂时是空的，可能还没同步。\n点「修改」检查地址和账号。"),
+            text = _("书架暂时是空的，可能还没同步。"),
         }
         return
     end
@@ -2233,7 +2328,7 @@ function XRead:showBookshelf(page, cached_books)
     if not ok then
         self:showBackendIssue{
             title = _("获取书架失败"),
-            text = tostring(books) .. "\n" .. _("点「修改」检查地址和服务端。"),
+            text = tostring(books),
         }
         -- 书架没开起来：恢复首页心跳（openShelf 开头为让路停掉了它）
         local home = self._home_view
@@ -2822,6 +2917,11 @@ end
 -- 之前是「关目录 + 立即全刷 + switchDocument」，中间空档会把书架画出来，
 -- 真机表现为点章节先闪一下书架再进正文。
 function XRead:jumpToChapterFromCatalog(view, book, chapters, i)
+    if os.getenv("XREAD_DIAG") == "1" then
+        print(string.format("[XREAD_DIAG] catalog_tap i=%s total=%s title=%s cur=%s",
+            tostring(i), tostring(chapters and #chapters),
+            tostring(chapters and chapters[i] and chapters[i].title), tostring(SHARED.index)))
+    end
     if self._switch_overlay and self._switch_overlay ~= view then
         pcall(function() UIManager:close(self._switch_overlay) end)
     end
@@ -2935,6 +3035,23 @@ function XRead:openBook(book)
                 self:_cancelOpenBook()
                 return
             end
+            -- 进入同步：开书前主动拉一次云端进度，跟随其它设备读到的最新章。
+            -- 失败/未开启时保持本地缓存位置，不影响开书。
+            if self:syncOnOpenEnabled() then
+                local cloud = self:fetchCloudChapterIndex(book)
+                if cloud and cloud ~= start then
+                    start = cloud
+                    book.durChapterIndex = cloud - 1
+                    if chapters and start > #chapters then start = #chapters end
+                    pcall(function()
+                        self.meta_cache:updateShelfProgress(
+                            book.bookUrl or book.name, cloud - 1, os.time())
+                    end)
+                    if os.getenv("XREAD_AUTOTEST") then
+                        print("[XREAD_AUTOTEST] sync_open chapter=" .. tostring(cloud))
+                    end
+                end
+            end
             local chs = chapters
             if not chs or #chs == 0 then
                 chs = self.client:getChapterList(book)
@@ -2971,6 +3088,11 @@ end
 -- 抓“当前这一章”（本地分片有就直接用），拼好 TXT 立刻打开；
 -- 剩下的章节交给后台静默缓存。
 function XRead:openAtChapter(book, chapters, index)
+    if os.getenv("XREAD_DIAG") == "1" then
+        print(string.format("[XREAD_DIAG] open_at index=%s total=%s title=%s",
+            tostring(index), tostring(chapters and #chapters),
+            tostring(chapters and chapters[index] and chapters[index].title)))
+    end
     local max_chapters = tonumber(self:getSetting("max_chapters", "3")) or 3
     if max_chapters < 1 then max_chapters = 1 end
     local last = math.min(index + max_chapters - 1, #chapters)
@@ -3049,7 +3171,10 @@ function XRead:openAtChapter(book, chapters, index)
         return
     end
     SHARED.book, SHARED.chapters, SHARED.index = book, chapters, index
-    SHARED.doc_first, SHARED.doc_last = index, last
+    -- doc_last 必须是「真正写进文件的最后一章」：原来填的是计划范围的上界 last，
+    -- 中途某章没缓存上时上界比实际大，TOC 条目数就和 doc_count 对不上，
+    -- 页码→章节换算会走进比例兜底，显示成完全不相干的章节。
+    SHARED.doc_first, SHARED.doc_last = index, math.max(index, contig_end)
     SHARED.txt_path, SHARED.txt_size = path, fileSize(path)
     if os.getenv("XREAD_AUTOTEST") == "opentime" then
         print("[XREAD_AUTOTEST] opentime: html_written=" .. autotest_now())
@@ -3489,8 +3614,7 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
                     local count = self:cacheDepthCount()
                     if count == nil then
                         MessageBox.show{
-                            title = _("未设置缓存章节数"),
-                            text = _("请先在我的首页 → 设置 → 缓存管理里\n选择「服务器缓存预加载章节数」（50 章 / 100 章 / 全部），\n再回来点「缓存」。"),
+                            text = _("请设置服务器预缓存章节数"),
                             sticky = true,
                             buttons = { { text = _("知道了") } },
                         }
@@ -3843,6 +3967,37 @@ a, a * { color: #F2F2F2 !important; }
 end
 -- 正文局部夜晚：只改文档样式，不动 Screen 反色，所以菜单和弹出页不受影响。
 -- 复用 applyParaIndent 的样式表入口，避免覆盖用户已有的 style tweaks。
+-- 书内「夜晚」只改正文颜色（不整屏反色），而页脚是 ReaderFooter 自己画的
+-- 白色 FrameContainer，于是出现「正文黑、页脚白」这种半截反色。
+-- 这里按「源色」把页脚底色 / 文字色一起翻过来：
+--   书内夜晚 ≠ 全局夜晚 → 页脚写深色（正片是黑底白字）
+--   相等           → 写浅色（正片白底黑字；全局夜晚时由整屏反色负责翻黑）
+function XRead:_applyReaderChromeNight()
+    local ui = self.ui
+    if not ui then return end
+    local footer = ui.view and ui.view.footer
+    if not footer then return end
+    local dark = self:_bookNightSourceDark()
+    local Blitbuffer = require("ffi/blitbuffer")
+    pcall(function()
+        -- 页脚容器会被 updateFooterContainer 按白底重建，所以先重建再改色
+        if footer.updateFooterContainer then footer:updateFooterContainer() end
+        if footer.footer_content then
+            footer.footer_content.background =
+                dark and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
+        end
+        if footer.footer_text then
+            footer.footer_text.fgcolor =
+                dark and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+        end
+        if footer.resetLayout then footer:resetLayout(true) end
+        if footer.updateFooterText then footer:updateFooterText(true) end
+    end)
+    if os.getenv("XREAD_AUTOTEST") then
+        print("[XREAD_AUTOTEST] chrome_night dark=" .. tostring(dark))
+    end
+end
+
 function XRead:_applyBookNightCss()
     local ui = self.ui
     if not (ui and ui.document) then return end
@@ -3854,6 +4009,8 @@ function XRead:_applyBookNightCss()
         end
     end)
     pcall(function() self:applyParaIndent() end)
+    -- 正文换色后页脚也要跟着换，否则夜里正文黑、页脚一条白
+    self:_applyReaderChromeNight()
 end
 
 function XRead:toggleNightMode()
@@ -4089,6 +4246,20 @@ function XRead:_refreshReaderChromeFromPage()
     local idx = pageChapterIndex(ui, footer and footer.pageno, SHARED.chapters,
         SHARED.doc_first, SHARED.doc_last)
     if idx then SHARED.index = idx end
+    if os.getenv("XREAD_AUTOTEST") and idx then
+        local first = tonumber(SHARED.doc_first)
+        local last = tonumber(SHARED.doc_last)
+        if first and last and (idx < first or idx > last) then
+            print("[XREAD_AUTOTEST] chapter_index_out_of_range idx=" .. tostring(idx)
+                .. " first=" .. tostring(first) .. " last=" .. tostring(last))
+        end
+    end
+    if os.getenv("XREAD_DIAG") == "1" then
+        local toc = ui and ui.toc and ui.toc.toc
+        print(string.format("[XREAD_DIAG] refresh pageno=%s toc=%s first=%s last=%s pages=%s idx=%s total=%s",
+            tostring(footer and footer.pageno), tostring(toc and #toc), tostring(SHARED.doc_first),
+            tostring(SHARED.doc_last), tostring(footer and footer.pages), tostring(idx), tostring(total)))
+    end
     local cur = math.max(1, math.min(tonumber(SHARED.index) or 1, math.max(1, total)))
     local ch = (SHARED.chapters and SHARED.chapters[cur]) or {}
     local ch_title = ch.title or ch.name
@@ -4285,6 +4456,15 @@ function XRead:_restoreReaderFooter()
             footer:applyFooterMode(orig_mode)
         end
         if footer.updateFooterContainer then footer:updateFooterContainer() end
+        -- 退出本书时把书内夜晚改过的页脚颜色还原成默认（白底黑字），
+        -- 否则同一 ReaderUI 实例的底栏会留着白字，下本书的白色页脚上看不见
+        local Blitbuffer = require("ffi/blitbuffer")
+        if footer.footer_content then
+            footer.footer_content.background = Blitbuffer.COLOR_WHITE
+        end
+        if footer.footer_text then
+            footer.footer_text.fgcolor = Blitbuffer.COLOR_BLACK
+        end
         if footer.resetLayout then footer:resetLayout(true) end
         if footer.updateFooterText then footer:updateFooterText(true) end
     end)
@@ -4361,6 +4541,8 @@ function XRead:_applyReaderFooter()
     if os.getenv("XREAD_AUTOTEST") then
         print("[XREAD_AUTOTEST] footer apply: " .. tostring(ok) .. " " .. tostring(err))
     end
+    -- 底栏刚被按白底重建：书内夜晚时要把底色/文字色再翻一次
+    self:_applyReaderChromeNight()
 end
 -- 扫描 TXT 正文里的 "== 章节标题 ==" 行，构建 页码->章节 映射并注入 KOReader TOC。
 -- HTML 正文：crengine 从 h2 自动生成原生 TOC，无需注入；纯 TXT 才走扫描注入。
@@ -4475,6 +4657,9 @@ function XRead:onCloseDocument()
         SHARED.ui = nil
     end
     if SHARED.txt_path == path then
+        -- 退出同步：关书时把当前章上传到云端。放在清空 SHARED.index 之前，
+        -- 失败静默（后端刚判定不可达时直接跳过，不让关书卡在网络超时上）。
+        self:_uploadProgressOnExit()
         SHARED.txt_path = nil
         SHARED.txt_size = nil
         restoreEndPopup()
@@ -4857,12 +5042,13 @@ function XRead:showMorePanel()
         { label = _("我的书架"), callback = function() self:openShelf() end },
         { label = _("地址管理"), callback = function() self:showServerManage() end },
         { label = _("账号管理"), callback = function() self:showAccountManage() end },
-        { label = _("启动管理"), callback = function() self:showBootManage() end },
+        { label = _("首页管理"), callback = function() self:showBootManage() end },
+        { label = _("升级管理"), callback = function() self:showUpdateManage() end },
         { label = _("关于本机"), callback = function() self:showAboutPanel() end },
     }, { hint = _("点击条目进入；点空白处返回。") })
 end
 
--- ---------- 启动管理：系统启动后自动进入哪个界面 ----------
+-- ---------- 首页管理：开机后自动进入哪个界面 ----------
 -- 三选一：我的首页 / 我的书架 / 原生界面（进入 KOReader 文件管理器）
 -- 文案只留「名字 + 一句说明」：右侧说明只在真有补充信息时才写，
 -- 避免出现「默认」「直接进书架网格」这类和左边重复的废话。
@@ -4894,7 +5080,7 @@ function XRead:showBootManage()
             end,
         }
     end
-    self:showMoreListPanel(_("启动管理"), items, {
+    self:showMoreListPanel(_("首页管理"), items, {
         hint = _("开机后自动进入的界面，下次开机生效。"),
     })
 end
@@ -4947,33 +5133,90 @@ function XRead:notifyUpdateAvailable()
     local info = self._update_info
     if not info or not info.newer then return end
     local via_local = tostring(info.via or "") == "local"
-    -- 更新说明截断：首页卡片不能因为一段超长 notes 撑出屏幕
-    local notes = tostring(self._update_notes or ""):gsub("%s+", " ")
-    if notes == "" then notes = _("提升阅读与缓存稳定性") end
-    if #notes > 90 then notes = notes:sub(1, 90) .. "…" end
+    -- 一句话说清「有新版本 / 在哪」；更新说明不再塞进弹窗（点「去更新」看关于页）
     local text = via_local
-        and T(_("插件目录里已准备好新版本 %1，装完自动重启即可生效。\n\n更新内容：%2"),
-            tostring(info.remote_version or ""), notes)
-        or T(_("发现可用新版本 %1（当前 %2）。\n\n更新内容：%3"),
-            tostring(info.remote_version or ""), tostring(info.local_version or ""), notes)
+        and T(_("插件目录里已备好新版本 %1，更新后自动重启。"),
+            tostring(info.remote_version or ""))
+        or T(_("发现新版本 %1（当前 %2）。"),
+            tostring(info.remote_version or ""), tostring(info.local_version or ""))
     MessageBox.show{
         title = _("发现新版本"),
         text = text,
         sticky = true,
         buttons = {
+            { text = _("去更新"), bold = true,
+              callback = function() self:showAboutPanel() end },
             { text = _("稍后"), callback = function() end },
-            { text = _("去更新"), callback = function() self:showAboutPanel() end },
         },
     }
+end
+-- ---------- 升级管理：自动检查周期 ----------
+-- 一小时 / 一天 / 一周 / 启动时（默认一天）。周期只管「自动检查」，
+-- 手动「检查更新」不受影响。周期改完立即重排下一次检查。
+local UPDATE_PERIODS = {
+    { key = "1h",   label = _("一小时") },
+    { key = "1d",   label = _("一天") },
+    { key = "1w",   label = _("一周") },
+    { key = "boot", label = _("启动时") },
+}
+local UPDATE_PERIOD_SECONDS = { ["1h"] = 3600, ["1d"] = 86400, ["1w"] = 7 * 86400 }
+
+function XRead:updateCheckPeriod()
+    local v = tostring(self:getSetting("update_period", "1d") or "1d")
+    for _i, p in ipairs(UPDATE_PERIODS) do
+        if p.key == v then return v end
+    end
+    return "1d"
+end
+
+function XRead:showUpdateManage()
+    local cur = self:updateCheckPeriod()
+    local items = {}
+    for _i, p in ipairs(UPDATE_PERIODS) do
+        local key = p.key
+        items[#items + 1] = {
+            label = (key == cur and "● " or "○ ") .. p.label,
+            callback = function()
+                self:saveSetting("update_period", key)
+                self:_scheduleNextUpdateCheck()
+                self:showUpdateManage()   -- 重建回显当前选择
+            end,
+        }
+    end
+    self:showMoreListPanel(_("升级管理"), items, {
+        hint = _("自动检查新版本的周期；发现新版才提示。"),
+    })
 end
 -- 书架/首页显示后错峰静默检查新版本（失败完全无声，仅首次发现时提示一次）
 function XRead:quietUpdateCheck(delay)
     if os.getenv("XREAD_NO_UPDATER") == "1" then return end
-    -- 一次会话只查一次：首页会反复重建，别每次都发一遍列目录请求
-    if self._update_checked then return end
+    -- 首页会反复重建，别每次都发一遍列目录请求：整个会话只起一条检查链
+    if self._update_check_started then return end
+    self._update_check_started = true
     self._update_checked = true
-    UIManager:scheduleIn(delay or 10, function()
-        Trapper:wrap(function()
+    UIManager:scheduleIn(delay or 10, function() self:_runUpdateCheck() end)
+end
+
+--- 按「升级管理」里的周期排下一次自动检查（「启动时」= 不重复）
+function XRead:_scheduleNextUpdateCheck()
+    if os.getenv("XREAD_NO_UPDATER") == "1" then return end
+    if self._update_timer then
+        pcall(function() UIManager:unschedule(self._update_timer) end)
+        self._update_timer = nil
+    end
+    local secs = UPDATE_PERIOD_SECONDS[self:updateCheckPeriod()]
+    if not secs then return end
+    self._update_timer = function()
+        self._update_timer = nil
+        self:_runUpdateCheck()
+    end
+    UIManager:scheduleIn(secs, self._update_timer)
+end
+
+--- 跑一次静默检查；先排下一次，本轮失败也不会把周期链断掉
+function XRead:_runUpdateCheck()
+    self:_scheduleNextUpdateCheck()
+    Trapper:wrap(function()
             local ok, updater = pcall(function()
                 return require("xread/updater"):new{ client = self.client }
             end)
@@ -5021,7 +5264,6 @@ function XRead:quietUpdateCheck(delay)
                 end
             end
         end)
-    end)
 end
 -- 关于本机：插件版本 / 后端版本 / 固件版本 / 检查更新
 function XRead:showAboutPanel()
@@ -5219,20 +5461,13 @@ function XRead:confirmUpdate()
         -- 面板比确认框大：面板关掉后必须整屏重刷，否则它露在框外的边缘会留成残影
         UIManager:setDirty("all", "full")
     end
-    local notes = manifest.notes or ""
-    if #notes > 300 then notes = notes:sub(1, 300) .. "…" end
-    if notes ~= "" then notes = "\n\n更新内容：" .. notes end
-    -- 本地包直接安装；远端包下载整包后文件级差异在下载后判定
-    local src_line = info.via == "local" and "\n（本地更新包，无需联网）" or ""
-    -- 唯一确认框：更新 + 重启合并成一次询问，装完不再二次确认
-    local body = T(_("新版本 %1 已就绪，请尽快更新%2%3\n\n点「更新并重启」后立即安装，装完自动重启 KOReader 生效。"),
-        tostring(info.remote_version), src_line, notes)
+    -- 唯一确认框：一句话说明，更新 + 重启合并成一次询问
+    local body = T(_("新版本 %1 已就绪，更新后自动重启。"), tostring(info.remote_version))
     local owner = self
     local box
     box = MessageBox.confirm{
         text = body,
         ok_text = _("更新并重启"),
-        cancel_text = _("取消"),
         -- 更新前这一步关框后整屏重刷一次，清掉叠层残影
         full_refresh = true,
         callback = function(ok)
@@ -6581,6 +6816,62 @@ function XRead:zhMode()
     if v ~= "s" and v ~= "t" then return "none" end
     return v
 end
+
+-- ---------- 进度同步：进入同步 / 退出同步 ----------
+-- 进入同步：打开书籍时主动从云端拉一次进度，而不是只用本地缓存的旧书架位置。
+-- 退出同步：关闭书籍时把当前章节上传到云端。
+-- 默认「进入开、退出关」：开书位置跟随云端，关书不额外发请求。
+function XRead:syncOnOpenEnabled()
+    return tostring(self:getSetting("sync_on_open", "1") or "1") ~= "0"
+end
+
+function XRead:syncOnExitEnabled()
+    return tostring(self:getSetting("sync_on_exit", "0") or "0") == "1"
+end
+
+-- 云端进度快照（模块级）：60s 内连续开书只拉一次书架，
+-- 避免每开一本书都在 UI 线程上多等一个网络往返。
+local CLOUD_PROGRESS = { at = 0, map = nil }
+
+--- 拉一次云端进度，返回这本书的 1 基章节号（拿不到返回 nil）
+-- 只认 bookUrl 相同的那本：书架里同名不同源的书很常见，不能按书名对位。
+function XRead:fetchCloudChapterIndex(book)
+    if not (book and book.bookUrl) then return nil end
+    local url = tostring(book.bookUrl)
+    local now = os.time()
+    if not (CLOUD_PROGRESS.map and (now - CLOUD_PROGRESS.at) < 60) then
+        local ok, shelf = pcall(function()
+            return self.client:getBookshelf(1, { timeout = 4 })
+        end)
+        if not ok or type(shelf) ~= "table" then return nil end
+        local map = {}
+        for _i, b in ipairs(shelf) do
+            local u = tostring(b.bookUrl or "")
+            if u ~= "" then map[u] = tonumber(b.durChapterIndex) end
+        end
+        CLOUD_PROGRESS.at, CLOUD_PROGRESS.map = now, map
+    end
+    local idx = CLOUD_PROGRESS.map[url]
+    if idx and idx >= 0 then return idx + 1 end
+    return nil
+end
+
+--- 退出同步的实际动作：把当前章推到云端，并同步写进本地书架缓存
+function XRead:_uploadProgressOnExit()
+    if not self:syncOnExitEnabled() then return end
+    local book, idx = SHARED.book, tonumber(SHARED.index)
+    if not (book and idx) then return end
+    if not self:_backendUsable() then return end
+    local zero = math.max(0, idx - 1)
+    local ok = pcall(function() self.client:saveBookProgress(book, zero) end)
+    if not ok then return end
+    pcall(function()
+        self.meta_cache:updateShelfProgress(book.bookUrl or book.name, zero, os.time())
+    end)
+    if os.getenv("XREAD_AUTOTEST") then
+        print("[XREAD_AUTOTEST] sync_exit chapter=" .. tostring(idx))
+    end
+end
 -- 简繁切换：切完要把当前正文文件按新模式重拼一遍再热重载，
 -- 否则已经在看的这一章还是旧字形（下一章才会生效）。
 function XRead:applyZhConvert(mode)
@@ -6604,6 +6895,7 @@ function XRead:applyZhConvert(mode)
             n = n + 1
         end
         if n == 0 then error("no cached text") end
+        SHARED.doc_last = index + n - 1
         local f = io.open(SHARED.txt_path, "w")
         if not f then error("open failed") end
         f:write(table.concat(parts))
@@ -6618,11 +6910,7 @@ function XRead:applyZhConvert(mode)
     UIManager:nextTick(function() hotReload(ui, SHARED.txt_path) end)
 end
 
--- ---------- 正文里的「设置」：页面管理 / 字体管理 / 翻页管理（卡片分组） ----------
-local BOOK_PAGE_MODE_TEXT = {
-    default = { label = _("上下分区"), desc = _("上点上一页 · 下点下一页") },
-    left_right = { label = _("左右分区"), desc = _("左点上一页 · 右点下一页") },
-}
+-- ---------- 正文里的「设置」：页面管理 / 字体管理 / 同步管理（卡片分组） ----------
 
 function XRead:showBookSettingsPanel()
     -- 防重叠：已有面板开着先关掉（改任意一项都会重建面板回显）
@@ -6920,36 +7208,33 @@ function XRead:showBookSettingsPanel()
         refreshDialog()
     end))
 
-    -- ---------- 翻页管理：两种分区方案，选中即生效 ----------
-    local cur_mode = self:currentPageMode()
-    local page_keys = {}
-    for key in pairs(PAGE_MODES) do page_keys[#page_keys + 1] = key end
-    table.sort(page_keys, function(a, b)
-        if (a == "default") ~= (b == "default") then return a == "default" end
-        return tostring(a) < tostring(b)
+    -- ---------- 同步管理：两个开关，可以同时开 ----------
+    -- 翻页管理已从这里移出（与首页齿轮「设置 → 翻页管理」重复，同一功能两处入口）。
+    local enter_sync_row = toggleRow(_("进入同步"), self:syncOnOpenEnabled(), function()
+        self:saveSetting("sync_on_open", self:syncOnOpenEnabled() and "0" or "1")
     end)
-    local page_rows = {}
-    for _i, key in ipairs(page_keys) do
-        local info = BOOK_PAGE_MODE_TEXT[key] or {}
-        local chosen = key == cur_mode
-        local mode_key = key
-        page_rows[#page_rows + 1] = row(
-            (chosen and "● " or "○ ") .. tostring(info.label or key),
-            tostring(info.desc or ""),
-            function()
-                self:saveSetting("page_mode", mode_key)
-                pcall(function() self:setupCenterTap() end)   -- 阅读中即时生效
-                refreshDialog()
-            end,
-            { value_face = face_desc, selected = chosen })
-    end
+    local exit_sync_row = toggleRow(_("退出同步"), self:syncOnExitEnabled(), function()
+        self:saveSetting("sync_on_exit", self:syncOnExitEnabled() and "0" or "1")
+    end)
+    local sync_hint = VerticalGroup:new{ align = "left",
+        TextWidget:new{
+            text = _("进入同步：打开书籍自动拉取云端进度"),
+            face = face_desc, fgcolor = Blitbuffer.COLOR_GRAY_6, max_width = inner_w,
+        },
+        TextWidget:new{
+            text = _("退出同步：关闭书籍自动上传当前进度"),
+            face = face_desc, fgcolor = Blitbuffer.COLOR_GRAY_6, max_width = inner_w,
+        },
+    }
     local rows = VerticalGroup:new{ align = "left" }
     rows[#rows + 1] = groupTitle(_("页面管理"))
     rows[#rows + 1] = card({ indent_row, footer_row })
     rows[#rows + 1] = groupTitle(_("字体管理"))
     rows[#rows + 1] = card({ font_face_row, font_size_row, bold_row, zh_row })
-    rows[#rows + 1] = groupTitle(_("翻页管理"))
-    rows[#rows + 1] = card(page_rows)
+    rows[#rows + 1] = groupTitle(_("同步管理"))
+    rows[#rows + 1] = card({ enter_sync_row, exit_sync_row })
+    rows[#rows + 1] = VerticalSpan:new{ width = Screen:scaleBySize(6) }
+    rows[#rows + 1] = sync_hint
     rows[#rows + 1] = VerticalSpan:new{ width = Screen:scaleBySize(14) }
     rows[#rows + 1] = TextWidget:new{
         text = _("改动即时生效并自动保存；点空白处或右上角 ✕ 关闭。"),
@@ -7287,8 +7572,7 @@ function XRead:doCacheBook(book, count)
     if wanted == nil then wanted = self:cacheDepthCount() end
     if wanted == nil then
         MessageBox.show{
-            title = _("未设置缓存章节数"),
-            text = _("请先在我的首页 → 设置 → 缓存管理里\n选择「服务器缓存预加载章节数」，再缓存。"),
+            text = _("请设置服务器预缓存章节数"),
             sticky = true,
             buttons = { { text = _("知道了") } },
         }

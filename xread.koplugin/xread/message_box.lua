@@ -20,9 +20,9 @@ local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
+local _ = require("gettext")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local RightContainer = require("ui/widget/container/rightcontainer")
 local UICommon = require("xread/ui_common")
@@ -38,8 +38,8 @@ local M = {}
 -- 逻辑尺寸：字体由 Font:getFace 内部 scaleBySize（font.lua:276），
 -- 间距和按钮高度必须自己 scaleBySize，否则 300dpi 屏上只有十几像素，文字会贴边。
 local PAD = 16              -- 卡片内边距
-local GAP_HEAD = 10         -- 标题与分隔线
-local GAP_BODY = 12         -- 分隔线与正文 / 正文与按钮
+local GAP_HEAD = 8          -- 标题与正文
+local GAP_BODY = 12         -- 正文与按钮
 local BTN_H = 36            -- 按钮行高度
 local CARD_RATIO = 0.72     -- 卡片宽度占屏比（固定宽度，保证所有提示框等宽）
 local CARD_MAX = 560        -- 卡片宽度上限（小屏用比例，大屏别太宽）
@@ -183,7 +183,8 @@ function Box:init()
     local close_w = UICommon.closeButtonSize()
     content[#content + 1] = VerticalSpan:new{ width = close_w }
 
-    -- 标题 + 分隔线（可选）
+    -- 标题（可选）：不再跟一条分割线，标题和正文之间只留一点空白，
+    -- 让整张卡片保持「一句话说明」的轻量感。
     if self.title and self.title ~= "" then
         content[#content + 1] = TextWidget:new{
             text = self.title,
@@ -193,11 +194,6 @@ function Box:init()
             max_width = inner_w,
         }
         content[#content + 1] = VerticalSpan:new{ width = Screen:scaleBySize(GAP_HEAD) }
-        content[#content + 1] = LineWidget:new{
-            dimen = Geom:new{ w = inner_w, h = 1 },
-            background = C_LINE,
-        }
-        content[#content + 1] = VerticalSpan:new{ width = Screen:scaleBySize(GAP_BODY) }
     end
 
     -- 正文（已折行，每行一个 TextWidget，居中）
@@ -216,10 +212,6 @@ function Box:init()
     if n_btn > 0 then
         local btn_h = Screen:scaleBySize(BTN_H)
         content[#content + 1] = VerticalSpan:new{ width = Screen:scaleBySize(GAP_BODY) }
-        content[#content + 1] = LineWidget:new{
-            dimen = Geom:new{ w = inner_w, h = 1 },
-            background = C_LINE,
-        }
         local row = HorizontalGroup:new{ align = "center" }
         local bw = math.floor(inner_w / n_btn)
         for i = 1, n_btn do
@@ -228,8 +220,9 @@ function Box:init()
                 text = btn.text,
                 width = (i == n_btn) and (inner_w - bw * (n_btn - 1)) or bw,
                 height = btn_h,
-                -- 最后一个按钮（确定/删除）加粗，主次分明
-                bold = (i == n_btn),
+                -- 加粗跟着「主操作」走，不再跟着位置（按钮顺序换了也要主次分明）；
+                -- 只有一个按钮（知道了/好）时默认加粗。
+                bold = btn.bold == true or n_btn == 1,
                 callback = function()
                     if btn.callback then pcall(btn.callback) end
                     self:close()
@@ -353,7 +346,9 @@ function M.close()
     end
 end
 
---- 统一确认框：取消 / 确定（确定加粗）
+--- 统一确认框：主操作（确定/删除/修改）在左并加粗，忽略在右。
+--- 原来左「取消」右「确定」，取消和右上角 ✕ 重复；现在统一改成
+--- 「主操作 + 忽略」，忽略就是原来的取消语义（关闭弹窗、什么都不做）。
 function M.confirm(opts)
     opts = opts or {}
     local cb = opts.callback
@@ -371,10 +366,16 @@ function M.confirm(opts)
         full_refresh = opts.full_refresh == true,
         sticky = opts.sticky == true,
         buttons = {
-            { text = opts.cancel_text or "取消", callback = function() finish(false) end },
-            { text = opts.ok_text or "确定", callback = function() finish(true) end },
+            {
+                text = opts.ok_text or "确定", bold = true,
+                callback = function() finish(true) end,
+            },
+            {
+                text = opts.cancel_text or _("忽略"),
+                callback = function() finish(false) end,
+            },
         },
-        -- 返回键关闭 = 取消
+        -- 返回键关闭 = 忽略
         on_close = function() finish(false) end,
     }
 end
