@@ -12,7 +12,10 @@ emu_start "home"
 emu_wait_mark "mode=home done" 180
 emu_settle 8
 emu_tap 1005 45; sleep 4     # 开更多面板
-emu_tap 400 1000; sleep 12   # 点「关于本机」（第6项）
+# 「关于本机」的 y 由面板自己打印（more_row），不再写死第 6 项的 1000
+AY=$(grep -a "more_row text=关于本机 " "$EMU_LOG" | tail -1 | sed -n 's/.*y=\([0-9]*\).*/\1/p')
+[ -z "$AY" ] && AY=1000
+emu_tap 400 "$AY"; sleep 12  # 点「关于本机」
 emu_wait_mark "about_server_version" 40
 assert_log_contains "about_server_version v[0-9]" "后端版本已获取到具体版本号"
 assert_no_fatal

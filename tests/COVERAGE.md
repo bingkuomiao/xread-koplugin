@@ -11,13 +11,13 @@
 | 静态质量 | 全部 `.lua` 可被 LuaJIT 解析 | 09_syntax |
 | 交付一致性 | zip / 源码 / 部署三方 md5 完全一致 | 10_package_consistency |
 | 书架 | 加载、网格、空/异常数据、翻页 | 01_shelf_smoke、25_layout_edge、26_shelf_paging |
-| 首页 | 首屏渲染、hero 卡、刷新按钮、简介清洗 | 06_home、22_home_hero_cache |
+| 首页 | 首屏渲染、hero 卡、刷新按钮、简介清洗、长书名排版 | 06_home、22_home_hero_cache、36_hero_title |
 | 首页按钮 | 更新/搜索/同步/夜晚/设置 逐个点击 | 15a_home_buttons |
 | 首页 ↔ 书架 | 进入书架、返回首页、不叠层 | 20_shelf_back、05_back_to_shelf |
 | 开书 / 正文 | 点书进入、正文渲染、翻页 | 02_reading_open、14_full_flow_touch |
 | 阅读工具栏 | 呼出、按钮布局、目录图标、返回书架 | 03_toolbar、08_toolbar_catalog_tap、15b_toolbar_buttons |
 | 目录 | 打开、跳章、缓存态高亮、翻章后章节名同步 | 04_catalog、22_home_hero_cache（chapter_sync） |
-| 更多菜单 | 我的书架/地址管理/账号管理/首页管理/升级管理/关于本机 | 15c_more_menu |
+| 更多菜单 | 我的书架/地址管理/账号管理/首页管理/升级管理/关于本机/系统设置 | 15c_more_menu |
 | 设置面板 | 地址、账号、翻页、缓存章节数单选 | 22_home_hero_cache（settings / cache_none） |
 | 阅读统计 | 统计页渲染 | 07_stats |
 | 缓存 | 整本预缓存、未设置章节数时的引导、缓存失败常驻卡 | 15b_toolbar_buttons（cache）、22_home_hero_cache |
@@ -40,7 +40,7 @@
 |---|---|
 | 任意 `.lua` 语法/结构 | 09_syntax、10_package_consistency |
 | `ui_scale.lua`、字号/间距常量 | 23_display_size、06_home、25_layout_edge |
-| `home_view.lua` | 06_home、22_home_hero_cache、15a_home_buttons、23 |
+| `home_view.lua` | 06_home、36_hero_title、22_home_hero_cache、15a_home_buttons、23 |
 | `full_shelf_view.lua` / `shelf_grid.lua` | 01_shelf_smoke、25_layout_edge、26_shelf_paging、20_shelf_back |
 | `catalog_view.lua` | 04_catalog、08_toolbar_catalog_tap、22（chapter_sync） |
 | `reader_toolbar.lua` | 03_toolbar、15b_toolbar_buttons |
@@ -48,6 +48,7 @@
 | `memory.lua` / 缓存策略 | 28_memory_low、26_shelf_paging、06_home |
 | `updater.lua` / 打包脚本 | 12、16、18、19、13、10 |
 | `cover_cache.lua` | 17_cover_api、06_home、22 |
+| `showMoreListPanel` / 更多菜单增删条目 | 15c_more_menu、29_about_version（坐标按 `more_row` 日志解析） |
 | `message_box.lua` / `showInfo` / 任何弹窗文案 | 35_notice_no_auto_dismiss、22（msgbox/msgconfirm）、15c_more_menu |
 
 ## 三、自动化测不到的部分（必须真机/人工）
@@ -122,3 +123,14 @@
   - 按钮坐标由 `message_box.lua` 在 `XREAD_AUTOTEST` 下打印，**不要手写坐标**：
     字号/DPI/文案行数一变就会点偏。
   - 相关日志标记：`notice_shown id=<n>`、`notice_closed id=<n>`、`box_geom ...`。
+
+## 八、v0.6.34 英雄卡与更多面板
+
+- 英雄卡书名不再和右上角刷新图标同行：图标独占第一行，书名下移一行并用满 `text_w`。
+  8 字书名（三国之蜀汉我做主）不再折成「…我做」+「主」。
+  `36_hero_title`（flow=`hero_title`）把书名换成长标题重排后截图，人工复核折行。
+- 更多面板 7 项（新增「系统设置」= 点左上角「阅读X」同一入口）。
+  关闭面板时补 `UIManager:setDirty("all","full")` —— 整屏面板关掉后只刷局部会在底部留残影，
+  打开 KOReader 菜单时最明显。
+- 更多面板在 `XREAD_AUTOTEST` 下打印 `more_row text=<标签> x=<x> y=<y>`：
+  15c / 29 改为按标签取坐标，增删菜单项不必再改用例里的硬编码 y。

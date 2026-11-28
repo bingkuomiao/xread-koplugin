@@ -9,7 +9,7 @@
 tests/
 ├── CASE_INDEX.md          本文件：用例索引 + 判定规则 + 坐标基准
 ├── lib/common.sh          公共库：模拟器启停、验收标记等待、断言、截图
-├── cases/01..35/*.sh      独立用例（12=zip 更新，13=包留存策略，16=按版本挑最新，17=封面单测，18=tar.gz 更新，19=本地包更新，31=静默检查更新，34=更新器建目录，35=提示卡不自动消失；11 旧散文件用例已移除）
+├── cases/01..36/*.sh      独立用例（12=zip 更新，13=包留存策略，16=按版本挑最新，17=封面单测，18=tar.gz 更新，19=本地包更新，31=静默检查更新，34=更新器建目录，35=提示卡不自动消失，36=英雄卡长书名；11 旧散文件用例已移除）
 ├── reports/<时间戳>/      每次运行归档：SUMMARY.md + 逐用例日志 + 截图
 └── run_all.sh             统一入口（--full / --quick / --only）
 ```
@@ -50,6 +50,7 @@ tests/
 | 33_catalog_jump_range | 目录跳章范围 | `open` + `FLOW=diag_chapter` | `after_jump_<n> index=<n>` 落在当前文档范围，无 `chapter_index_out_of_range` | ~90s |
 | 34_updater_ensure_dir | 更新器建目录 | `home` + `FLOW=updater_ensure_dir` | 相对/绝对路径都能建出 `a/b`，mode=directory | ~60s |
 | 35_notice_no_auto_dismiss | 提示卡不自动消失（v0.6.33） | `home` + `FLOW=notice_demo` | 弹卡后静置 12s 无 `notice_closed`；点「知道了」后才出现同 id 关闭标记 | ~90s |
+| 36_hero_title | 英雄卡长书名排版（v0.6.34） | `home` + `FLOW=hero_title`（书名换成「三国之蜀汉我做主」） | `flow=hero_title done ok=true`；截图人工复核书名在刷新图标下一行且完整 | ~90s |
 
 ## 运行方式
 

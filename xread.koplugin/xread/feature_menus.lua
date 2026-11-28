@@ -39,6 +39,9 @@ function M.install(env)
             { label = _("首页管理"), callback = function() self:showBootManage() end },
             { label = _("升级管理"), callback = function() self:showUpdateManage() end },
             { label = _("关于本机"), callback = function() self:showAboutPanel() end },
+            -- 「系统设置」= 点左上角「阅读X」的同一个入口（KOReader 自身菜单），
+            -- 给「不想去点标题」的用户留一条明路。
+            { label = _("系统设置"), callback = function() self:openReaderMenuFromHome() end },
         }, { hint = _("点击条目进入；点空白处返回。") })
     end
 

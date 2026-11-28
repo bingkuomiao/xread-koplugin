@@ -226,6 +226,21 @@ function M.install(env)
                 check("absolute", "/tmp/xread_abstest/a/b")
                 mark("flow=updater_ensure_dir done")
             end)
+        elseif flow == "hero_title" then
+            -- 回归（v0.6.34）：英雄卡书名要让开右上角刷新图标（整体下移一行），
+            -- 并且能用满 text_w —— 原来书名宽度被图标扣掉，8 字书名会折成
+            -- 「三国之蜀汉我做」+「主」，第二行只剩一个字。
+            UIManager:scheduleIn(6, function()
+                local hero = self._hero_ref
+                if not hero then
+                    mark("flow=hero_title no_hero")
+                    return
+                end
+                hero.title = "三国之蜀汉我做主"
+                local ok = pcall(function() MiuiHome.update_hero(hero) end)
+                mark("flow=hero_title done ok=" .. tostring(ok)
+                    .. " len=" .. tostring(#hero.title))
+            end)
         elseif flow == "notice_demo" then
             -- 回归（v0.6.33）：结果类提示不再自动消失。
             -- 用例流程：等 notice_shown → 静置 12s（断言没有同 id 的 notice_closed）
@@ -661,6 +676,7 @@ function M.install(env)
             end
         end
         local hero = self:_makeHeroInfo(hero_book, cover_paths)
+        self._hero_ref = hero   -- 自动验收用：hero_title flow 会换成长书名重排这张卡
         -- 右侧区域：上面时钟，下面本周阅读记录（每天打卡）
         local week_stats = {}
         pcall(function() week_stats = ReadingStats.getHomeStats() end)

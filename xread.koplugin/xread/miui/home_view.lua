@@ -418,9 +418,16 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     local info_h = body_h
     local line_h = math.max(UiScale.dp(15, 13, 20), math.floor(body_h * .088))
     local meta_gap = math.max(1, math.floor(line_h * .12))
-    -- 书名占 info 区前两行；右上角刷新图标要给书名让出宽度
-    local title_w = math.max(1, text_w - (history_w > 0 and history_w + UiScale.dp(5, 4, 8) or 0))
-    local intro_top = title_h + meta_gap
+    -- 书名不再和右上角刷新图标抢同一行：图标独占第一行右侧，
+    -- 书名整体下移到图标下方，并能用满 text_w。
+    -- 原来书名只拿到 text_w - history_w，像「三国之蜀汉我做主」这种 8 字书名
+    -- 会被挤成「三国之蜀汉我做」+「主」，第二行只剩一个字。
+    local title_y = 0
+    local title_w = math.max(1, text_w)
+    if history_w > 0 then
+        title_y = history_h + math.max(1, math.floor(line_h * .18))
+    end
+    local intro_top = title_y + title_h + meta_gap
     local info = OverlapGroup:new{dimen = Geom:new{w = text_w, h = info_h}, allow_mirroring = false}
     local function info_line(text, y, bold, size)
         if text == "" then return end
@@ -432,8 +439,8 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
             height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
         }}
     end
-    -- 书名（封面右侧第一行）
-    info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = 0, TextBoxWidget:new{
+    -- 书名（图标下方第一行，宽度用满）
+    info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = title_y, TextBoxWidget:new{
         text = tostring(book.title or "未命名"),
         face = title_face,
         bold = true,

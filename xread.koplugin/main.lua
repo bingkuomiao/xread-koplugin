@@ -3164,6 +3164,20 @@ function XRead:showMoreListPanel(title, items, opts)
         if self.callback then self.callback() end
         return true
     end
+
+    -- 自动验收：打印每行的屏幕中心坐标，用例按「文字 → 坐标」点击。
+    -- 原来 15c/29 是硬编码 y（495/596/…/1000），一加菜单项就全部点偏，
+    -- 只能靠人去数行数改坐标。这里让面板自己报位置，增删条目不用再动用例。
+    function MoreRow:paintTo(bb, x, y)
+        if not self._pos_logged and os.getenv("XREAD_AUTOTEST") then
+            self._pos_logged = true
+            print(string.format("[XREAD_AUTOTEST] more_row text=%s x=%d y=%d w=%d h=%d",
+                tostring(self.text or ""),
+                math.floor(x + self.width / 2), math.floor(y + self.height / 2),
+                self.width, self.height))
+        end
+        return InputContainer.paintTo(self, bb, x, y)
+    end
     local row_h = Screen:scaleBySize(56)
     local gap = Screen:scaleBySize(12)
     local rows = VerticalGroup:new{ align = "left" }
@@ -3177,6 +3191,10 @@ function XRead:showMoreListPanel(title, items, opts)
                 if item.callback then
                     UIManager:close(dialog)
                     if self._more_panel_view == dialog then self._more_panel_view = nil end
+                    -- 这个面板是整屏的（居中卡片 + 压暗遮罩），关掉后必须整屏重绘：
+                    -- 否则接手的界面只刷自己那块，底下会留一条旧卡片/底图的残影
+                    -- （「系统设置」打开 KOReader 菜单时最明显：底部残留一行提示文字）。
+                    UIManager:setDirty("all", "full")
                     item.callback()
                 end
                 return true
