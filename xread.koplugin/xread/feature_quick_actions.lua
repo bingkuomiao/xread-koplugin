@@ -1,4 +1,4 @@
--- xread.koplugin/xread/feature/quick_actions.lua
+-- xread.koplugin/xread/quick_actions.lua
 -- 快捷面板（屏幕中间呼出）里的各个动作：换章、换书、目录、缓存、夜间、排版等。
 --
 -- 从 main.lua 拆出（Batch 2），方法仍挂在同一个 XRead 类上。

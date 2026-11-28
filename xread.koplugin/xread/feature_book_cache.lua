@@ -1,4 +1,4 @@
--- xread.koplugin/xread/feature/book_cache.lua
+-- xread.koplugin/xread/book_cache.lua
 -- 书架侧的书本操作：从后端移除书籍、整本预缓存（含人工中止）、漫画下载并打包 CBZ。
 --
 -- 从 main.lua 拆出（Batch 2），方法仍挂在同一个 XRead 类上。

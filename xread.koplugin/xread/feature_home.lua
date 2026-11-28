@@ -1,4 +1,4 @@
--- xread.koplugin/xread/feature/home.lua
+-- xread.koplugin/xread/home.lua
 -- miuread 首页（视觉层）：最近阅读、操作行、分类页签、我的书架预览、
 -- 以及首页自动验收（XREAD_AUTOTEST_FLOW）里的 home_* 流程。
 --
@@ -208,6 +208,23 @@ function M.install(env)
                         mark("flow=test_conn done")
                     end)
                 end)
+            end)
+        elseif flow == "updater_ensure_dir" then
+            -- 回归（v0.6.32）：更新器建目录必须同时支持相对/绝对路径。
+            -- 旧实现按绝对路径处理，plugin_root 是相对路径时会去 mkdir "/plugins/..."，
+            -- 父目录不存在 → 建目录失败，表现就是「新增子目录里的文件全部『无法写入』」。
+            UIManager:scheduleIn(2, function()
+                local Updater = require("xread/updater")
+                local lfs = require("libs/libkoreader-lfs")
+                local function check(tag, path)
+                    local ok = false
+                    if Updater.ensureDirForTest then ok = Updater.ensureDirForTest(path) end
+                    print(string.format("[XREAD_AUTOTEST] ensure_dir %s ok=%s mode=%s path=%s",
+                        tag, tostring(ok), tostring(lfs.attributes(path, "mode")), path))
+                end
+                check("relative", "xread_reltest/a/b")
+                check("absolute", "/tmp/xread_abstest/a/b")
+                mark("flow=updater_ensure_dir done")
             end)
         else
             mark("flow=unknown name=" .. flow)

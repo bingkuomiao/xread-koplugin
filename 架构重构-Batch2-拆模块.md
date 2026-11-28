@@ -11,11 +11,11 @@ v0.6.30 时 `main.lua` 有 **7760 行 / 143 个方法**，改一处要在一屏�
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
 | `main.lua` | 7760 → **3277** | 类定义、init、菜单、开书、后台缓存、目录、书架、工具栏接线 |
-| `xread/feature/menus.lua` | 1764 | 更多面板、首页管理、升级管理、关于本机、热更新、地址/账号/书架管理、首页设置 |
-| `xread/feature/quick_actions.lua` | 1018 | 快捷面板里的各动作（换章/换书/目录/缓存/夜间/排版） |
-| `xread/feature/home.lua` | 845 | miuread 首页（最近阅读、操作行、分类页签、书架预览） |
-| `xread/feature/book_settings.lua` | 568 | 书内设置面板、排版偏好、进度同步 |
-| `xread/feature/book_cache.lua` | 485 | 移除书籍、整本预缓存、漫画下载打包 |
+| `xread/feature_menus.lua` | 1764 | 更多面板、首页管理、升级管理、关于本机、热更新、地址/账号/书架管理、首页设置 |
+| `xread/feature_quick_actions.lua` | 1018 | 快捷面板里的各动作（换章/换书/目录/缓存/夜间/排版） |
+| `xread/feature_home.lua` | 845 | miuread 首页（最近阅读、操作行、分类页签、书架预览） |
+| `xread/feature_book_settings.lua` | 568 | 书内设置面板、排版偏好、进度同步 |
+| `xread/feature_book_cache.lua` | 485 | 移除书籍、整本预缓存、漫画下载打包 |
 | `xread/shared.lua` | 34 | 跨实例运行时状态单例（原 main.lua 里的 `SHARED`） |
 
 ## 做法
@@ -82,6 +82,31 @@ require("xread.feature.home").install{ XRead = XRead, SHARED = SHARED, BackendPr
 - 段内局部量泄漏检查：对每个被搬走的名字统计「出现在几个文件」，全部只在自己文件里
   （`BG` / `stopBg` 例外，它们是 main 注入的，符合预期）；
 - 全量自动验收（34 项）：见本轮报告 `tests/reports/`。
+
+## 升级事故与修正（v0.6.32）
+
+v0.6.31 用了 `xread/feature/` 这个**新目录**，结果 0.6.29 设备升级时报：
+
+```
+失败：以下文件更新失败：xread/feature/book_cache.lua（无法写入）xread/feature/b...
+```
+
+根因在 `updater.lua` 的 `ensureDir`：它把路径当绝对路径处理——`cur` 从 `""` 开始
+拼 `"/"`，而且**第一段不创建**。只要 `plugin_root` 是相对路径（KOReader 以相对
+路径启动时就是这样），它就会去 `mkdir "/plugins/..."`，父目录不存在必然失败。
+表现就是「新增目录里的文件全部无法写入，已有目录里的文件照常更新」。
+
+两处修正：
+
+1. `ensureDir` 改用 KOReader 自带的 `util.makePath`（它自己区分绝对/相对，从最近的
+   已存在祖先逐级 mkdir），并返回布尔值；建目录失败与写文件失败分开报错，
+   不再一律显示「无法写入」。
+2. 5 个 feature 模块改成扁平命名 `xread/feature_*.lua`，**这一版升级不再需要任何新目录**，
+   已经卡在 0.6.29/0.6.30 的设备可以直接升上来。
+
+回归用例 `34_updater_ensure_dir`：相对路径与绝对路径都必须真的建出多级目录。
+另做了端到端验证：用 git 里的 0.6.29 源码部署→放真实 0.6.32 包→本地升级，
+版本变 0.6.32、6 个新模块全部落盘、日志无写入失败。
 
 ## 还没做的（Batch 3）
 

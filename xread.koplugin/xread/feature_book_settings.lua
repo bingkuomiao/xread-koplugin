@@ -1,4 +1,4 @@
--- xread.koplugin/xread/feature/book_settings.lua
+-- xread.koplugin/xread/book_settings.lua
 -- 书内设置：正文排版偏好（缩进 / 粗细 / 简繁）、进度同步（进入 / 退出）、
 -- 以及正文里呼出的「设置」面板（页面管理 / 字体管理 / 同步管理）。
 --

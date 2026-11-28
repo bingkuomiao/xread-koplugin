@@ -1,4 +1,4 @@
--- xread.koplugin/xread/feature/menus.lua
+-- xread.koplugin/xread/menus.lua
 -- 「更多」面板 / 首页管理 / 升级管理 / 关于本机 / 热更新 / 地址与账号管理 / 首页设置。
 --
 -- 从 main.lua 拆出（Batch 2）。方法仍挂在同一个 XRead 类上：install(env) 只是

@@ -278,20 +278,31 @@ local function safeRelPath(path)
     return path
 end
 
---- 逐级创建目录（path 为绝对路径目录）
+--- 逐级创建目录，返回是否真的存在了。
+-- 旧实现把路径当绝对路径处理（从 "" 开始拼 "/"、且第一段不创建）：
+-- 一旦 plugin_root 是相对路径（KOReader 以相对路径启动时就是这样），
+-- 它会去 mkdir "/plugins/..."，父目录不存在必然失败，表现为整包更新报
+-- 「无法写入」——v0.6.29→0.6.31 新增 xread/feature/ 目录时正是这样炸的。
+-- 交给 KOReader 的 util.makePath：它自己区分绝对/相对，从最近的已存在祖先逐级 mkdir。
 local function ensureDir(path)
-    local parts = {}
-    for seg in path:gmatch("[^/]+") do
-        parts[#parts + 1] = seg
+    if not path or path == "" then return true end
+    if lfs.attributes(path, "mode") == "directory" then return true end
+    local util = require("util")
+    local ok = pcall(util.makePath, path)
+    if ok and lfs.attributes(path, "mode") == "directory" then return true end
+    -- 兜底：util.makePath 在极老固件上签名不同，退回手工逐级创建（相对/绝对都支持）
+    local sep = path:sub(1, 1) == "/" and "/" or ""
+    local cur = sep
+    for seg in path:gmatch("[^/\\]+") do
+        cur = (cur == "" or cur == "/") and (cur .. seg) or (cur .. "/" .. seg)
+        if not lfs.attributes(cur, "mode") then pcall(lfs.mkdir, cur) end
     end
-    local cur = ""
-    for i, seg in ipairs(parts) do
-        cur = cur .. "/" .. seg
-        if i > 1 and not lfs.attributes(cur, "mode") then
-            pcall(lfs.mkdir, cur)
-        end
-    end
+    return lfs.attributes(path, "mode") == "directory"
 end
+
+-- 供自动验收直接验证建目录行为（相对/绝对路径都要成立）。
+-- 生产代码不会读这个字段，只是把同一个实现暴露出来，避免测试复制一份逻辑。
+Updater.ensureDirForTest = ensureDir
 
 --- 本地文件 md5（不存在返回 nil）
 local function localMd5(path)
@@ -508,13 +519,20 @@ function Updater:installArchive(archive_path, expected_name_version, on_progress
                 end
                 local target = self.plugin_root .. e.rel
                 local dir = target:match("^(.*)/[^/]+$")
-                if dir then ensureDir(dir) end
+                -- 建目录失败要和「写文件失败」分开报：混在一起只会看到「无法写入」，
+                -- 根本看不出是父目录没创建出来。
+                local dir_ok = true
+                if dir then dir_ok = ensureDir(dir) end
+                if not dir_ok then
+                    failed = failed or {}
+                    failed[#failed + 1] = e.rel .. "（无法创建目录：" .. tostring(dir) .. "）"
+                end
                 local tmp = target .. ".xup_tmp"
-                local tf = io.open(tmp, "wb")
-                if not tf then
+                local tf = dir_ok and io.open(tmp, "wb") or nil
+                if dir_ok and not tf then
                     failed = failed or {}
                     failed[#failed + 1] = e.rel .. "（无法写入）"
-                else
+                elseif tf then
                     local wrote = tf:write(content)
                     tf:close()
                     if not wrote then

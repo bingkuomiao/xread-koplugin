@@ -1529,8 +1529,8 @@ function XRead:warmup()
     end)
 end
 
--- ---------- 第二步：miuread 首页 → xread/feature/home.lua ----------
-require("xread.feature.home").install{
+-- ---------- 第二步：miuread 首页 → xread/feature_home.lua ----------
+require("xread.feature_home").install{
     XRead = XRead,
     SHARED = SHARED,
     BackendProbe = BackendProbe,
@@ -2972,8 +2972,8 @@ function XRead:_showLegacyQuickPanel()
     SHARED.panel = panel
     UIManager:show(panel)
 end
--- ---------- 面板里各快捷动作 → xread/feature/quick_actions.lua ----------
-require("xread.feature.quick_actions").install{
+-- ---------- 面板里各快捷动作 → xread/feature_quick_actions.lua ----------
+require("xread.feature_quick_actions").install{
     XRead = XRead,
     SHARED = SHARED,
     BG = BG,
@@ -3240,10 +3240,10 @@ function XRead:showMoreListPanel(title, items, opts)
     end
 end
 
--- ---------- 设置 / 更多 / 升级 → xread/feature/menus.lua ----------
+-- ---------- 设置 / 更多 / 升级 → xread/feature_menus.lua ----------
 -- 每个 feature 模块只声明自己真正需要的依赖：通用模块自己 require，
 -- main.lua 的私有小工具从这里显式传入（不复制实现，也不依赖全局）。
-require("xread.feature.menus").install{
+require("xread.feature_menus").install{
     XRead = XRead,
     SHARED = SHARED,
     PAGE_MODES = PAGE_MODES,
@@ -3252,8 +3252,8 @@ require("xread.feature.menus").install{
     display_address = display_address,
 }
 
--- ---------- 书内设置 / 排版 / 同步 → xread/feature/book_settings.lua ----------
-require("xread.feature.book_settings").install{
+-- ---------- 书内设置 / 排版 / 同步 → xread/feature_book_settings.lua ----------
+require("xread.feature_book_settings").install{
     XRead = XRead,
     SHARED = SHARED,
     chapterHtmlHead = chapterHtmlHead,
@@ -3262,8 +3262,8 @@ require("xread.feature.book_settings").install{
     hotReload = hotReload,
 }
 
--- ---------- 移除书籍 / 整本预缓存 / 漫画 → xread/feature/book_cache.lua ----------
-require("xread.feature.book_cache").install{
+-- ---------- 移除书籍 / 整本预缓存 / 漫画 → xread/feature_book_cache.lua ----------
+require("xread.feature_book_cache").install{
     XRead = XRead,
     SHARED = SHARED,
     BOOK_DIR = BOOK_DIR,
