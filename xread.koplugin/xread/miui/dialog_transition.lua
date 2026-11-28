@@ -1,7 +1,7 @@
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local Geometry = require("xread.miui.modal_geometry")
-local Geom = require("ui/geometry")
+local Repaint = require("xread.miui.repaint")
 
 local M = {generation = 0}
 
@@ -14,10 +14,14 @@ end
 -- Never paint the retired window in place: ask UIManager to repaint the
 -- CURRENT stack on the next turn.  "all" requests layout paint, whereas
 -- nil requests waveform only and may leave an old frame behind.
+--
+-- after_close 在三个连续 tick 里会各标脏一次（旧框、动作后的新框、两者并集）。
+-- 三次都是局部 ui 刷新，在 PW3 上就是三次物理局刷；交给 Repaint 在 120ms
+-- 窗口内取并集合成一次，区域完全覆盖，肉眼看到的结果不变。
 function M.restore(region, mode)
     local safe = Geometry.rect(region, 3)
     if safe then
-        UIManager:setDirty("all", mode or "ui", Geom:new(safe))
+        Repaint.paint("dialog.restore", mode or "ui", safe)
     end
 end
 

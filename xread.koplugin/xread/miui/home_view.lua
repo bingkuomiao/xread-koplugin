@@ -28,6 +28,7 @@ local Ui = require("xread.miui.ui_components")
 local HeaderLayout = require("xread.miui.home_header_layout")
 local Memory = require("xread.miui.memory")
 local Prims = require("xread.miui.ui_primitives")
+local Repaint = require("xread.miui.repaint")
 
 local Screen = Device.screen
 local live_widget
@@ -2005,11 +2006,9 @@ function HomeWidget:_mark_dirty(kind, previous_region)
             -- switching is responsive. A coalesced full cleanup runs only after
             -- the user stops switching, preserving final e-ink quality.
             UIManager:setDirty(self,function() return "ui",region end)
-            if self._section_clean_refresh_task then UIManager:unschedule(self._section_clean_refresh_task) end
             local clean_region=region:copy()
-            local task
-            task=function()
-                if self._miu_closed or self._section_clean_refresh_task~=task then return end
+            local task=function()
+                if self._miu_closed then return end
                 self._section_clean_refresh_task=nil
                 if self._miu_input_suspended==true or self._miu_device_suspended==true then return end
                 if foreground_over_home(self) then
@@ -2021,7 +2020,10 @@ function HomeWidget:_mark_dirty(kind, previous_region)
                 logger.info("[MiuRead][HomeSwitchPerf] quality cleanup","delay_ms=",tostring(math.floor((tonumber(Config.HOME_SECTION_CLEAN_REFRESH_DELAY) or 2.8)*1000+.5)))
             end
             self._section_clean_refresh_task=task
-            UIManager:scheduleIn(math.max(.8,tonumber(Config.HOME_SECTION_CLEAN_REFRESH_DELAY) or 2.8),task)
+            -- 同一视图快速连切页签时，只有最后一次的「补一次全刷」需要保留。
+            -- 统一交给 Repaint.debounce，连撤销次数一起记进 stats。
+            Repaint.debounce("home.clean." .. tostring(self),
+                math.max(.8,tonumber(Config.HOME_SECTION_CLEAN_REFRESH_DELAY) or 2.8), task)
         else
             UIManager:setDirty(self,function() return "ui",region end)
         end
@@ -2466,6 +2468,7 @@ function HomeWidget:onCloseWidget()
     self._dimension_refresh_generation=(tonumber(self._dimension_refresh_generation) or 0)+1
     if self._dimension_refresh_task then UIManager:unschedule(self._dimension_refresh_task); self._dimension_refresh_task=nil end
     if self._section_clean_refresh_task then UIManager:unschedule(self._section_clean_refresh_task); self._section_clean_refresh_task=nil end
+    Repaint.cancel("home.clean." .. tostring(self))
     if self._miu_occluded_dirty_task then UIManager:unschedule(self._miu_occluded_dirty_task); self._miu_occluded_dirty_task=nil end
     self:_clear_inactive_section_cache()
     if live_widget == self then live_widget = nil end
@@ -2522,6 +2525,7 @@ function HomeView.park()
         UIManager:unschedule(live_widget._section_clean_refresh_task)
         live_widget._section_clean_refresh_task=nil
     end
+    Repaint.cancel("home.clean." .. tostring(live_widget))
     -- Reader keeps only the currently visible lightweight shell. Inactive
     -- rendered section layers (and their cover surfaces) are released here.
     if type(live_widget._clear_inactive_section_cache)=="function" then live_widget:_clear_inactive_section_cache() end

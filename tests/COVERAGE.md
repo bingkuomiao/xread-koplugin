@@ -166,3 +166,26 @@
   - 作者行加前缀「作者 · 」，和「最新 · 」「阅读至 」同一写法。
 - 其它文案：正文设置「同步管理」改为「进入书籍拉取进度 / 退出上传进度」，删掉两行解释小字；发现新版本弹窗按钮「去更新」→「更新」。
 - 自动验收踩坑：`message_box` 的 `box_geom` 每个按钮打一行，用例取坐标必须 `grep btn1=`，`tail -1` 拿到的是 btn2；另外 stdout 重定向到文件是块缓冲，打印后要 `io.stdout:flush()`，否则用例运行中 grep 不到（进程被杀才落盘）。
+
+## 十二、v0.6.39 Batch 4：刷新合并 / 延迟任务去抖 / 封面缓存预算
+
+- **合并同一交互内的多次标脏**：`xread/miui/repaint.lua` 新增 `paint(key, mode, rect, window)`，
+  默认 120ms 窗口内同 key 请求合并，`full` 优先于 `ui`、区域取并集，窗口末统一发一次标脏。
+  接入两处已知重复路径：`dialog_transition` 的连续三个 tick（旧框 → 动作后新框 → 并集），
+  以及 `message_box` 的「关旧框 / 开新框 / sticky 补全刷」三条同 key 请求。
+  没有把 `setDirty` 同步降级成 `ui`——KOReader 同一事件循环本来就会合并；也不需要把
+  full 降成 ui 留下残影。
+- **scheduleIn 去抖**：`repaint.debounce` 增加取消/执行计数；首页切节的 2.8s「补一次全刷」
+  从手写 `scheduleIn` + `unschedule` 迁到 `Repaint.debounce("home.clean.<widget>")`，
+  并在两个关闭路径补 `Repaint.cancel`，快速连切页签只保留最后一次全刷。
+- **封面解码预算**：`Memory.cover_do_cache()` 不再只按内存档位开关，而是额外给全局
+  ImageCache 一个 16 张（约两页）的额度；用完的封面改由 widget 持有，`free()` 时回收。
+  `XREAD_MEM_TIER=low` 时额度为 0。注意 `describe()` 用的是非消耗式查询，不能在这里扣额度。
+- **真机验证口径**（WSL 测不出 e-ink 黑闪与内存占用，只能看门限）：
+  - `38_batch4` 起两遍首页，正常档日志 `memory tier=normal ... cover_cache=true budget=9/7`
+    （首页已经用掉 7 张，剩余 9 张，总额度 16），低内存档 `budget=0/16`；两遍都要求无 fatal、截图非空。
+  - 真机开 `XREAD_PERF_LOG=1`，连点页签/连开关弹窗后看 `[XRead][Perf]` 行：
+    `paint merge key=...` 出现、`paint flush ... merged=N` 的 N>0；
+    再核对 `[XREAD_AUTOTEST] perf ... full merged=` 不为 0（自动构建时会打印）。
+  - 真机上重点看「连切页签是否还黑闪多次」「长会话后内存是否还在涨」；合并器只改刷新
+    次数与缓存额度，不改像素，布局回归仍以 01/03/04/06/07 的截图逐像素比对为准。

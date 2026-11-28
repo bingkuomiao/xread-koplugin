@@ -81,27 +81,50 @@ function M.section_cache_layers()
     return 3
 end
 
--- 封面是否进入全局 ImageCache。
--- file_do_cache=true 会把解码后的 Blitbuffer 交给 ImageCache 常驻（按字节
--- 上限淘汰），首页+书架+翻过的所有封面都会堆在里面；低内存设备上改成
--- false，让 Blitbuffer 归 widget 所有，widget 树 free() 时立刻回收。
-function M.cover_do_cache()
-    return not M.is_low()
+-- 封面进入全局 ImageCache 的预算。
+-- file_do_cache=true 会把解码后的 Blitbuffer 交给 ImageCache 常驻。那个缓存是
+-- KOReader 全局的 8MiB / 128 项 LRU，里面还混着图标；插件每翻一页就塞 8 张
+-- 封面（PW3 上约 2~3MB），几页之后图标被挤出去，封面却几乎不会再被复用
+-- （翻回来时视图已重建、封面路径也换了）。
+-- 所以只给「一屏多一点」的额度：16 张 ≈ 两页；用完的封面改由 widget 持有，
+-- widget 树 free() 时立刻回收。低内存档位额度为 0（全部归 widget）。
+local COVER_CACHE_BUDGET = 16
+local cover_budget
+
+local function budget()
+    if cover_budget == nil then
+        cover_budget = M.is_low() and 0 or COVER_CACHE_BUDGET
+    end
+    return cover_budget
 end
+
+--- 创建封面 ImageWidget 时调用：还有额度就进 ImageCache，否则归 widget 自己。
+function M.cover_do_cache()
+    local left = budget()
+    if left <= 0 then return false end
+    cover_budget = left - 1
+    return true
+end
+
+--- 诊断用：还剩多少张封面可以进 ImageCache / 已经用掉多少张。
+function M.cover_cache_left() return budget() end
+function M.cover_cache_spent() return COVER_CACHE_BUDGET - budget() end
 
 --- 供测试/诊断输出一行档位摘要。
 function M.describe()
     local s = M.snapshot(true)
-    return string.format("tier=%s total=%sMB avail=%sMB layers=%d cover_cache=%s",
+    return string.format("tier=%s total=%sMB avail=%sMB layers=%d cover_cache=%s budget=%d/%d",
         tostring(s.tier),
         s.total and tostring(math.floor(s.total / MB)) or "?",
         s.available and tostring(math.floor(s.available / MB)) or "?",
         M.section_cache_layers(),
-        tostring(M.cover_do_cache()))
+        tostring(budget() > 0),  -- 兼容 28_memory_low 的 cover_cache=false 断言
+        M.cover_cache_left(), M.cover_cache_spent())
 end
 
 function M.reset()
     cached = nil
+    cover_budget = nil
 end
 
 pcall(function()

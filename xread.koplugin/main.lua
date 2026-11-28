@@ -1097,6 +1097,10 @@ function XRead:init()
         autotest_go(function()
             self:openHome()
             print("[XREAD_AUTOTEST] mode=home done")
+            -- Batch 4 诊断：合并器计数与内存档位直接进日志，自动用例和真机
+            -- 都能据此确认「去抖/额度」是否真的生效（e-ink 耗时在 WSL 测不出）
+            print("[XREAD_AUTOTEST] perf " .. Repaint.stats_line())
+            print("[XREAD_AUTOTEST] memory " .. require("xread.miui.memory").describe())
             -- 首页上下文的验收 flow（书架/布局/旋转/搜索），不依赖已开书
             local home_flow = os.getenv("XREAD_AUTOTEST_FLOW")
             if home_flow and home_flow ~= "" then

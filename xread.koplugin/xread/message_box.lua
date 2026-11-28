@@ -26,6 +26,7 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local RightContainer = require("ui/widget/container/rightcontainer")
 local UICommon = require("xread/ui_common")
+local Repaint = require("xread.miui.repaint")
 local Screen = Device.screen
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
@@ -308,9 +309,9 @@ function Box:close()
     if live == self then live = nil end
     pcall(function() UIManager:close(self) end)
     if self.on_close then pcall(self.on_close) end
-    pcall(function()
-        UIManager:setDirty("all", self.full_refresh and "full" or "ui")
-    end)
+    -- 同一个 key：M.show() 关旧框、开新框、sticky 补全刷都在一次交互里，
+    -- 120ms 窗口内合并成一次物理刷新，full 优先、区域取并集。
+    Repaint.paint("msgbox", self.full_refresh and "full" or "ui")
 end
 
 ----------------------------------------------------------------------
@@ -351,7 +352,7 @@ function M.show(opts)
     UIManager:show(box)
     -- sticky 卡片出现在首页时，首页可能还有排队的 dirty 回调；
     -- 只靠 show() 的标脏会被随后一次首页重绘盖住，这里补一次整屏刷新。
-    if box.sticky then UIManager:setDirty("all", "full") end
+    if box.sticky then Repaint.paint("msgbox", "full") end
 
     local timeout = tonumber(opts.timeout)
     if timeout and timeout > 0 then
@@ -368,7 +369,7 @@ function M.close()
         live = nil
         box._closed = true
         pcall(function() UIManager:close(box) end)
-        pcall(function() UIManager:setDirty("all", "ui") end)
+        Repaint.paint("msgbox", "ui")
     end
 end
 
