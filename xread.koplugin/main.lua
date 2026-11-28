@@ -1887,13 +1887,33 @@ function XRead:_makeHeroInfo(hero_book, cover_paths)
         end
     end
     hero.description = intro_text
-    -- 附件1格式：作者 · 书源（originName 作为来源/分类展示）
+    -- 参考图的排法：作者、来源各占一行（来源换行，不和作者挤同一行），
+    -- 然后是「最新 · 最新章节名」，再是进度，最后是章节规模。
     local author = tostring(hero_book.author or ""):gsub("^%s+", ""):gsub("%s+$", "")
     local origin = tostring(hero_book.originName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    hero.author_line = author
+    hero.origin_line = origin
     local meta_bits = {}
     if author ~= "" then meta_bits[#meta_bits + 1] = author end
     if origin ~= "" then meta_bits[#meta_bits + 1] = origin end
     hero.meta_line = table.concat(meta_bits, " · ")
+    -- 「最新 · 最新章节名」：后端书架接口直接带 latestChapterTitle（如「第453话」），
+    -- 不需要为首页再拉一次目录。个别老后端没有这个字段时退回目录缓存的最后一章。
+    local latest_title = tostring(hero_book.latestChapterTitle or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if latest_title == "" then
+        pcall(function()
+            local chapters = self.meta_cache and self.meta_cache:getChapters(hero_book) or nil
+            if type(chapters) ~= "table" then return end
+            for i = #chapters, 1, -1 do
+                local c = chapters[i]
+                if type(c) == "table" and c.isVolume ~= true then
+                    local t = tostring(c.title or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                    if t ~= "" then latest_title = t break end
+                end
+            end
+        end)
+    end
+    hero.latest_line = latest_title ~= "" and (_("最新 · ") .. latest_title) or ""
     -- 阅读进度行：阅读至 N% · 上次阅读时间（HH:MM 或 M月D日）
     local progress_text = _("阅读至 ") .. tostring(hero.progress or 0) .. "%"
     if read_time > 0 then
@@ -1903,13 +1923,17 @@ function XRead:_makeHeroInfo(hero_book, cover_paths)
             and _("今天 ") .. hour or os.date("%m月%d日 ", read_time) .. hour
     end
     hero.progress_line = progress_text .. (hero.when_text and (" · " .. hero.when_text) or "")
-    -- 第三行：共 N 章 · 上次读到第 X 章（只有真读过才带后半句，没进度就不硬编「第 1 章」）
+    -- 章节规模与「上次读到」合并成一行，避免「共 N 章」出现两遍；
+    -- 顺序按参考图：先上次读到，再共 N 章。只有真读过才带前半句。
     local chap_bits = {}
-    if total > 0 then chap_bits[#chap_bits + 1] = T(_("共 %1 章"), tostring(total)) end
     if read_time > 0 then
         chap_bits[#chap_bits + 1] = _("上次读到第 ") .. tostring(dur + 1) .. _(" 章")
     end
-    hero.source_line = table.concat(chap_bits, " · ")
+    if total > 0 then chap_bits[#chap_bits + 1] = T(_("共 %1 章"), tostring(total)) end
+    hero.last_chap_line = table.concat(chap_bits, " · ")
+    -- 经典（无仪表盘）布局仍按原来的字段读，保持向后兼容
+    hero.source_line = hero.last_chap_line
+    hero.last_read_text = ""
     hero.on_tap = function() self:openBook(hero_book) end
     -- 右上角改为「刷新最近阅读」按钮
     hero.on_refresh = function() self:refreshRecentBook() end
