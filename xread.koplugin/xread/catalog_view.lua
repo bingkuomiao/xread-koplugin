@@ -440,7 +440,8 @@ function CatalogView:init()
 
         text_font_size = scaled(15), bordersize = 1, radius = scaled(6),
 
-        background = Blitbuffer.COLOR_GRAY_E, color = Blitbuffer.COLOR_GRAY_7,
+        -- 只留一圈细边框，不再填灰底（和目录白底一致）
+        background = nil, color = Blitbuffer.COLOR_GRAY_7,
 
         callback = function() if self.on_back then self.on_back() end end,
 
@@ -456,7 +457,8 @@ function CatalogView:init()
 
         text_font_size = scaled(15), bordersize = 1, radius = scaled(6),
 
-        background = Blitbuffer.COLOR_GRAY_E, color = Blitbuffer.COLOR_GRAY_7,
+        -- 只留一圈细边框，不再填灰底（和目录白底一致）
+        background = nil, color = Blitbuffer.COLOR_GRAY_7,
 
         callback = function()
             if self.on_order_toggle then

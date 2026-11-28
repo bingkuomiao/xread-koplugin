@@ -41,9 +41,10 @@ function M.install(env)
             -- 「本地书架」= 首页底部「本地阅读」按钮的同一入口（本机导出的 EPUB）。
             -- 放在「我的书架」后面：两者都是书架，先云端再本地。
             { label = _("本地书架"), callback = function() self:showLocalBooks() end },
-            { label = _("首页管理"), callback = function() self:showBootManage() end },
+            { label = _("加载管理"), callback = function() self:showBootManage() end },
             { label = _("系统管理"), callback = function() self:openReaderMenuFromHome() end },
-            { label = _("升级管理"), callback = function() self:showUpdateManage() end },
+            -- 「升级管理」已从更多页移除：检查更新统一走「关于本机」，
+            -- 自动检查的周期沿用上次设置，不再单独给一个入口。
             { label = _("关于本机"), callback = function() self:showAboutPanel() end },
         }, { hint = _("点击条目进入；点空白处返回。") })
     end
@@ -139,13 +140,24 @@ function M.install(env)
                 tostring(info.remote_version or ""))
             or T(_("发现新版本 %1（当前 %2）。"),
                 tostring(info.remote_version or ""), tostring(info.local_version or ""))
-        MessageBox.show{
+        local notice
+        notice = MessageBox.show{
             title = _("发现新版本"),
             text = text,
             sticky = true,
             buttons = {
                 { text = _("更新"), bold = true,
-                  callback = function() self:showAboutPanel() end },
+                  -- 直接进升级确认框，不再绕去「关于本机」让用户找「检查更新」。
+                  -- 必须先收掉这张 sticky 卡：否则 MessageBox.show 的 sticky 单实例
+                  -- 保护会把紧随其后的确认框整个吞掉。
+                  callback = function()
+                      if notice then pcall(function() notice:close() end) end
+                      if info.newer and self._update_manifest then
+                          UIManager:nextTick(function() self:confirmUpdate() end)
+                      else
+                          self:showAboutPanel()
+                      end
+                  end },
                 { text = _("稍后"), callback = function() end },
             },
         }

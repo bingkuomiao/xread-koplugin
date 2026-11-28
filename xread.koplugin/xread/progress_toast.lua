@@ -48,6 +48,7 @@ local Toast = InputContainer:extend{
     aborted = false,
     confirmed = false,
     with_buttons = false,
+    only_cancel = false,   -- 下载这类任务：只给「取消」，点完确认就不再叠第二个确定
     _miuread_transient = true,
     -- 只是进度提示，不参与 TransientGuard 的模态互斥
     _miuread_modal_surface = false,
@@ -99,11 +100,17 @@ function Toast:_measure()
     -- 两个按钮的绝对热区（取消在左、确定在右）
     self.cancel_rect, self.confirm_rect = nil, nil
     if show_buttons then
-        local bw = math.floor(self.inner_w / 2)
         local by = box_y + BORDER + self.pad + self.text_h + self.btn_gap
         local bx = box_x + BORDER + self.pad
-        self.cancel_rect = Geom:new{ x = bx, y = by, w = bw, h = self.btn_h }
-        self.confirm_rect = Geom:new{ x = bx + bw, y = by, w = self.inner_w - bw, h = self.btn_h }
+        if self.only_cancel then
+            -- 只有一个「取消」：整行都是它的热区，不再出现第二个确定按钮
+            self.cancel_rect = Geom:new{ x = bx, y = by, w = self.inner_w, h = self.btn_h }
+            self.confirm_rect = nil
+        else
+            local bw = math.floor(self.inner_w / 2)
+            self.cancel_rect = Geom:new{ x = bx, y = by, w = bw, h = self.btn_h }
+            self.confirm_rect = Geom:new{ x = bx + bw, y = by, w = self.inner_w - bw, h = self.btn_h }
+        end
     end
     return Geom:new{ x = box_x, y = box_y, w = box_w, h = box_h }
 end
@@ -122,10 +129,12 @@ function Toast:paintTo(bb, x, y)
     local tx = bx + BORDER + self.pad
     local ty = by + BORDER + self.pad
     self.text_widget:paintTo(bb, tx, ty)
-    if self.cancel_rect and self.confirm_rect then
-        -- 按钮之间一条细分隔线，和 MessageBox 的按钮行观感一致
-        local sep_x = self.cancel_rect.x + self.cancel_rect.w
-        bb:paintRect(sep_x, self.cancel_rect.y, 1, self.btn_h, Blitbuffer.COLOR_GRAY)
+    if self.cancel_rect then
+        if self.confirm_rect then
+            -- 按钮之间一条细分隔线，和 MessageBox 的按钮行观感一致
+            local sep_x = self.cancel_rect.x + self.cancel_rect.w
+            bb:paintRect(sep_x, self.cancel_rect.y, 1, self.btn_h, Blitbuffer.COLOR_GRAY)
+        end
         local function paint_label(widget, rect)
             local sz = widget:getSize()
             local lw, lh = tonumber(sz and sz.w) or 1, tonumber(sz and sz.h) or 1
@@ -134,7 +143,7 @@ function Toast:paintTo(bb, x, y)
             widget:paintTo(bb, lx, ly)
         end
         paint_label(self.cancel_label, self.cancel_rect)
-        paint_label(self.confirm_label, self.confirm_rect)
+        if self.confirm_rect then paint_label(self.confirm_label, self.confirm_rect) end
     end
 end
 
@@ -152,7 +161,9 @@ function Toast:_refresh(old)
             h = math.max(old.y + old.h, new.y + new.h) - y1,
         }
     end
-    UIManager:setDirty(self, function() return "ui", region end)
+    -- 必须让底层（正文）也跟着重画：只标脏 toast 自己的话，卡片缩小后
+    -- 旧按钮行的像素没人擦，真机上就是「两个框叠在一起再也消不掉」。
+    UIManager:setDirty("all", "ui", region)
 end
 
 function Toast:setText(text)
@@ -214,7 +225,11 @@ function M.show(text, opts)
     M.close()
     opts = type(opts) == "table" and opts or {}
     local ok, toast = pcall(function()
-        return Toast:new{ text = tostring(text or ""), with_buttons = opts.buttons == true }
+        return Toast:new{
+            text = tostring(text or ""),
+            with_buttons = opts.buttons == true,
+            only_cancel = opts.only_cancel == true,
+        }
     end)
     if not ok or not toast then
         logger.warn("[MiuRead][ProgressToast] create failed", tostring(toast))
@@ -222,6 +237,11 @@ function M.show(text, opts)
     end
     live = toast
     UIManager:show(toast)
+    if os.getenv("XREAD_AUTOTEST") then
+        print(string.format("[XREAD_AUTOTEST] progress_card buttons=%s only_cancel=%s",
+            tostring(opts.buttons == true), tostring(opts.only_cancel == true)))
+        pcall(function() io.stdout:flush() end)
+    end
     return toast
 end
 

@@ -36,18 +36,23 @@ local function tappable(width, height, child, callback, hold_callback)
     return Prims.tappable(width, height, child, callback, hold_callback)
 end
 
-local function image_widget(path, width, height)
+-- stretch=true 时按盒子尺寸拉伸铺满（首页书架同款），不留等比缩放的上下白边；
+-- 默认仍按等比 best-fit，供「我的书架」保持原样。
+local function image_widget(path, width, height, stretch)
     path = tostring(path or "")
     if path == "" then return nil end
     local image
     local ok = pcall(function()
-        image = ImageWidget:new{
+        -- 注意：不能写 `stretch and nil or 0` —— Lua 里 nil or 0 仍是 0，
+        -- 会悄悄退回等比缩放，封面顶部又出现一条空白。
+        local params = {
             file = path,
             width = width,
             height = height,
-            scale_factor = 0,
             file_do_cache = Memory.cover_do_cache(),
         }
+        if not stretch then params.scale_factor = 0 end
+        image = ImageWidget:new(params)
         image:getSize()
         image.width = nil
         image.height = nil
@@ -119,7 +124,9 @@ local function outlined_badge(text, width, height)
     return layer
 end
 
-local function book_card(book, width, height, on_select, on_hold)
+local function book_card(book, width, height, on_select, on_hold, opts)
+    -- 本地书架只要封面：不画「已下载 ✓ / 阅读进度」角标，封面也铺满不留白边。
+    local plain = opts and opts.plain_covers == true
     local title_h = UiScale.dp(31, 27, 44)
     local gap = UiScale.dp(3, 2, 5)
     local cover_h = math.max(UiScale.dp(116, 98, 190), height - title_h - gap)
@@ -133,17 +140,17 @@ local function book_card(book, width, height, on_select, on_hold)
         or status == "已生成" or status == "已下载"
         or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))
     -- 有徽标时把占位封面的文字往下让，避免书名压在百分比上
-    local badge_reserve = (downloaded or progress > 0) and (badge_h + badge_inset * 2) or 0
-    local cover = image_widget(book.cover_path, cover_w, cover_h)
+    local badge_reserve = (not plain and (downloaded or progress > 0)) and (badge_h + badge_inset * 2) or 0
+    local cover = image_widget(book.cover_path, cover_w, cover_h, plain)
         or placeholder(cover_w, cover_h, book.title, book.author, badge_reserve)
     local layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
     layer[#layer + 1] = cover
 
-    if downloaded then
+    if downloaded and not plain then
         local badge = UiScale.dp(20, 18, 28)
         layer[#layer + 1] = OffsetContainer:new{x_off = badge_inset, y_off = badge_inset, outlined_badge("✓", badge, badge)}
     end
-    if progress > 0 then
+    if progress > 0 and not plain then
         local text = progress >= 100 and "已读" or tostring(math.floor(progress + .5)) .. "%"
         local badge_w = math.max(UiScale.dp(29, 25, 43), U.utf8_len(text) * UiScale.dp(7.4, 6.4, 10) + UiScale.dp(10, 8, 14))
         layer[#layer + 1] = OffsetContainer:new{
@@ -315,7 +322,7 @@ function GridShelfWidget:_build()
         self:_add(layers,
             margin + col * (card_w + col_gap),
             grid_y + row * (card_h + row_gap),
-            book_card(book, card_w, card_h, self.opts.on_select, self.opts.on_hold))
+            book_card(book, card_w, card_h, self.opts.on_select, self.opts.on_hold, self.opts))
         slot = slot + 1
     end
 

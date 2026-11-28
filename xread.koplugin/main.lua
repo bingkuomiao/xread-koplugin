@@ -847,10 +847,22 @@ function XRead:init()
                 autotest_mark("flow=boot_manage done")
             end)
         elseif flow == "progress" then
-            -- 验收：带「取消 / 确定」的下载进度卡片（只展示几秒，不真的下书）
+            -- 验收：带「取消」的下载进度卡片（只展示几秒，不真的下书）
             UIManager:scheduleIn(4, function()
-                ProgressToast.show(T(_("正在下载 %1%（%2/%3）"), "38", "8", "21"), { buttons = true })
+                ProgressToast.show(T(_("正在下载 %1%（%2/%3）"), "38", "8", "21"),
+                    { buttons = true, only_cancel = true })
                 autotest_mark("flow=progress done")
+            end)
+        elseif flow == "update_notice" then
+            -- 验收 v0.6.40：自动更新提示卡点「更新」应直接弹升级确认框，
+            -- 不再跳「关于本机」。用假 manifest 触发，避免下载真更新包。
+            UIManager:scheduleIn(4, function()
+                self._update_info = { newer = true, remote_version = "9.9.9",
+                    local_version = "0.6.40", via = "remote" }
+                self._update_manifest = { version = "9.9.9", notes = "autotest" }
+                self._update_notified = nil
+                self:notifyUpdateAvailable()
+                autotest_mark("flow=update_notice done")
             end)
         elseif flow == "night_seq" then
             -- 验收：正文夜晚 → 首页夜晚连续切换（首页必须每次都能翻转）
@@ -1962,7 +1974,8 @@ function XRead:showMiuiShelfGrid(books, page, cover_paths)
             self:openBook(mbook._xread_book)
         end,
         on_hold = function(mbook)
-            self:showBookCatalog(mbook._xread_book, SHARED.cover_paths[mbook._xread_book])
+            -- 长按封面 = 移除书籍；目录页由短按进书后从正文菜单打开
+            self:removeBookFlow(mbook._xread_book)
         end,
         on_page_changed = function(new_page, first, last, shelf_view)
             -- miui 内部已按新页重建；这里补下新页封面再刷新

@@ -468,7 +468,7 @@ function M.install(env)
         -- ---------- 同步管理：两个开关，可以同时开 ----------
         -- 翻页管理已从这里移出（与首页齿轮「设置 → 翻页管理」重复，同一功能两处入口）。
         -- 标签写全「做什么」，下面不再挂两行解释小字：解释只会把面板撑长。
-        local enter_sync_row = toggleRow(_("进入书籍拉取进度"), self:syncOnOpenEnabled(), function()
+        local enter_sync_row = toggleRow(_("进入拉取进度"), self:syncOnOpenEnabled(), function()
             self:saveSetting("sync_on_open", self:syncOnOpenEnabled() and "0" or "1")
         end)
         local exit_sync_row = toggleRow(_("退出上传进度"), self:syncOnExitEnabled(), function()

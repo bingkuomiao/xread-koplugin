@@ -39,6 +39,11 @@ function M.install(env)
                 if not ok then return end
                 self:runQuiet(function()
                     local del_ok = self.client:deleteBook(book)
+                    if os.getenv("XREAD_AUTOTEST") then
+                        print(string.format("[XREAD_AUTOTEST] shelf_book_removed name=%s ok=%s",
+                            tostring(book.name or ""), tostring(del_ok == true)))
+                        pcall(function() io.stdout:flush() end)
+                    end
                     if del_ok then
                         -- 清本地：章节分片目录 + 目录缓存 + 整本缓存文件 + 封面缓存
                         pcall(function()
@@ -175,7 +180,7 @@ function M.install(env)
             -- 原来是每轮 Trapper:info(nil) —— 它会新建一个空文字 InfoMessage，
             -- 真机上就是「进度框不停闪 + 反复出现空框」。
             ProgressToast.show(ProgressToast.hint(T(_("正在下载 %1%（%2/%3）"),
-                "0", "0", tostring(total))), { buttons = true })
+                "0", "0", tostring(total))), { buttons = true, only_cancel = true })
             local deadline = os.time() + math.max(180, total * 30)
             local last_done, last_t = -1, 0
             local user_aborted = false
@@ -240,6 +245,11 @@ function M.install(env)
     -- 正文里的「删除」直接删当前书；没有传入书时才列书单供选择
     function XRead:removeBookFlow(book)
         if book then
+            if os.getenv("XREAD_AUTOTEST") then
+                print(string.format("[XREAD_AUTOTEST] remove_flow_requested name=%s",
+                    tostring(book.name or "")))
+                pcall(function() io.stdout:flush() end)
+            end
             self:_confirmRemoveBook(book)
             return
         end

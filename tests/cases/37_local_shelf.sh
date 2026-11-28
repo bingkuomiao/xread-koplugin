@@ -4,7 +4,7 @@
 #       2) 本机导出的 EPUB 以前只有灰底占位块 —— 要和「我的书架」共享封面。
 # 做法：flow=local_shelf 造一本和书架第一本同名的假 EPUB（不带 .cover.png），
 #       打开本地书架后应命中书架封面缓存（cache=true / shown=true）。
-# 截图人工复核：网格里第一张卡片是真实封面，不是占位色块，标题带 ✓ 角标。
+# 截图人工复核：网格里第一张卡片是真实封面、铺满无白边；v0.6.40 起本地书架不再画 ✓ 角标。
 CASE_ID="37_local_shelf"
 source "$(dirname "$0")/../lib/common.sh"
 

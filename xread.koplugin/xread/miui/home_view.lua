@@ -1,4 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
+local _ = require("gettext")
+local T = require("ffi/util").template
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Font = require("ui/font")
@@ -232,11 +234,15 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
         if ok and tonumber(fh) and tonumber(fh) > 0 then title_line_h = math.floor(tonumber(fh) + .5) end
     end
     local title_h = math.max(UiScale.dp(38, 34, 52), title_line_h * 2 + UiScale.dp(2, 1, 3))
-    -- 卡片底部保留一条阅读进度条（纯图形，不再配「阅读进度 N%」文字：
-    -- 上面的「阅读至 N%」已经说过同一件事，重复的就不要了）。
+    -- 卡片底部：进度条上方恢复一行「阅读进度 N%」（用户要求；图3）。
+    -- 这行占用的是简介与进度条之间的空档，不动 body_h / 封面尺寸。
     local bar_track_h = math.max(UiScale.line("thick"), UiScale.dp(3, 2, 5))
     local bar_slot_h = math.max(bar_track_h, UiScale.dp(9, 8, 12))
     local bar_h = bar_slot_h + section_gap
+    local progress_label_face = face("smallinfofont", 9.8, 13.0, 8.2)
+    local progress_label_h = UiScale.dp(15, 13, 21)
+    local progress_label_gap = UiScale.dp(2, 1, 3)
+    local progress_label_y = math.max(0, inner_h - bar_slot_h - progress_label_h - progress_label_gap)
     -- 简介至少留三行的位置：详情行变多、字号变大之后，简介不能只剩一条缝。
     local intro_h = math.max(UiScale.dp(42, 38, 58), math.floor(inner_h * .17))
     local body_h = math.max(1, inner_h - intro_h - section_gap - bar_h)
@@ -412,10 +418,10 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     -- body_h 是按「书名最多两行」预留的，实际单行书名时那块空白会全堆在详情和简介之间。
     -- 同时不能压到封面（封面在 body_h 里垂直居中），所以取两者更靠下的那个。
     local intro_y = math.max(rows_bottom, cover_bottom) + section_gap
-    -- 简介高度 = 到进度条之前的全部剩余空间（至少保证两行）
-    local intro_box_h = math.max(UiScale.dp(26, 24, 34), inner_h - section_gap - bar_h - intro_y)
-    if intro_y + intro_box_h > inner_h - bar_h - section_gap then
-        intro_box_h = math.max(1, inner_h - bar_h - section_gap - intro_y)
+    -- 简介高度 = 到「阅读进度」文字之前的全部剩余空间（至少保证两行）
+    local intro_box_h = math.max(UiScale.dp(26, 24, 34), progress_label_y - section_gap - intro_y)
+    if intro_y + intro_box_h > progress_label_y - section_gap then
+        intro_box_h = math.max(1, progress_label_y - section_gap - intro_y)
     end
 
     -- 卡片底部的简介（横贯全宽）
@@ -443,10 +449,18 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     end
     body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = intro_y, intro}
 
-    -- 底部阅读进度条：只有条，没有「阅读进度 N%」文字（上面「阅读至 N%」已经说了）
+    -- 底部阅读进度条 + 进度百分比文字
     local progress_value = tonumber(book.progress)
     if book.progress_known == false or progress_value == nil then progress_value = 0 end
     progress_value = math.max(0, math.min(100, progress_value))
+    local progress_label = T(_("阅读进度 %1%"), tostring(math.floor(progress_value + .5)))
+    if os.getenv("XREAD_AUTOTEST") then
+        print(string.format("[XREAD_AUTOTEST] hero_progress text=%s y=%d", progress_label, progress_label_y))
+    end
+    body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = progress_label_y, TextWidget:new{
+        text = progress_label, face = progress_label_face,
+        fgcolor = Blitbuffer.COLOR_BLACK, bold = true,
+    }}
     local bar_top = math.max(0, inner_h - bar_slot_h)
     local bar_y = bar_top + math.floor((bar_slot_h - bar_track_h) / 2)
     body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = bar_y, LineWidget:new{

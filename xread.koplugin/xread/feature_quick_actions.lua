@@ -184,10 +184,12 @@ function M.install(env)
             end
         end
         local view
-        local function closeView()
+        -- opening=true：紧接着就要开阅读器，别再整屏重刷一次首页，
+        -- 否则关本地书架 → 首页露一帧 → 阅读器才起来，表现为「闪一下首页」。
+        local function closeView(opening)
             self._local_view = nil
             if view then pcall(function() UIManager:close(view) end) end
-            UIManager:setDirty("all", "full")
+            if not opening then UIManager:setDirty("all", "full") end
         end
         -- 「返回」= 关掉本地阅读页 + 回到我的首页（不是回退到下面的旧画面）
         self._local_back = function()
@@ -199,6 +201,8 @@ function M.install(env)
             title = _("本地书架"),
             page = 1,
             show_actions = true,
+            -- 本地书架只要封面：去掉「已下载 ✓」角标和等比缩放留下的空白行。
+            plain_covers = true,
             -- 统计入口已收进首页仪表盘的数据区，本地书架右上角只留「返回」
             left_action_label = "",
             hide_left_action = true,
@@ -210,7 +214,7 @@ function M.install(env)
             end,
             on_select = function(mbook)
                 local path = mbook and mbook._xread_local
-                closeView()
+                closeView(true)
                 self:openLocalBook(path)
             end,
             -- 长按删本地文件：本地书架以前没有任何删除入口，

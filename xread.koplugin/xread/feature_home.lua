@@ -248,7 +248,17 @@ function M.install(env)
             UIManager:scheduleIn(4, function()
                 local BookExport = require("xread.book_export")
                 local books = self.meta_cache:getShelf() or {}
-                local first = books[1]
+                -- 优先挑一本已经有缓存封面的：别的用例可能移除/重排过书架，
+                -- 写死 books[1] 会挑到占位封面的书，让本用例假失败。
+                local first
+                for _, b in ipairs(books) do
+                    local p
+                    if self.cover_cache then
+                        pcall(function() p = self.cover_cache:anyPathFor(b) end)
+                    end
+                    if p then first = b break end
+                end
+                first = first or books[1]
                 if not first then
                     mark("flow=local_shelf no_shelf")
                     return
@@ -740,7 +750,8 @@ function M.install(env)
             on_local_stats = function() self:showLocalBooks() end,
             on_weread_stats = function() self:showReadingStats() end,
             on_open_book = function(mbook) self:openBook(mbook._xread_book) end,
-            on_hold_book = function(mbook) self:showBookCatalog(mbook._xread_book, mbook.cover_path) end,
+            -- 长按封面 = 从书架移除（原来弹目录页，和短按进书重复了）
+            on_hold_book = function(mbook) self:removeBookFlow(mbook._xread_book) end,
             on_shelf_page = function(delta)
                 -- 向后翻：进「我的书架」页（4 排书那页）
                 -- 不在取数据前关首页：关掉后底层文件管理器会露出一帧
