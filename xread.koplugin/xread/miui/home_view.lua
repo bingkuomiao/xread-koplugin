@@ -1370,19 +1370,15 @@ end
 
 function HomeWidget:_grid_geometry(m, width, available_h, count, force_rows)
     local columns = 4
-    -- 每页统一 4×3：封面收小一档，竖屏多显示一行（用户要求）。
-    -- 末页留空格，不放大剩余封面。
-    local rows = force_rows or 3
-    rows = math.max(1, math.min(rows, 3))
+    -- 首页封面维持 4×2（用户明确要求不变）；末页留空格，不放大剩余封面。
+    local rows = force_rows or 2
+    rows = math.max(1, math.min(rows, 2))
     local col_gap = math.max(UiScale.dp(2, 2, 4), math.floor(m.gap * .55))
     local row_gap = math.max(UiScale.dp(3, 2, 5), math.floor(m.gap * .65))
-    -- 高度实在不够时逐级退行，避免把封面压成一条
-    while rows > 1 and math.floor((available_h - row_gap * (rows - 1)) / rows) < UiScale.dp(88, 74, 120) do
-        rows = rows - 1
-    end
+    if rows == 2 and math.floor((available_h - row_gap) / 2) < UiScale.dp(118, 96, 170) then rows = 1 end
     local card_w = math.max(1, math.floor((width - col_gap * (columns - 1)) / columns))
     local raw_card_h = math.max(1, math.floor((available_h - row_gap * (rows - 1)) / rows))
-    local preferred_card_h = math.max(UiScale.dp(132, 112, 190), math.floor(card_w * 1.48))
+    local preferred_card_h = math.max(UiScale.dp(160, 132, 228), math.floor(card_w * 1.80))
     local card_h = math.min(raw_card_h, preferred_card_h)
     return columns, rows, col_gap, row_gap, card_w, card_h
 end
@@ -1661,7 +1657,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             if section_h > 0 then shelf_sy = shelf_sy + section_h + math.max(2, math.floor(gap * .25)) end
             local shelf_footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
             local shelf_grid_h = math.max(1, bottom - shelf_sy - shelf_footer_h)
-            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, shelf_w, shelf_grid_h, #books, 3)
+            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, shelf_w, shelf_grid_h, #books, 2)
             local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
                 self:_add(children, x, y, hero_card(self.opts.hero, hero_w, available_h, self.opts.hero.on_tap, compact,
@@ -1733,7 +1729,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             local footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
             local grid_h = math.max(1, bottom - sy - footer_h)
             if #books > 0 then
-                self:_render_grid(children, m, shelf_x, sy, shelf_w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 3)
+                self:_render_grid(children, m, shelf_x, sy, shelf_w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 2)
             else
                 self:_add(children, shelf_x, sy, empty_section(shelf_w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_all))
             end
@@ -1774,7 +1770,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             if section_h > 0 and shelf_y + section_h < bottom then shelf_y = shelf_y + section_h + math.max(2, math.floor(gap * .25)) end
             local shelf_footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
             local shelf_grid_h = math.max(1, bottom - shelf_y - shelf_footer_h)
-            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, w, shelf_grid_h, #books, 3)
+            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, w, shelf_grid_h, #books, 2)
             local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
                 if dashboard_visible then
@@ -1865,7 +1861,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     local footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
     local grid_h = math.max(1, bottom - y - footer_h)
     if #books > 0 then
-        self:_render_grid(children, m, x, y, w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 3)
+        self:_render_grid(children, m, x, y, w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 2)
     else
         self:_add(children, x, y, empty_section(w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_all))
     end

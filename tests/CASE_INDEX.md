@@ -9,7 +9,7 @@
 tests/
 ├── CASE_INDEX.md          本文件：用例索引 + 判定规则 + 坐标基准
 ├── lib/common.sh          公共库：模拟器启停、验收标记等待、断言、截图
-├── cases/01..37/*.sh      独立用例（12=zip 更新，13=包留存策略，16=按版本挑最新，17=封面单测，18=tar.gz 更新，19=本地包更新，31=静默检查更新，34=更新器建目录，35=提示卡不自动消失，36=英雄卡长书名，37=本地书架；11 旧散文件用例已移除）
+├── cases/01..41/*.sh      独立用例（12=zip 更新，13=包留存策略，16=按版本挑最新，17=封面单测，18=tar.gz 更新，19=本地包更新，31=静默检查更新，34=更新器建目录，35=提示卡不自动消失，36=英雄卡长书名，37=本地书架，40/41=几何与 UI 修正；11 旧散文件用例已移除）
 ├── reports/<时间戳>/      每次运行归档：SUMMARY.md + 逐用例日志 + 截图
 └── run_all.sh             统一入口（--full / --quick / --only）
 ```
@@ -41,7 +41,7 @@ tests/
 | 23_display_size | 界面字号三档 | `home` + `FLOW=display_size` + `XREAD_UI_SCALE` | compact/standard/large 三档重建均不溢出、不崩 | ~120s |
 | 24_rotate | 横竖屏旋转 | `home` + `FLOW=rotate` | 两次重建都完成，尺寸记录在日志供人工核对 | ~120s |
 | 25_layout_edge | 布局边界数据 | `home` + `FLOW=layout_edge`（假 books，不联网） | 超长书名/空作者/无封面/进度 0/跨页均不重叠 | ~90s |
-| 26_shelf_paging | 全屏书架翻页 | `home` + `FLOW=shelf_paging` | 30 本 3 页前进后退不崩（Batch 4 封面内存回收主验收） | ~120s |
+| 26_shelf_paging | 全屏书架翻页 | `home` + `FLOW=shelf_paging` | 30 本 / 竖屏 16 本每页 = 2 页，前进后退不崩（Batch 4 封面内存回收主验收） | ~120s |
 | 27_search_panel | 搜索加书入口 | `home` + `FLOW=search_panel` | 输入框 + 取消/搜索按钮弹出并可关闭，不发请求 | ~90s |
 | 28_memory_low | 低内存档位 | `home` + `XREAD_MEM_TIER=low` | `tier=low` + `layers=1` + `cover_cache=false`，首页正常打开 | ~90s |
 | 29_about_version | 关于本机后端版本 | `home` + 点更多 → 关于本机 | 「检测中」变为具体版本号，无 `showAboutPanel failed` | ~90s |
@@ -55,7 +55,8 @@ tests/
 | 37_local_shelf | 本地书架复用书架封面 + 长按删除（v0.6.37） | `home` + `FLOW=local_shelf`（造一本与书架第一本同名的假 EPUB，不带随书封面） | `cache=true`/`shown=true`；长按卡片弹确认卡，点「删除」后出现 `local_book_deleted ok=true` 且列表刷新 | ~150s |
 | 38_batch4 | 刷新合并计数 + 封面缓存预算（v0.6.39） | `home` 起两遍，第二遍 `XREAD_MEM_TIER=low` | 日志有 `perf paint req=...` / `memory tier=normal ... cover_cache=true budget=<n>/<m>`；低内存档 `budget=0/16`；两遍截图非空 | ~180s |
 | 39_ui_fixes | v0.6.40 九项 UI 修正 | 三段会话：`home`（英雄卡+更多面板）、`open`+`progress`（下载进度卡）、`shelfback`（长按封面） | `hero_progress text=阅读进度 N%`；`more_row text=加载管理` 且无 `升级管理`；`progress_card buttons=true only_cancel=true`；长按后 `box_geom` + `remove_flow_requested name=`（点忽略，不真删书）；更新提示点「更新」后 `update_confirm_shown` | ~240s |
-| 40_ui_tweaks | v0.6.41 五项修正 | 四段会话：`local_books`（点书不闪首页）、`catalog`（按钮）、`home`+`local_shelf`（行数/角标）+ 纯 Lua 单测 | `local_open keep_shelf=true`→`reader_ready`；`catalog_buttons back_bg=Color8(0) order_bg=Color8(0)`（截图复核白字）；`home_shelf_geom rows=3` / `full_shelf_geom rows=4` + `progress_badge=off`；`comic_detect_test 6 passed` | ~300s |
+| 40_ui_tweaks | v0.6.41 五项修正 | 四段会话：`local_books`（点书不闪首页）、`catalog`（按钮）、`home`+`local_shelf`（行数/角标）+ 纯 Lua 单测 | `local_open keep_shelf=true`→`reader_ready`；`catalog_buttons back_bg=Color8(0) order_bg=Color8(0)`（截图复核白字）；`home_shelf_geom rows=2 cols=4` / `full_shelf_geom rows=4` + `progress_badge=off`；`comic_detect_test 6 passed` | ~300s |
+| 41_home_grid_4x2 | 首页封面维持 4×2（v0.6.42） | `home` + `home`/`local_shelf` 两段会话 | `home_shelf_geom rows=2 cols=4`；`full_shelf_geom rows=4 cols=4`（横屏 3 行）不受影响；两张截图人工复核封面尺寸 | ~180s |
 
 ## 运行方式
 

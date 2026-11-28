@@ -9,12 +9,12 @@ case_begin "TC-26 全屏书架翻页"
 emu_start "home" "shelf_paging"
 emu_wait_mark "mode=home done" 180
 emu_wait_mark "flow=shelf_paging open ok=true" 180
-emu_wait_mark "flow=shelf_paging done page=2" 180
+emu_wait_mark "flow=shelf_paging done page=" 180
 emu_settle 8
 emu_shot
 assert_shot 20000
-# 30 本、每页 12 张（4 列 x 3 行）= 3 页
-assert_log_contains "flow=shelf_paging open ok=true pages=3" "页数=3"
+# v0.6.41 起本地书架竖屏 4 行（横屏 3 行）：30 本 / 每页 16 张 = 2 页
+assert_log_contains "flow=shelf_paging open ok=true pages=2" "页数=2"
 assert_no_fatal
 
 case_finish

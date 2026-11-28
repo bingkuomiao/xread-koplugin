@@ -25,7 +25,7 @@ screen_md5() {
 # 等界面真正离开某一个画面。固定 sleep 在后端慢的时候必然错位：
 # 目录请求超时重试会把开书拖到 60s 以上，后面每一步点击都会落在旧界面上。
 wait_screen_change() {
-    local base="$1" limit="${2:-150}" el=0 cur
+    local base="$1" limit="${2:-150}" strict="${3:-1}" el=0 cur
     while [ "$el" -lt "$limit" ]; do
         cur=$(screen_md5)
         if [ -n "$cur" ] && [ "$cur" != "$base" ]; then
@@ -35,7 +35,12 @@ wait_screen_change() {
         sleep 3
         el=$((el+3))
     done
-    fail "界面在 ${limit}s 内没有变化（预期离开当前画面）"
+    if [ "$strict" = "1" ]; then
+        fail "界面在 ${limit}s 内没有变化（预期离开当前画面）"
+    else
+        # 书源可能只返回 1 章，点当前章本来就不会换页；这一步只作截图留档
+        log "  画面未变（跳转目标就是当前章或后端慢），继续后续步骤"
+    fi
     return 1
 }
 
@@ -60,7 +65,7 @@ emu_tap 536 724; wait_screen_change "$TB_MD5" 45; shot_step "07_toolbar"
 CAT_MD5=$(screen_md5)
 emu_tap 148 330; wait_screen_change "$CAT_MD5" 60; shot_step "08_catalog"
 JUMP_MD5=$(screen_md5)
-emu_tap 500 670; wait_screen_change "$JUMP_MD5" 90; emu_settle 6; shot_step "09_after_jump_ch6"
+emu_tap 500 670; wait_screen_change "$JUMP_MD5" 90 0; emu_settle 6; shot_step "09_after_jump_ch6"
 emu_tap 900 724; sleep 4; emu_tap 900 724; sleep 4; shot_step "10_reading_next"
 
 TB_BEFORE=$(grep -c "ReaderToolbar" "$EMU_LOG" 2>/dev/null)

@@ -236,13 +236,31 @@
      original/srcset/source）、CSS `url()`、协议相对 URL，并去重。
    - `downloadImage` 补 `Referer`（书源域名），修漫画站防盗链导致的 403/1x1 空图。
    - 新增纯 Lua 单测 `comic_detect_test.lua`（6 项），覆盖上述写法与大 script 回归。
-4. **两个书架多显示一行**：首页网格 4×2→4×3（`_grid_geometry` 上限 3、调用点 force_rows=3），
-   本地书架竖屏 3→4 / 横屏 2→3（`_metrics`）。高度不足时逐级退行，避免压扁封面。
+4. **两个书架多显示一行**：当时首页网格 4×2→4×3、本地书架竖屏 3→4 / 横屏 2→3。
+   **v0.6.42 按用户要求把首页回退为 4×2**（见第十五节），本地书架多显示一行保持不变。
 5. **去掉所有封面百分比角标**：`shelf_book_card` / `full_shelf_view.book_card`
    都不再画 `N%` / `已读` 徽标，占位封面也不再为角标留空；英雄卡进度条上方的
    「阅读进度 N%」是上一轮明确要求加回的，保持不动。
 
 新增 `40_ui_tweaks`（四段会话 + 单测），日志锚点：
 `local_open keep_shelf=true` → `local_open reader_ready close_shelf=1`、
-`catalog_buttons back_bg=…`、`home_shelf_geom rows=3` / `full_shelf_geom rows=4`、
+`catalog_buttons back_bg=…`、`home_shelf_geom rows=2 cols=4`（v0.6.42 回退后）/ `full_shelf_geom rows=4`、
 `progress_badge=off`。
+
+## 十五、v0.6.42 首页封面维持 4×2
+
+用户明确要求首页封面保持 4×2（本地书架的多显示一行不动）。
+`HomeWidget:_grid_geometry` 回到 `force_rows or 2`、上限 2、
+`preferred_card_h = max(dp(160,132,228), card_w * 1.80)`，
+四处调用点（hero 侧栏估算、两处 section、末尾全屏网格）的 `force_rows` 全部回传 2。
+本地书架 `full_shelf_view._metrics` 仍是竖屏 4 行 / 横屏 3 行；
+v0.6.41 去掉封面 `N%` / `已读` 角标、英雄卡「阅读进度 N%」等改动均不受影响。
+
+新增 `41_home_grid_4x2`：两段会话分别断言 `home_shelf_geom rows=2 cols=4`、
+`full_shelf_geom rows=4 cols=4`，并留存首页/本地书架截图供像素复核。
+TC-40 的首页断言同步收紧为精确 `rows=2 cols=4`（原来是 rows=2 或 3 都过）。
+
+顺带修掉两条被 v0.6.41 书架几何和书源数据带偏的旧断言：
+`26_shelf_paging` 从「12 本/页、共 3 页」改为竖屏 16 本/页、共 2 页；
+`14_full_flow_touch` 的跳章截图步骤对「书源只返回 1 章、点当前章不换页」改为非致命，
+点击链路断言仍保留。

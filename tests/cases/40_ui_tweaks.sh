@@ -3,7 +3,7 @@
 #   1) 本地书架点书：先保持书架盖住首页（keep_shelf=true），阅读器就绪后才关（reader_ready）
 #   2) 目录四个按钮黑底白字（catalog_buttons 日志 + 截图人工复核）
 #   3) 漫画图片提取单测（comic_detect_test.lua，6 项）
-#   4) 两个书架多显示一行（home_shelf_geom / full_shelf_geom 日志 rows）
+#   4) 首页封面维持 4×2，本地书架多显示一行（home_shelf_geom / full_shelf_geom 日志 rows）
 #   5) 封面无百分比角标（geom 日志 progress_badge=off + 截图人工复核）
 CASE_ID="40_ui_tweaks"
 source "$(dirname "$0")/../lib/common.sh"
@@ -43,7 +43,7 @@ emu_stop
 # --- 书架行数与角标日志 ---
 emu_start "home"
 emu_wait_mark "mode=home done" 180
-assert_log_contains "home_shelf_geom rows=[23] " "首页书架至少 2 行"
+assert_log_contains "home_shelf_geom rows=2 cols=4 " "首页书架固定 4×2"
 assert_log_contains "home_shelf_geom .* progress_badge=off" "首页封面无进度角标"
 emu_settle 4
 emu_shot
