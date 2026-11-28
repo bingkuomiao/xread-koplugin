@@ -226,6 +226,16 @@ function M.install(env)
                 check("absolute", "/tmp/xread_abstest/a/b")
                 mark("flow=updater_ensure_dir done")
             end)
+        elseif flow == "notice_demo" then
+            -- 回归（v0.6.33）：结果类提示不再自动消失。
+            -- 用例流程：等 notice_shown → 静置 12s（断言没有同 id 的 notice_closed）
+            -- → 按 box_geom 点「知道了」→ 断言同一 id 的 notice_closed 出现。
+            UIManager:scheduleIn(6, function()
+                -- 首页可能先弹了「后端连不上」的 sticky 卡，会挡住这条提示，先清场
+                pcall(function() require("xread.message_box").close() end)
+                self:showInfo(_("提示框回归：这条提示不会自动消失，请点「知道了」关闭。"))
+                mark("flow=notice_demo shown")
+            end)
         else
             mark("flow=unknown name=" .. flow)
         end

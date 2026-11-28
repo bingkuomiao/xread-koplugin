@@ -6,7 +6,6 @@ local DataStorage  = require("datastorage")
 local LuaSettings  = require("luasettings")
 local UIManager    = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
-local InfoMessage  = require("ui/widget/infomessage")
 local InputDialog  = require("ui/widget/inputdialog")
 local Menu         = require("ui/widget/menu")
 local ConfirmBox   = require("ui/widget/confirmbox")
@@ -307,16 +306,31 @@ local function hotReload(ui, path)
 end
 -- ---------- UI 辅助 ----------
 -- 统一提示：所有 InfoMessage 都从这里出，保证样式（白底黑边黑字居中）一致。
--- 超时按内容长度自适应：短提示 4s，长一点的 6~8s，免得没读完就消失。
-function XRead:showInfo(text, timeout)
+--
+-- v0.6.33 起不再自动消失：原来按内容长度给 4~8s 的 timeout，长一点的错误原因
+-- 常没读完就没了，用户只能反复触发同一个错误去「抢读」。
+-- 现在固定「知道了」按钮 + 右上角 ✕ 两个出口，且点卡片外区域不关闭
+-- （dismissable=false），必须由用户明确关掉。
+-- 第二个参数 timeout 已废弃，仅为兼容历史调用保留，传了也不会自动关闭。
+function XRead:showInfo(text, _timeout)
     local txt = tostring(text or "")
     if txt == "" then return end
-    local t = tonumber(timeout)
-    if not t then
-        local n = #txt
-        if n <= 60 then t = 4 elseif n <= 150 then t = 6 else t = 8 end
+    -- 每个提示一个序号：自动演验收据此断言「同一张卡没有被自动关掉」
+    self._notice_seq = (self._notice_seq or 0) + 1
+    local id = self._notice_seq
+    if os.getenv("XREAD_AUTOTEST") then
+        print("[XREAD_AUTOTEST] notice_shown id=" .. tostring(id) .. " len=" .. tostring(#txt))
     end
-    MessageBox.show{ text = txt, timeout = t }
+    MessageBox.show{
+        text = txt,
+        dismissable = false,
+        buttons = { { text = _("知道了"), bold = true } },
+        on_close = function()
+            if os.getenv("XREAD_AUTOTEST") then
+                print("[XREAD_AUTOTEST] notice_closed id=" .. tostring(id))
+            end
+        end,
+    }
 end
 -- 后台同步网络任务是否该让路：首页/书架之上盖了弹层（更多/设置/账号等）时，
 -- 同步 HTTP 会卡住 UI 线程，导致弹层里的点击要等十几秒才有反应。
@@ -453,17 +467,25 @@ function XRead:notifyBackendDown(reason, silent)
         self:showBackendIssue{ title = _("无法连接后端"), text = msg }
     end
 end
---- 探活期间的不遮挡提示（toast，可以继续点击，不是模态框）
+--- 探活期间的等待提示。
+-- v0.6.33：不再用系统 Notification 小横幅（一闪而过、字小、还抢不到焦点），
+-- 改成同一套居中卡片；探活有结论后由 withBackend 主动收起（成功即进入内容，
+-- 失败由失败卡接替），所以它不算「会自己消失的通知」——它是过程态。
 function XRead:showConnectingToast(addr)
-    local ok, Notification = pcall(require, "ui/widget/notification")
-    if ok and Notification and Notification.notify then
-        pcall(function()
-            Notification:notify(T(_("正在连接 %1…"), display_address(addr)))
-        end)
-    end
+    self._connecting_box = MessageBox.show{
+        text = T(_("正在连接 %1…"), display_address(addr)),
+        dismissable = false,
+    }
 end
---- 首页秒开后的「软失败」提示：与 notifyBackendDown 的模态卡片不同，
--- 这里用原生 Notification（小横幅、不抢焦点、事件继续传播），且本次启动只提示一次。
+
+--- 收起探活等待卡（探活结束、无论成败都调）
+function XRead:_hideConnectingToast()
+    local box = self._connecting_box
+    self._connecting_box = nil
+    if box then pcall(function() box:close() end) end
+end
+--- 首页秒开后的「软失败」提示：与 notifyBackendDown 的模态卡片同一套样式，
+--- 一句话说现状 + 给出路，本次启动只提示一次（手动关闭后才算看完）。
 -- 只对「本地有缓存、之前连通过」的首页生效：无缓存时 withBackend 已经弹过模态引导。
 function XRead:notifyBackendSoftDownOnce()
     if self._home_soft_down_notified then return end
@@ -502,6 +524,8 @@ function XRead:withBackend(fn, opts)
     end
     if not opts.silent then self:showConnectingToast(addr) end
     BackendProbe.check(addr, opts.timeout, function(ok, reason)
+        -- 探活有结论：先收起「正在连接…」过程卡，后续提示（失败卡 / 业务 UI）才不会被它盖住
+        self:_hideConnectingToast()
         if not ok then
             self:notifyBackendDown(reason)
             if type(opts.on_fail) == "function" then
@@ -2791,6 +2815,7 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
                         MessageBox.show{
                             text = _("请设置服务器预缓存章节数"),
                             sticky = true,
+                            dismissable = false,
                             buttons = { { text = _("知道了") } },
                         }
                         return

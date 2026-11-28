@@ -9,7 +9,7 @@
 tests/
 ├── CASE_INDEX.md          本文件：用例索引 + 判定规则 + 坐标基准
 ├── lib/common.sh          公共库：模拟器启停、验收标记等待、断言、截图
-├── cases/01..19/*.sh      独立用例（12=zip 更新，13=包留存策略，16=按版本挑最新，17=封面单测，18=tar.gz 更新，19=本地包更新；11 旧散文件用例已移除）
+├── cases/01..35/*.sh      独立用例（12=zip 更新，13=包留存策略，16=按版本挑最新，17=封面单测，18=tar.gz 更新，19=本地包更新，31=静默检查更新，34=更新器建目录，35=提示卡不自动消失；11 旧散文件用例已移除）
 ├── reports/<时间戳>/      每次运行归档：SUMMARY.md + 逐用例日志 + 截图
 └── run_all.sh             统一入口（--full / --quick / --only）
 ```
@@ -34,6 +34,22 @@ tests/
 | 17_cover_api | 统一封面接口（本地/网络书通用） | 纯 Lua 单测（LuaJIT + mock socket.http） | `path=<customCoverUrl||coverUrl 原值>`、统一带 accessToken/secureKey/userNS、未登录网络书 URL 正确、Referer 为合法 header、本地书 401 重登后用新 token 重试 | <5s |
 | 18_targz_update | tar.gz 包热更新全流程（v0.6.2+） | `update` + filelist.json + tar.gz + md5 sidecar | `via=list`、识别 .tar.gz 包名版本、下载解压后本地版本变为测试版本；同名 tar.gz 与解压目录同级留存 | ~90s |
 | 19_local_update | 本地包热更新（v0.6.4+，不联网） | `localupdate` + 规范 zip 放插件目录内（同级目录负向验证不扫描） | `via=local`、本地包版本识别、解压后本地版本变为测试版本；源包挪入 xread_update 留存、插件目录清理；同级目录 9.9.9 包未被识别 | ~30s |
+| 20_shelf_back | 书架返回首页 | `home` + 进入书架 + 点左上返回 | 回到首页、书架已关闭、不叠层 | ~90s |
+| 21_night_buttons | 夜晚按钮作用域 | `home` / `open` 分别点夜晚 | 正文只切当前书、首页切全局，两者互不干扰 | ~120s |
+| 22_home_hero_cache | hero 封面 / 刷新 / 缓存章节单选 / 翻章章节名同步 | `home` + 多个 flow | hero 封面正常、缓存单选四档互斥、翻章后章节名同步 | ~180s |
+| 23_display_size | 界面字号三档 | `home` + `FLOW=display_size` + `XREAD_UI_SCALE` | compact/standard/large 三档重建均不溢出、不崩 | ~120s |
+| 24_rotate | 横竖屏旋转 | `home` + `FLOW=rotate` | 两次重建都完成，尺寸记录在日志供人工核对 | ~120s |
+| 25_layout_edge | 布局边界数据 | `home` + `FLOW=layout_edge`（假 books，不联网） | 超长书名/空作者/无封面/进度 0/跨页均不重叠 | ~90s |
+| 26_shelf_paging | 全屏书架翻页 | `home` + `FLOW=shelf_paging` | 30 本 3 页前进后退不崩（Batch 4 封面内存回收主验收） | ~120s |
+| 27_search_panel | 搜索加书入口 | `home` + `FLOW=search_panel` | 输入框 + 取消/搜索按钮弹出并可关闭，不发请求 | ~90s |
+| 28_memory_low | 低内存档位 | `home` + `XREAD_MEM_TIER=low` | `tier=low` + `layers=1` + `cover_cache=false`，首页正常打开 | ~90s |
+| 29_about_version | 关于本机后端版本 | `home` + 点更多 → 关于本机 | 「检测中」变为具体版本号，无 `showAboutPanel failed` | ~90s |
+| 30_test_connection_status | 测试连接状态回写 | `home` + `FLOW=test_conn` | 成功后顶部立即变「已连接」，不等 60s 心跳 | ~90s |
+| 31_quiet_update | 后台静默检查更新 | `home` | `update_checked newer=` 出现，无 `quiet update check failed` | ~90s |
+| 32_book_night_footer | 书内夜晚页脚配色 | `open` + `FLOW=book_night` | `chrome_night dark=true`，页脚不留白条 | ~90s |
+| 33_catalog_jump_range | 目录跳章范围 | `open` + `FLOW=diag_chapter` | `after_jump_<n> index=<n>` 落在当前文档范围，无 `chapter_index_out_of_range` | ~90s |
+| 34_updater_ensure_dir | 更新器建目录 | `home` + `FLOW=updater_ensure_dir` | 相对/绝对路径都能建出 `a/b`，mode=directory | ~60s |
+| 35_notice_no_auto_dismiss | 提示卡不自动消失（v0.6.33） | `home` + `FLOW=notice_demo` | 弹卡后静置 12s 无 `notice_closed`；点「知道了」后才出现同 id 关闭标记 | ~90s |
 
 ## 运行方式
 
@@ -105,7 +121,7 @@ bash /mnt/d/WorkBuddy/2026-11-22-00-23-49/xread-migration/tests/run_all.sh
 
 | 脚本 | 验证内容 | 备注 |
 |---|---|---|
-| `tests/probe_health_ui.sh` | 测试连接回执：成功「地址 + 耗时」，失败「地址 + 耗时 + 原因」 | 用 `XREAD_AUTOTEST_DELAY` 对齐截图时机（提示会超时消失） |
+| `tests/probe_health_ui.sh` | 测试连接回执：成功「地址 + 耗时」，失败「地址 + 耗时 + 原因」 | 提示卡自 v0.6.33 起不自动消失，`XREAD_AUTOTEST_DELAY` 只用于等业务请求返回 |
 | `tests/probe_update_ui.sh [confirm|full]` | 检查更新 → 唯一确认框「更新并重启」→ 安装进度 → 自动重启，`_meta.lua` 已换成包内版本 | `full` 需传 `TAP_OK_X/TAP_OK_Y`（确认框按钮坐标） |
 | `tests/probe_auto_raw.sh` | 自动检查更新提示（本地 http.server 提供 filelist.json + 0.6.8 包，避开 NAS webdav 抖动） | 通过 `XREAD_UPDATER_URL` 走 raw 通道 |
 | `tests/probe_remote_targz.sh [confirm|full]` | 远端 tar.gz 全链路：模拟器降级 0.6.6 → 列远端目录 → 确认框 → 下载/校验/解压 → 自动重启 | `full` 传 `TAP_OK_X=732 TAP_OK_Y=816` |

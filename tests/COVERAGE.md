@@ -17,14 +17,14 @@
 | 开书 / 正文 | 点书进入、正文渲染、翻页 | 02_reading_open、14_full_flow_touch |
 | 阅读工具栏 | 呼出、按钮布局、目录图标、返回书架 | 03_toolbar、08_toolbar_catalog_tap、15b_toolbar_buttons |
 | 目录 | 打开、跳章、缓存态高亮、翻章后章节名同步 | 04_catalog、22_home_hero_cache（chapter_sync） |
-| 更多菜单 | 我的书架/地址/账号/翻页/关于本机 | 15c_more_menu |
+| 更多菜单 | 我的书架/地址管理/账号管理/首页管理/升级管理/关于本机 | 15c_more_menu |
 | 设置面板 | 地址、账号、翻页、缓存章节数单选 | 22_home_hero_cache（settings / cache_none） |
 | 阅读统计 | 统计页渲染 | 07_stats |
 | 缓存 | 整本预缓存、未设置章节数时的引导、缓存失败常驻卡 | 15b_toolbar_buttons（cache）、22_home_hero_cache |
 | 夜晚模式 | 首页全局 / 正文书籍级，两者互不干扰 | 21_night_buttons |
-| 消息与弹窗 | 提示卡、确认框、原生 ConfirmBox | 22（msgbox/msgconfirm）、15c |
+| 消息与弹窗 | 提示卡（不自动消失、按钮/✕ 关闭）、确认框、原生 ConfirmBox | 35_notice_no_auto_dismiss、22（msgbox/msgconfirm）、15c |
 | 本地阅读 | 本地书列表、返回 | 15a（local_books / local_back） |
-| 热更新 | zip / tar.gz / 本地包 / 列目录取最新 / 留存策略 | 12、16、18、19、13 |
+| 热更新 | zip / tar.gz / 本地包 / 列目录取最新 / 留存策略 / 静默检查 / 建目录 | 12、16、18、19、13、31_quiet_update、34_updater_ensure_dir |
 | 封面接口 | 编码、鉴权、Referer、401 重登 | 17_cover_api |
 | 界面字号 | standard / compact / large 三档布局 | 23_display_size |
 | 屏幕旋转 | 横屏 ↔ 竖屏重建 | 24_rotate |
@@ -48,6 +48,7 @@
 | `memory.lua` / 缓存策略 | 28_memory_low、26_shelf_paging、06_home |
 | `updater.lua` / 打包脚本 | 12、16、18、19、13、10 |
 | `cover_cache.lua` | 17_cover_api、06_home、22 |
+| `message_box.lua` / `showInfo` / 任何弹窗文案 | 35_notice_no_auto_dismiss、22（msgbox/msgconfirm）、15c_more_menu |
 
 ## 三、自动化测不到的部分（必须真机/人工）
 
@@ -104,3 +105,20 @@
   （只在排查问题时打开，生产无副作用。）
 - 15c_more_menu / 29_about_version 的点击坐标按 6 项更多面板更新
   （我的书架 495 / 地址管理 596 / 账号管理 697 / 首页管理 798 / 升级管理 899 / 关于本机 1000）。
+
+## 七、v0.6.33 提示卡改造（不再自动消失）
+
+- 背景：`showInfo` 原来按文案长度给 4/6/8s 的 timeout，长一点的错误原因没读完就没了；
+  用户只能反复触发同一个错误去「抢读」。系统 `Notification` 小横幅同样一闪而过、字还小。
+- 现状：所有结果类提示统一走 `MessageBox.show{ buttons={{text="知道了"}} , dismissable=false }`，
+  出口只有两个——底部「知道了」按钮、右上角 ✕（返回键也保留）。点卡片外区域不再关闭。
+- 过程提示仍会自动收起，但它们是「状态」不是「通知」：
+  - `showConnectingToast`（正在连接…）→ 已从系统横幅改成同一套居中卡片，
+    探活一出结论就由 `_hideConnectingToast()` 收起，失败则由失败卡接替；
+  - 进度类（`ProgressToast`、`Trapper:info` 的「正在下载更新包/正在准备目录」）原地刷新，任务结束即收。
+- 回归用例 `35_notice_no_auto_dismiss`：flow=`notice_demo` 弹一条提示 →
+  静置 12s 断言日志中**没有**同 id 的 `notice_closed`（旧实现最长 8s 就消失）→
+  按插件打印的 `box_geom btn1=x,y` 点「知道了」→ 断言同 id 的 `notice_closed` 出现。
+  - 按钮坐标由 `message_box.lua` 在 `XREAD_AUTOTEST` 下打印，**不要手写坐标**：
+    字号/DPI/文案行数一变就会点偏。
+  - 相关日志标记：`notice_shown id=<n>`、`notice_closed id=<n>`、`box_geom ...`。

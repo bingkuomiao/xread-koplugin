@@ -209,8 +209,8 @@ function Box:init()
 
     -- 按钮行（可选）
     local n_btn = self.buttons and #self.buttons or 0
+    local btn_h = Screen:scaleBySize(BTN_H)   -- 外层声明：下面的验收几何输出要用
     if n_btn > 0 then
-        local btn_h = Screen:scaleBySize(BTN_H)
         content[#content + 1] = VerticalSpan:new{ width = Screen:scaleBySize(GAP_BODY) }
         local row = HorizontalGroup:new{ align = "center" }
         local bw = math.floor(inner_w / n_btn)
@@ -233,8 +233,9 @@ function Box:init()
     end
 
     -- 用固定宽度的容器把内容撑到 inner_w，保证卡片等宽且内容水平居中
+    local content_h = content:getSize().h
     local holder = CenterContainer:new{
-        dimen = Geom:new{ w = inner_w, h = content:getSize().h },
+        dimen = Geom:new{ w = inner_w, h = content_h },
         content,
     }
 
@@ -263,6 +264,21 @@ function Box:init()
         dimen = Geom:new{ x = 0, y = math.floor(-GAP_TOP * sh), w = sw, h = sh },
         card,
     }
+
+    -- 自动验收：把按钮中心坐标打印出来，用例据此点击（不要靠猜坐标，
+    -- 字号/DPI/文案行数一变就会点偏）。只在 XREAD_AUTOTEST 下输出。
+    if os.getenv("XREAD_AUTOTEST") and n_btn > 0 then
+        local card_h = content_h + pad * 2 + 4      -- +4 = 上下各 2px 边框
+        local card_top = math.floor(-GAP_TOP * sh + (sh - card_h) / 2)
+        local btn_y = card_top + pad + content_h - math.floor(btn_h / 2)
+        local bw_each = math.floor(inner_w / n_btn)
+        for i = 1, n_btn do
+            -- 第 i 个按钮的中心 x：卡片左边距 + 内边距 + 前面按钮宽度 + 本按钮半宽
+            local bx = math.floor((sw - card_w) / 2 + pad + bw_each * (i - 1) + bw_each / 2)
+            print(string.format("[XREAD_AUTOTEST] box_geom n_btn=%d card=%dx%d top=%d btn%d=%d,%d",
+                n_btn, card_w, card_h, card_top, i, bx, btn_y))
+        end
+    end
 
     self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.full_dimen } } }
     if Device:hasKeys() then
@@ -318,6 +334,12 @@ function M.show(opts)
     end)
     if not ok or not box then
         logger.warn("[MiuRead][MessageBox] create failed", tostring(box))
+        -- 兜底：卡片建不起来时绝不能把话吞掉（用户只会以为「点了没反应」）。
+        -- 用原生 InfoMessage 撑 30s，至少让人看清内容，再去日志里查原因。
+        pcall(function()
+            local InfoMessage = require("ui/widget/infomessage")
+            UIManager:show(InfoMessage:new{ text = text, timeout = 30 })
+        end)
         return nil
     end
 

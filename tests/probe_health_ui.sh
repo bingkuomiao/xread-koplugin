@@ -1,6 +1,7 @@
 #!/bin/bash
 # 探针：测试连接回执（成功/失败各一次）
-# 提示是 6s 自动消失的 InfoMessage，所以用 XREAD_AUTOTEST_DELAY 精确对齐截图时机
+# 提示是常驻卡片（v0.6.33 起不自动消失，需点「知道了」/✕），
+# 截图时机不再需要精算，XREAD_AUTOTEST_DELAY 只用于等业务请求回来
 set -u
 source "$(dirname "$0")/lib/common.sh"
 

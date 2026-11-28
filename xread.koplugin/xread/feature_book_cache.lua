@@ -297,6 +297,7 @@ function M.install(env)
             MessageBox.show{
                 text = _("请设置服务器预缓存章节数"),
                 sticky = true,
+                dismissable = false,
                 buttons = { { text = _("知道了") } },
             }
             return
@@ -413,6 +414,7 @@ function M.install(env)
                     title = _("缓存失败"),
                     text = readable_error(err_text),
                     sticky = true,
+                    dismissable = false,
                     buttons = { { text = _("知道了") } },
                 }
             end
