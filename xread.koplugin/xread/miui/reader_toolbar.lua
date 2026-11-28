@@ -13,11 +13,11 @@ local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local Widget = require("ui/widget/widget")
-local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local TransientGuard = require("xread.miui.transient_guard")
 local DialogTransition = require("xread.miui.dialog_transition")
 local Skin = require("xread.miui.reader_skin")
+local Prims = require("xread.miui.ui_primitives")
 local Ui = require("xread.miui.ui_components")
 local UiScale = require("xread.miui.ui_scale")
 local U = require("xread.miui.util")
@@ -25,39 +25,8 @@ local U = require("xread.miui.util")
 local Screen = Device.screen
 local live_toolbar
 
-local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
-function OffsetContainer:getSize() return self[1]:getSize() end
-function OffsetContainer:paintTo(bb, x, y)
-    self[1]:paintTo(bb, x + self.x_off, y + self.y_off)
-end
-
-local TapBox = InputContainer:extend{
-    dimen = nil,
-    callback = nil,
-    hold_callback = nil,
-    enabled = true,
-}
-function TapBox:init()
-    self.dimen = self.dimen or Geom:new{w = 1, h = 1}
-    self.ges_events = {TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}}}
-    if self.hold_callback then
-        self.ges_events.HoldSelect = {GestureRange:new{ges = "hold", range = self.dimen}}
-    end
-end
-function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
-function TapBox:paintTo(bb, x, y)
-    self.dimen.x, self.dimen.y = x, y
-    if self[1] then self[1]:paintTo(bb, x, y) end
-end
-function TapBox:onTapSelect()
-    if self.enabled ~= false and self.callback then self.callback() end
-    return true
-end
-function TapBox:onHoldSelect()
-    if self.enabled ~= false and self.hold_callback then self.hold_callback() end
-    return true
-end
-function TapBox:handleEvent(event) return InputContainer.handleEvent(self, event) end
+local OffsetContainer = Prims.OffsetContainer
+local TapBox = Prims.TapBox
 
 local function centered_text(text, width, height, face, options)
     options = options or {}

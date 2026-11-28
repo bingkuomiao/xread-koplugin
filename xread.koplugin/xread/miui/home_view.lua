@@ -2,7 +2,6 @@ local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Font = require("ui/font")
-local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local GestureBridge = require("xread.miui.gesture_bridge")
@@ -20,7 +19,6 @@ local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
-local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local U = require("xread.miui.util")
 local ShelfProgress = require("xread.miui.shelf_progress")
@@ -29,6 +27,7 @@ local UiScale = require("xread.miui.ui_scale")
 local Ui = require("xread.miui.ui_components")
 local HeaderLayout = require("xread.miui.home_header_layout")
 local Memory = require("xread.miui.memory")
+local Prims = require("xread.miui.ui_primitives")
 
 local Screen = Device.screen
 local live_widget
@@ -38,122 +37,17 @@ local function face(name, nominal, maximum, minimum)
     return UiScale.face(name, nominal, maximum, minimum)
 end
 
-local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
-function OffsetContainer:getSize() return self[1]:getSize() end
-function OffsetContainer:paintTo(bb, x, y)
-    self[1]:paintTo(bb, x + self.x_off, y + self.y_off)
-end
-
-local RoundedImageContainer = WidgetContainer:extend{width = 1, height = 1, radius = 0, ink_boost = 0}
-function RoundedImageContainer:getSize()
-    return Geom:new{w = self.width, h = self.height}
-end
-function RoundedImageContainer:paintTo(bb, x, y)
-    if self[1] then self[1]:paintTo(bb, x, y) end
-    local boost = math.max(0, math.min(.18, tonumber(self.ink_boost) or 0))
-    if boost > 0 and bb and type(bb.darkenRect) == "function" then
-        -- A light contrast lift keeps pale covers legible on e-ink without
-        -- turning dark covers into solid blocks.
-        pcall(bb.darkenRect, bb, x, y, self.width, self.height, boost)
-    end
-    local r = math.max(0, math.min(math.floor(self.radius or 0), math.floor(math.min(self.width, self.height) / 2)))
-    if r <= 1 or not bb or type(bb.paintRect) ~= "function" then return end
-    -- Mask only the four corner pixels. This keeps the image flush with its
-    -- box while giving the cover itself rounded corners, without a padded frame.
-    for row = 0, r - 1 do
-        local dy = r - row
-        local inside = math.sqrt(math.max(0, r * r - dy * dy))
-        local inset = math.max(0, math.floor(r - inside + .5))
-        if inset > 0 then
-            bb:paintRect(x, y + row, inset, 1, Blitbuffer.COLOR_WHITE)
-            bb:paintRect(x + self.width - inset, y + row, inset, 1, Blitbuffer.COLOR_WHITE)
-            bb:paintRect(x, y + self.height - 1 - row, inset, 1, Blitbuffer.COLOR_WHITE)
-            bb:paintRect(x + self.width - inset, y + self.height - 1 - row, inset, 1, Blitbuffer.COLOR_WHITE)
-        end
-    end
-end
-
-local function fixed_frame(width, height, options, content)
-    options = options or {}
-    local border = tonumber(options.bordersize) or 0
-    local padding = tonumber(options.padding) or 0
-    local margin = tonumber(options.margin) or 0
-    local inset = border + padding + margin
-    return FrameContainer:new{
-        bordersize = border,
-        radius = options.radius or 0,
-        padding = padding,
-        margin = margin,
-        background = options.background,
-        color = options.color or Blitbuffer.COLOR_BLACK,
-        CenterContainer:new{
-            dimen = Geom:new{
-                w = math.max(1, width - inset * 2),
-                h = math.max(1, height - inset * 2),
-            },
-            content or Widget:new{dimen = Geom:new{w = 1, h = 1}},
-        },
-    }
-end
+local OffsetContainer = Prims.OffsetContainer
+local RoundedImageContainer = Prims.RoundedImage
+local fixed_frame = Prims.frame
 
 local function background(width, height)
     return fixed_frame(width, height, {background = Blitbuffer.COLOR_WHITE})
 end
 
-local TapBox = InputContainer:extend{dimen = nil, callback = nil, hold_callback = nil, _hold_handled = false}
-function TapBox:init()
-    self.dimen = self.dimen or Geom:new{w = 1, h = 1}
-    self.ges_events = {
-        TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}},
-        HoldSelect = {GestureRange:new{ges = "hold", range = self.dimen}},
-        HoldReleaseSelect = {GestureRange:new{ges = "hold_release", range = self.dimen}},
-    }
-end
-function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
-function TapBox:paintTo(bb, x, y)
-    self.dimen.x, self.dimen.y = x, y
-    if self[1] then self[1]:paintTo(bb, x, y) end
-end
-function TapBox:onTapSelect(_, ges)
-    if self._hold_handled then
-        self._hold_handled = false
-        return true
-    end
-    -- 用墙上时钟做双击防抖（os.clock 是 CPU 时间，UI 卡住时几乎不走，
-    -- 会把之后几十秒的点击全部误判成「防抖期」吞掉）
-    local now=U.now()
-    if now<(tonumber(self._miu_tap_block_until) or 0) then return true end
-    self._miu_tap_block_until=now+.20
-    if self.callback then self.callback(self.dimen and self.dimen:copy() or nil, ges) end
-    return true
-end
-function TapBox:onHoldSelect()
-    self._hold_handled = self.hold_callback ~= nil
-    if self.hold_callback then self.hold_callback(self.dimen and self.dimen:copy() or nil) end
-    return self.hold_callback ~= nil
-end
-function TapBox:onHoldReleaseSelect()
-    if self._hold_handled then
-        self._hold_handled = false
-        self._miu_tap_block_until = U.now() + .20
-        return true
-    end
-    return false
-end
-function TapBox:handleEvent(event)
-    -- Child cards only own taps. Let swipes reach HomeWidget first so the
-    -- quick panel and shelf paging are not consumed by KOReader underneath.
-    return InputContainer.handleEvent(self, event)
-end
-
+-- 卡片统一 0.2s 防抖：首页卡片是「点一下开书」，误触代价太大
 local function tappable(width, height, child, callback, hold_callback)
-    local tap = TapBox:new{
-        dimen = Geom:new{w = width, h = height},
-        callback = callback,
-        hold_callback = hold_callback,
-    }
-    tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, child}
-    return tap
+    return Prims.tappable(width, height, child, callback, hold_callback, {debounce = .20})
 end
 
 local function text_button(text, width, height, callback, options)

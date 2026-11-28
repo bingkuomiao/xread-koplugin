@@ -1,7 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
-local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
@@ -17,11 +16,11 @@ local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
-local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UiScale = require("xread.miui.ui_scale")
 local U = require("xread.miui.util")
 local Ui = require("xread.miui.ui_components")
 local Memory = require("xread.miui.memory")
+local Prims = require("xread.miui.ui_primitives")
 
 local Screen = Device.screen
 
@@ -29,96 +28,12 @@ local function face(name, nominal, maximum, minimum)
     return UiScale.face(name, nominal, maximum, minimum)
 end
 
-local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
-function OffsetContainer:getSize() return self[1]:getSize() end
-function OffsetContainer:paintTo(bb, x, y)
-    self[1]:paintTo(bb, x + self.x_off, y + self.y_off)
-end
-
-local RoundedImage = WidgetContainer:extend{width = 1, height = 1, radius = 0, ink_boost = .10}
-function RoundedImage:getSize() return Geom:new{w = self.width, h = self.height} end
-function RoundedImage:paintTo(bb, x, y)
-    if self[1] then self[1]:paintTo(bb, x, y) end
-    if bb and type(bb.darkenRect) == "function" and (tonumber(self.ink_boost) or 0) > 0 then
-        pcall(bb.darkenRect, bb, x, y, self.width, self.height, math.min(.16, tonumber(self.ink_boost) or .10))
-    end
-    local r = math.max(0, math.min(math.floor(self.radius or 0), math.floor(math.min(self.width, self.height) / 2)))
-    if r <= 1 or not bb or type(bb.paintRect) ~= "function" then return end
-    for row = 0, r - 1 do
-        local dy = r - row
-        local inside = math.sqrt(math.max(0, r * r - dy * dy))
-        local inset = math.max(0, math.floor(r - inside + .5))
-        if inset > 0 then
-            bb:paintRect(x, y + row, inset, 1, Blitbuffer.COLOR_WHITE)
-            bb:paintRect(x + self.width - inset, y + row, inset, 1, Blitbuffer.COLOR_WHITE)
-            bb:paintRect(x, y + self.height - 1 - row, inset, 1, Blitbuffer.COLOR_WHITE)
-            bb:paintRect(x + self.width - inset, y + self.height - 1 - row, inset, 1, Blitbuffer.COLOR_WHITE)
-        end
-    end
-end
-
-local function fixed_frame(width, height, options, content)
-    options = options or {}
-    local border = tonumber(options.bordersize) or 0
-    local padding = tonumber(options.padding) or 0
-    local inset = border + padding
-    return FrameContainer:new{
-        bordersize = border,
-        padding = padding,
-        margin = 0,
-        radius = options.radius or 0,
-        background = options.background,
-        color = options.color or Blitbuffer.COLOR_BLACK,
-        CenterContainer:new{
-            dimen = Geom:new{w = math.max(1, width - inset * 2), h = math.max(1, height - inset * 2)},
-            content or Widget:new{dimen = Geom:new{w = 1, h = 1}},
-        },
-    }
-end
-
-local TapBox = InputContainer:extend{dimen = nil, callback = nil, hold_callback = nil, _hold_handled=false}
-function TapBox:init()
-    self.dimen = self.dimen or Geom:new{w = 1, h = 1}
-    self.ges_events = {
-        TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}},
-        HoldSelect = {GestureRange:new{ges = "hold", range = self.dimen}},
-    }
-end
-function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
-function TapBox:paintTo(bb, x, y)
-    self.dimen.x, self.dimen.y = x, y
-    if self[1] then self[1]:paintTo(bb, x, y) end
-end
-function TapBox:onTapSelect()
-    if self._hold_handled then
-        self._hold_handled=false
-        return true
-    end
-    if self.callback then self.callback(self.dimen and self.dimen:copy() or nil) end
-    return true
-end
-function TapBox:onHoldSelect()
-    if type(self.hold_callback)~="function" then return false end
-    self._hold_handled=true
-    self.hold_callback(self.dimen and self.dimen:copy() or nil)
-    return true
-end
-function TapBox:onHoldReleaseSelect()
-    if self._hold_handled then
-        self._hold_handled=false
-        return true
-    end
-    return false
-end
+local OffsetContainer = Prims.OffsetContainer
+local RoundedImage = Prims.RoundedImage
+local fixed_frame = Prims.frame
 
 local function tappable(width, height, child, callback, hold_callback)
-    local box = TapBox:new{
-        dimen = Geom:new{w = width, h = height},
-        callback = callback,
-        hold_callback = hold_callback,
-    }
-    box[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, child}
-    return box
+    return Prims.tappable(width, height, child, callback, hold_callback)
 end
 
 local function image_widget(path, width, height)

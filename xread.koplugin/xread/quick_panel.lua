@@ -6,6 +6,8 @@
 
 local UICommon        = require("xread.ui_common")
 
+local Prims           = require("xread.miui.ui_primitives")
+
 local Blitbuffer      = require("ffi/blitbuffer")
 
 local Geom            = require("ui/geometry")
@@ -93,31 +95,7 @@ local clamp = UiKit.clamp
 
 -- ---------- 可点击的小图标 / 文字 ----------
 
-local TapBox = InputContainer:extend{ widget = nil, width = nil, height = nil, callback = nil }
-
-function TapBox:init()
-
-    self.dimen = Geom:new{ w = self.width, h = self.height }
-
-    self[1] = CenterContainer:new{
-
-        dimen = Geom:new{ w = self.width, h = self.height },
-
-        self.widget,
-
-    }
-
-    self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.dimen } } }
-
-end
-
-function TapBox:onTap()
-
-    if self.callback then self.callback() end
-
-    return true
-
-end
+local TapBox = Prims.TapBox
 
 local function iconBox(name, size, box_w, box_h, callback)
 
