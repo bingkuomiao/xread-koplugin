@@ -337,10 +337,12 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
         if ok and tonumber(fh) and tonumber(fh) > 0 then title_line_h = math.floor(tonumber(fh) + .5) end
     end
     local title_h = math.max(UiScale.dp(38, 34, 52), title_line_h * 2 + UiScale.dp(2, 1, 3))
-    local progress_h = math.max(UiScale.dp(29, 26, 40), math.min(UiScale.dp(38, 33, 48), math.floor(inner_h * .11)))
-    -- 简介比书名多留一行高度，正文简介能多显示内容；相应压缩封面区，简介整体上移。
-    local intro_h = title_h + UiScale.dp(14, 12, 20)
-    local body_h = math.max(1, inner_h - intro_h - progress_h - section_gap * 2)
+    -- 卡片底部原来还有一行「阅读进度 xx%」+ 进度条，和上面信息区的「阅读至 xx%」
+    -- 是同一份数据、同一句话，属于重复内容，已去掉（参考图也没有这一条）。
+    -- 省下来的高度全部给简介，长简介多显示两行，不再动不动就被截断。
+    local bar_h = math.max(UiScale.dp(29, 26, 40), math.min(UiScale.dp(38, 33, 48), math.floor(inner_h * .11)))
+    local intro_h = title_h + UiScale.dp(14, 12, 20) + bar_h
+    local body_h = math.max(1, inner_h - intro_h - section_gap)
 
     local baseline_h = math.max(0, tonumber(shelf_cover_h) or 0)
     local baseline_w = math.max(0, tonumber(shelf_cover_w) or 0)
@@ -412,21 +414,20 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     local meta_line = U.trim(tostring(book.meta_line or ""))
     local progress_line = U.trim(tostring(book.progress_line or ""))
     local source_line = U.trim(tostring(book.source_line or ""))
+    -- 章节/上次读到已经并进 source_line，这里不再兜底成「尚未阅读」——
+    -- 空串就该少一行，否则会凭空多出一行和「共 N 章」打对台的废话。
     local last_line = U.trim(tostring(book.last_read_text or ""))
-    if last_line == "" then last_line = "尚未阅读" end
 
     local info_h = body_h
     local line_h = math.max(UiScale.dp(15, 13, 20), math.floor(body_h * .088))
     local meta_gap = math.max(1, math.floor(line_h * .12))
-    -- 书名不再和右上角刷新图标抢同一行：图标独占第一行右侧，
-    -- 书名整体下移到图标下方，并能用满 text_w。
+    -- 顶栏一行：左边「最近阅读」标签，右边刷新图标（参考图就是这个排法）。
+    -- 书名不再和图标抢同一行：图标行独占，书名从它下面一行开始并用满 text_w。
     -- 原来书名只拿到 text_w - history_w，像「三国之蜀汉我做主」这种 8 字书名
     -- 会被挤成「三国之蜀汉我做」+「主」，第二行只剩一个字。
-    local title_y = 0
+    local header_h = math.max(history_h, UiScale.dp(22, 20, 30))
+    local title_y = header_h + math.max(1, math.floor(line_h * .18))
     local title_w = math.max(1, text_w)
-    if history_w > 0 then
-        title_y = history_h + math.max(1, math.floor(line_h * .18))
-    end
     local intro_top = title_y + title_h + meta_gap
     local info = OverlapGroup:new{dimen = Geom:new{w = text_w, h = info_h}, allow_mirroring = false}
     local function info_line(text, y, bold, size)
@@ -438,6 +439,19 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
             width = text_w, height = line_h, height_adjust = false,
             height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
         }}
+    end
+    -- 「最近阅读」标签：和右上角刷新图标同一行，占文字列最左侧（参考图排法）
+    local label_h = math.max(1, math.min(header_h, UiScale.dp(19, 17, 26)))
+    if history_w > 0 then
+        info[#info + 1] = OffsetContainer:new{
+            x_off = 0, y_off = math.max(0, math.floor((header_h - label_h) / 2)),
+            TextBoxWidget:new{
+                text = "最近阅读",
+                face = face("smallinfofont", mini and 9.0 or 9.6, mini and 12.0 or 12.8, mini and 7.4 or 7.6),
+                width = math.max(1, text_w - history_w), height = label_h, height_adjust = false,
+                height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            },
+        }
     end
     -- 书名（图标下方第一行，宽度用满）
     info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = title_y, TextBoxWidget:new{
@@ -465,26 +479,6 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     }
 
-    local progress_number_value = tonumber(book.progress)
-    local progress_known = book.progress_known~=false and progress_number_value~=nil
-    local progress_value = progress_known and math.max(0, math.min(100, progress_number_value)) or 0
-    local progress_number = progress_known and string.format("%.1f", progress_value):gsub("%.0$", "") or "—"
-    local progress_label = progress_known and ("阅读进度 " .. progress_number .. "%") or "阅读进度 —"
-    local progress_label_h = math.max(UiScale.dp(18, 16, 25), math.floor(progress_h * .52))
-    local progress_slot_h = math.max(1, progress_h - progress_label_h)
-    local progress_track_h = math.max(UiScale.line("thick"), UiScale.dp(3, 2, 5))
-    local progress_fill = math.max(0, math.min(inner_w, math.floor(inner_w * progress_value / 100 + .5)))
-    local progress_layers = OverlapGroup:new{dimen = Geom:new{w = inner_w, h = progress_slot_h}, allow_mirroring = false}
-    local bar_y = math.floor((progress_slot_h - progress_track_h) / 2)
-    progress_layers[#progress_layers + 1] = OffsetContainer:new{x_off = 0, y_off = bar_y, LineWidget:new{
-        background = Blitbuffer.COLOR_LIGHT_GRAY, dimen = Geom:new{w = inner_w, h = progress_track_h},
-    }}
-    if progress_fill > 0 then
-        progress_layers[#progress_layers + 1] = OffsetContainer:new{x_off = 0, y_off = bar_y, LineWidget:new{
-            background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{w = progress_fill, h = progress_track_h},
-        }}
-    end
-
     local body = OverlapGroup:new{dimen = Geom:new{w = inner_w, h = inner_h}, allow_mirroring = false}
     if show_cover==false then
         body[#body + 1] = CenterContainer:new{dimen=Geom:new{w=text_w,h=body_h},info}
@@ -498,13 +492,6 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     end
     local intro_y = body_h + section_gap
     body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = intro_y, intro}
-    local progress_y = intro_y + intro_h + section_gap
-    body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = progress_y, VerticalGroup:new{
-        align = "left",
-        Ui.textbox(progress_label, inner_w, progress_label_h,
-            face("smallinfofont", 9.6, 13.2, 8.2), {bold = true, alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK}),
-        progress_layers,
-    }}
 
     local content = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
     content[#content + 1] = OffsetContainer:new{

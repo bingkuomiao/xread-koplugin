@@ -30,6 +30,7 @@ tests/
 | 10_package_consistency | 交付包一致性 | md5 | zip / 源码 / WSL 部署三方逐文件匹配 | <5s |
 | 12_update_zip | 列目录模式 zip 热更新全流程 | `update` + filelist.json + zip + md5 sidecar（无 manifest） | `via=list`、`newer=true`、下载 zip 解压后本地版本变为测试版本；同名 zip 与解压目录同级留存 | ~90s |
 | 13_package_retention | 设备端更新包留存与清理 | `update` + filelist.json（1 包）+ 预置 4 个历史包 | 新包落 `xread_update/<包名>/`；索引只留 3 条；最旧 p1/p2 的目录与 zip 被清理，p3/p4 保留 | ~90s |
+| 15c_more_menu | 更多页 5 项菜单逐项点击（v0.6.35） | `home` + 点右上「更多」→ 按 `more_row` 日志坐标逐项点 | 我的书架/首页管理/系统管理/升级管理/关于本机 各自打开对应面板，无致命错误 | ~240s |
 | 16_filelist_latest | 列目录按版本挑最新（不按时间） | `update` + filelist.json（2 包，无 version 字段）+ md5 sidecar | `via=list`、按包名语义版本挑中高版本（`remote=0.7.1-test`）而非时间戳更新的低版本、包内版本裁决后本地版本更新、不误装旧包 | ~90s |
 | 17_cover_api | 统一封面接口（本地/网络书通用） | 纯 Lua 单测（LuaJIT + mock socket.http） | `path=<customCoverUrl||coverUrl 原值>`、统一带 accessToken/secureKey/userNS、未登录网络书 URL 正确、Referer 为合法 header、本地书 401 重登后用新 token 重试 | <5s |
 | 18_targz_update | tar.gz 包热更新全流程（v0.6.2+） | `update` + filelist.json + tar.gz + md5 sidecar | `via=list`、识别 .tar.gz 包名版本、下载解压后本地版本变为测试版本；同名 tar.gz 与解压目录同级留存 | ~90s |

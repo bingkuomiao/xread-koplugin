@@ -32,16 +32,16 @@ function M.install(env)
     function XRead:showMorePanel()
         -- 「翻页管理」从这里移除了：它并进首页齿轮「设置」的翻页管理分组。
         -- 同一功能保留两个入口，用户会在两份列表里各点一遍。
+        -- 「地址管理」「账号管理」从这里移除了：两者在首页齿轮「设置」里都有入口，
+        -- 同一功能两处入口，用户会在两份列表里各点一遍。
+        -- 「系统管理」= 点左上角「阅读X」的同一个入口（KOReader 自身菜单），
+        -- 给「不想去点标题」的用户留一条明路；位置紧贴升级管理之前（都是「本机维护」类）。
         self:showMoreListPanel(_("更多"), {
             { label = _("我的书架"), callback = function() self:openShelf() end },
-            { label = _("地址管理"), callback = function() self:showServerManage() end },
-            { label = _("账号管理"), callback = function() self:showAccountManage() end },
             { label = _("首页管理"), callback = function() self:showBootManage() end },
+            { label = _("系统管理"), callback = function() self:openReaderMenuFromHome() end },
             { label = _("升级管理"), callback = function() self:showUpdateManage() end },
             { label = _("关于本机"), callback = function() self:showAboutPanel() end },
-            -- 「系统设置」= 点左上角「阅读X」的同一个入口（KOReader 自身菜单），
-            -- 给「不想去点标题」的用户留一条明路。
-            { label = _("系统设置"), callback = function() self:openReaderMenuFromHome() end },
         }, { hint = _("点击条目进入；点空白处返回。") })
     end
 

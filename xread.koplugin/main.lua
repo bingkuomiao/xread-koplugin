@@ -1868,8 +1868,10 @@ function XRead:_makeHeroInfo(hero_book, cover_paths)
     local total = tonumber(hero_book.totalChapterNum) or 0
     local dur = tonumber(hero_book.durChapterIndex) or 0
     local read_time = tonumber(hero_book.durChapterTime) or 0
-    hero.last_read_text = _("上次读到第 ") .. tostring(dur + 1) .. _(" 章 · 共 ")
-        .. tostring(total) .. _(" 章")
+    -- 章节规模与「上次读到」合并成一行：原来 source_line 是「阅读X · 共 N 章」，
+    -- last_read_text 又是「上次读到第 X 章 · 共 N 章」，「共 N 章」出现两遍。
+    -- 现在信息行只有三行（作者/阅读至/章节），一眼看完不重复。
+    hero.last_read_text = ""
     -- 简介只来自后端书架数据（书源抓取时带回来的字段），前端不生成内容。
     -- 不同书源/后端版本用的字段名不一样，这里按常见别名依次取；
     -- 有的书写简介、有的书（如家父汉高祖）后端本身就是空串，前端只能显示「暂无简介」。
@@ -1901,8 +1903,13 @@ function XRead:_makeHeroInfo(hero_book, cover_paths)
             and _("今天 ") .. hour or os.date("%m月%d日 ", read_time) .. hour
     end
     hero.progress_line = progress_text .. (hero.when_text and (" · " .. hero.when_text) or "")
-    -- 底部来源/分类行：微信读书风格「来源 · 共 N 章」
-    hero.source_line = _("阅读X") .. (total > 0 and (" · " .. T(_("共 %1 章"), tostring(total))) or "")
+    -- 第三行：共 N 章 · 上次读到第 X 章（只有真读过才带后半句，没进度就不硬编「第 1 章」）
+    local chap_bits = {}
+    if total > 0 then chap_bits[#chap_bits + 1] = T(_("共 %1 章"), tostring(total)) end
+    if read_time > 0 then
+        chap_bits[#chap_bits + 1] = _("上次读到第 ") .. tostring(dur + 1) .. _(" 章")
+    end
+    hero.source_line = table.concat(chap_bits, " · ")
     hero.on_tap = function() self:openBook(hero_book) end
     -- 右上角改为「刷新最近阅读」按钮
     hero.on_refresh = function() self:refreshRecentBook() end
@@ -3193,7 +3200,7 @@ function XRead:showMoreListPanel(title, items, opts)
                     if self._more_panel_view == dialog then self._more_panel_view = nil end
                     -- 这个面板是整屏的（居中卡片 + 压暗遮罩），关掉后必须整屏重绘：
                     -- 否则接手的界面只刷自己那块，底下会留一条旧卡片/底图的残影
-                    -- （「系统设置」打开 KOReader 菜单时最明显：底部残留一行提示文字）。
+                    -- （「系统管理」打开 KOReader 菜单时最明显：底部残留一行提示文字）。
                     UIManager:setDirty("all", "full")
                     item.callback()
                 end
