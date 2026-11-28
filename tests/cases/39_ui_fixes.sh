@@ -2,7 +2,7 @@
 # TC-39 v0.6.40 九项 UI 修正的可自动验收部分
 #   1) 英雄卡进度条上方有「阅读进度 N%」文字（hero_progress 日志）
 #   2) 更多面板改名「加载管理」且不再有「升级管理」（more_row 日志）
-#   3) 下载进度卡只有「取消」一个按钮（progress_card 日志）
+#   3) 下载进度卡为「取消 / 等待」两个按钮（v0.6.43，progress_card 日志）
 #   4) 我的书架长按封面弹的是移除确认，不再是目录页（box_geom + shelf_book_removed）
 # 截图人工复核：本地书架封面无 ✓ 角标/无上方白边；目录返回/倒序无灰底；
 #               自动更新点「更新」直达升级确认框。这些无稳定日志锚点，不写断言。
@@ -34,11 +34,11 @@ cp "$SHOT" "$EMU_LOG_DIR/39_more.png"
 assert_no_fatal
 emu_stop
 
-# --- 下载进度卡只有一个取消按钮 ---
+# --- 下载进度卡有取消与等待两个按钮 ---
 # flow 只在阅读器实例里分发，所以必须用 open 模式（带文档）
 emu_start "open" "progress"
 emu_wait_mark "flow=progress done" 180
-assert_log_contains "progress_card buttons=true only_cancel=true" "进度卡只有一个取消按钮"
+assert_log_contains "progress_card buttons=true .* wait_button=true" "进度卡有取消与等待按钮"
 emu_settle 4
 emu_shot
 assert_shot 20000
@@ -96,7 +96,7 @@ else
         sleep 1
     done
 fi
-assert_log_contains "update_confirm_shown" "点更新后直接弹出升级确认框"
+assert_log_contains "update_confirm_shown ok=升级" "升级确认框主按钮文案为「升级」"
 if grep -aq "about_server_version" "$EMU_LOG"; then
     fail "点更新后仍跳到了关于本机"
 else

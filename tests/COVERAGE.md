@@ -264,3 +264,33 @@ TC-40 的首页断言同步收紧为精确 `rows=2 cols=4`（原来是 rows=2 �
 `26_shelf_paging` 从「12 本/页、共 3 页」改为竖屏 16 本/页、共 2 页；
 `14_full_flow_touch` 的跳章截图步骤对「书源只返回 1 章、点当前章不换页」改为非致命，
 点击链路断言仍保留。
+
+## 十六、v0.6.43 英雄封面七项整改
+
+1. **最近阅读左对齐**：「最近阅读」标签原先画在 `info` 列里（x = cover_w + gap），
+   现在作为独立图层挂到 `body` 的 x=0，与下面封面左边缘对齐；刷新图标仍在右上角。
+   日志锚点 `hero_recent x=0 cover_x=0 ... align=cover`。
+2. **简介排版与过滤**：新增 `U.intro_text`（`miui/util.lua`），保留 `<p>/<br>` 段落，
+   每段补两个全角空格；剥「简介：/内容简介：」前缀，过滤作者/来源/最新章节、
+   纯章节标题、站点水印等非简介行，清掉 `& ;` 残缺实体与零宽字符。
+   封面到简介的间距从 `section_gap` 提升为至少一个 `line_h`（空一行）。
+   日志锚点 `hero_intro_filtered dropped=N` / `hero_intro ... intro_gap=N indent=2`；
+   纯 Lua 单测 `intro_text_test.lua` 12 项。
+3. **后端转码**：附件1说明后端已在 `get_cover` 命中与下载后把 AVIF/HEIC 转 JPEG 并回写缓存。
+   插件侧不再在 `Accept` 里主动索要 AVIF，改为只声明 JPEG/PNG/WebP/GIF；
+   魔数预检与 AVIF 负缓存保留作兜底。`cover_api_test.lua` 不受影响。
+4. **目录四按钮**：从 v0.6.41 的黑底白字改回透明无底黑字。
+   KOReader 的 `Button` 即使 `background=nil` 也会给 frame 填白底，必须创建后把
+   `frame.background/color/bordersize` 全清掉；`enableDisable` 覆盖为禁用态也保持黑字。
+   日志锚点 `catalog_buttons back_bg=transparent order_bg=transparent nav_bg=transparent text=black`。
+5. **缓存按钮文案**：两处确认框 `ok_text` 从「开始缓存」改为「缓存」，锚点 `cache_confirm ok=缓存`。
+6. **升级按钮文案**：升级确认框 `ok_text` 从「更新并重启」改为「升级」，
+   锚点 `update_confirm_shown ok=升级`（正文仍说明装完会自动重启）。
+7. **下载进度「等待」按钮**：`ProgressToast` 从「只有一个取消」改为「取消 / 等待」。
+   点「等待」关掉进度卡但**不**置 `aborted`，后台子进程继续跑完；`M.update` 在
+   `live=nil` 时仍让出时间片，避免轮询忙等。锚点
+   `progress_card ... wait_button=true` + `progress_wait=1 task_kept=true`。
+
+新增 `42_hero_fixes`：纯 Lua 单测 + 源码文案核对 + `home`/`catalog`/`progress` 三段会话；
+截图复核「最近阅读」左对齐、封面与简介空一行、目录四按钮透明、进度卡「取消 / 等待」。
+TC-39 与 TC-40 的相关断言同步更新到新文案/新锚点。

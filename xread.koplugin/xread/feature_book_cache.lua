@@ -180,7 +180,7 @@ function M.install(env)
             -- 原来是每轮 Trapper:info(nil) —— 它会新建一个空文字 InfoMessage，
             -- 真机上就是「进度框不停闪 + 反复出现空框」。
             ProgressToast.show(ProgressToast.hint(T(_("正在下载 %1%（%2/%3）"),
-                "0", "0", tostring(total))), { buttons = true, only_cancel = true })
+                "0", "0", tostring(total))), { buttons = true, wait_button = true })
             local deadline = os.time() + math.max(180, total * 30)
             local last_done, last_t = -1, 0
             local user_aborted = false
@@ -283,9 +283,12 @@ function M.install(env)
             items[#items + 1] = {
                 text = (book.name or "?") .. "　" .. (book.author or ""),
                 callback = function()
+                    if os.getenv("XREAD_AUTOTEST") then
+                        print("[XREAD_AUTOTEST] cache_confirm ok=缓存")
+                    end
                     MessageBox.confirm{
                         text = T(_("缓存「%1」到服务器？\n全部章节下载完后阅读秒开。"), book.name or ""),
-                        ok_text = _("开始缓存"),
+                        ok_text = _("缓存"),
                         callback = function(ok)
                             if ok then self:doCacheBook(book) end
                         end,

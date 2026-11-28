@@ -1,7 +1,7 @@
 #!/bin/bash
 # TC-40 v0.6.41 五项修正的可自动验收部分
 #   1) 本地书架点书：先保持书架盖住首页（keep_shelf=true），阅读器就绪后才关（reader_ready）
-#   2) 目录四个按钮黑底白字（catalog_buttons 日志 + 截图人工复核）
+#   2) 目录四个按钮 v0.6.41 曾改黑底白字，v0.6.43 按用户要求改回透明无底黑字
 #   3) 漫画图片提取单测（comic_detect_test.lua，6 项）
 #   4) 首页封面维持 4×2，本地书架多显示一行（home_shelf_geom / full_shelf_geom 日志 rows）
 #   5) 封面无百分比角标（geom 日志 progress_badge=off + 截图人工复核）
@@ -33,7 +33,7 @@ emu_start "open" "catalog"
 emu_wait_mark "flow=catalog done" 180
 emu_settle 4
 cp "$EMU_LOG" "$EMU_LOG_DIR/40_catalog.emu.log"
-assert_log_contains "catalog_buttons back_bg=Color8\(0\) order_bg=Color8\(0\) nav_bg=black" "目录四个按钮均为黑底"
+assert_log_contains "catalog_buttons back_bg=transparent order_bg=transparent nav_bg=transparent text=black" "目录四个按钮均为透明无底黑字"
 emu_settle 3
 emu_shot
 cp "$SHOT" "$EMU_LOG_DIR/40_catalog.png"

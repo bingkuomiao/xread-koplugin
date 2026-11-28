@@ -84,21 +84,28 @@ local CatalogView = FocusManager:extend{
 
 local scaled = UiKit.scaled
 
--- 黑底白字按钮。KOReader 的 Button 把文字颜色硬编码成黑色（只看 enabled），
--- 传 color=WHITE 只改边框，所以必须在 init 之后直接改 label_widget.fgcolor。
--- 另外覆盖 enableDisable：KOReader 在切换启用态时会把 fgcolor 重置回黑/深灰，
--- 这里保持白字，禁用态用 dim 表达（Nav 按钮会用到）。
-local function black_button(opts)
+-- 透明无底黑字按钮（v0.6.43 按用户要求从黑底白字改回）。
+-- KOReader 的 Button 即使 background=nil 也会给 frame 填白底，必须在 init
+-- 之后把 frame.background / color / bordersize 全部清掉才是真透明。
+-- 文字色默认黑，但 enableDisable 会把禁用态改成深灰；这里覆盖为始终黑字
+-- （禁用态只关回调，不改颜色），避免四个按钮里有两个看着发灰。
+local function flat_button(opts)
+    opts.background = nil
+    opts.bordersize = 0
     local b = Button:new(opts)
+    if b.frame then
+        b.frame.background = nil
+        b.frame.color = nil
+        b.frame.bordersize = 0
+    end
     if b.label_widget then
-        b.label_widget.fgcolor = Blitbuffer.COLOR_WHITE
+        b.label_widget.fgcolor = Blitbuffer.COLOR_BLACK
         if b.label_widget.update then b.label_widget:update() end
     end
-    local base_enable_disable = b.enableDisable
     b.enableDisable = function(self, enable)
-        base_enable_disable(self, enable)
+        if enable then self:enable() else self:disableWithoutDimming() end
         if self.label_widget then
-            self.label_widget.fgcolor = Blitbuffer.COLOR_WHITE
+            self.label_widget.fgcolor = Blitbuffer.COLOR_BLACK
             if self.label_widget.update then self.label_widget:update() end
         end
     end
@@ -455,14 +462,13 @@ function CatalogView:init()
 
     local half_btn_w = math.max(scaled(40), math.floor((btn_w - scaled(10)) / 2))
 
-    local back_btn = black_button{
+    local back_btn = flat_button{
 
         text = back_label, width = half_btn_w, height = btn_h,
 
         text_font_size = scaled(15), bordersize = 1, radius = scaled(6),
 
-        -- 黑底白字（用户指定）
-        background = Blitbuffer.COLOR_BLACK, color = Blitbuffer.COLOR_WHITE,
+        -- 透明无底黑字（flat_button 会清掉 frame 底色）
 
         callback = function() if self.on_back then self.on_back() end end,
 
@@ -470,7 +476,7 @@ function CatalogView:init()
 
     -- 「倒序 / 正序」：按钮上写的是「点一下会切到的方向」，
     -- 正序时显示「倒序」，倒序时显示「正序」，点了列表立刻翻过来。
-    local order_btn = black_button{
+    local order_btn = flat_button{
 
         text = (self.order == "desc") and _("正序") or _("倒序"),
 
@@ -478,8 +484,7 @@ function CatalogView:init()
 
         text_font_size = scaled(15), bordersize = 1, radius = scaled(6),
 
-        -- 黑底白字（用户指定）
-        background = Blitbuffer.COLOR_BLACK, color = Blitbuffer.COLOR_WHITE,
+        -- 透明无底黑字（flat_button 会清掉 frame 底色）
 
         callback = function()
             if self.on_order_toggle then
@@ -490,8 +495,12 @@ function CatalogView:init()
     }
 
     if os.getenv("XREAD_AUTOTEST") then
-        print(string.format("[XREAD_AUTOTEST] catalog_buttons back_bg=%s order_bg=%s nav_bg=black",
-            tostring(back_btn.background), tostring(order_btn.background)))
+        local function bg_name(btn)
+            local frame = btn and btn.frame
+            return (frame and frame.background) and tostring(frame.background) or "transparent"
+        end
+        print(string.format("[XREAD_AUTOTEST] catalog_buttons back_bg=%s order_bg=%s nav_bg=transparent text=black",
+            bg_name(back_btn), bg_name(order_btn)))
         pcall(function() io.stdout:flush() end)
     end
 
@@ -682,7 +691,7 @@ function CatalogView:init()
 
     local function newNavButton(text, width, enabled, callback)
 
-        return black_button{
+        return flat_button{
 
             text = text, width = width, height = nav_h,
 
@@ -690,8 +699,7 @@ function CatalogView:init()
 
             text_font_size = scaled(14), bordersize = 1, radius = 0, margin = 0,
 
-            -- 黑底白字（用户指定）；禁用态由 Button 的 dim 处理
-            background = Blitbuffer.COLOR_BLACK, color = Blitbuffer.COLOR_WHITE,
+            -- 透明无底黑字；禁用态也保持黑字（flat_button 覆盖 enableDisable）
 
         }
 

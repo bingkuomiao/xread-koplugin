@@ -11,8 +11,8 @@
 --   ② 固定卡片宽度 + 高度按内容算（原来跟着文字宽度走，又长又矮）；
 --   ③ 白底 + 2px 黑边自己画，和普通提示框同一套尺寸/间距；
 --   ④ 用 scheduleIn + coroutine.yield 让出时间片，UI 事件照常处理；
---   ⑤ 下载/缓存这类长时间任务显示「取消 / 确定」两个按钮：
---      取消 = 中止任务；确定 = 继续等待完成（收起按钮，进度继续显示）；
+--   ⑤ 下载/缓存这类长时间任务显示「取消 / 等待」两个按钮：
+--      取消 = 中止任务；等待 = 收起进度卡但任务继续后台跑完；
 --      点弹窗以外的地方只吞掉点击防翻页，绝不误取消。
 
 local Blitbuffer = require("ffi/blitbuffer")
@@ -48,7 +48,9 @@ local Toast = InputContainer:extend{
     aborted = false,
     confirmed = false,
     with_buttons = false,
-    only_cancel = false,   -- 下载这类任务：只给「取消」，点完确认就不再叠第二个确定
+    only_cancel = false,   -- 旧语义：只给「取消」
+    wait_button = false,   -- v0.6.43：下载任务显示「取消 / 等待」，等待即收起卡片但任务继续
+    waiting = false,
     _miuread_transient = true,
     -- 只是进度提示，不参与 TransientGuard 的模态互斥
     _miuread_modal_surface = false,
@@ -75,7 +77,7 @@ function Toast:init()
         fgcolor = Blitbuffer.COLOR_BLACK,
     }
     self.confirm_label = TextWidget:new{
-        text = "确定", face = Font:getFace("cfont", 17), bold = true,
+        text = self.wait_button and "等待" or "确定", face = Font:getFace("cfont", 17), bold = true,
         fgcolor = Blitbuffer.COLOR_BLACK,
     }
     self.text_h = math.max(1, tonumber(self.text_widget:getSize().h) or 1)
@@ -88,7 +90,7 @@ end
 function Toast:_measure()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     self.text_h = math.max(1, tonumber(self.text_widget:getSize().h) or 1)
-    local show_buttons = self.with_buttons and not self.confirmed
+    local show_buttons = self.with_buttons and not self.confirmed and not self.waiting
     local btn_block = show_buttons and (self.btn_gap + self.btn_h) or 0
     local box_w = self.card_w
     local box_h = BORDER * 2 + self.pad * 2 + self.text_h + btn_block
@@ -102,7 +104,7 @@ function Toast:_measure()
     if show_buttons then
         local by = box_y + BORDER + self.pad + self.text_h + self.btn_gap
         local bx = box_x + BORDER + self.pad
-        if self.only_cancel then
+        if self.only_cancel and not self.wait_button then
             -- 只有一个「取消」：整行都是它的热区，不再出现第二个确定按钮
             self.cancel_rect = Geom:new{ x = bx, y = by, w = self.inner_w, h = self.btn_h }
             self.confirm_rect = nil
@@ -196,15 +198,27 @@ function Toast:onTap(_, ges)
         self.aborted = true
     elseif in_rect(self.confirm_rect, pos) then
         self.confirmed = true
-        local old = self.box_dimen
-        self.box_dimen = self:_measure()  -- 收起按钮行，卡片变矮
-        self:_refresh(old)
+        if self.wait_button then
+            -- 「等待」= 收起进度卡，后台任务照常跑完；调用方继续轮询进度文件。
+            self.waiting = true
+            if os.getenv("XREAD_AUTOTEST") then
+                print("[XREAD_AUTOTEST] progress_wait=1 task_kept=true")
+                pcall(function() io.stdout:flush() end)
+            end
+            M.close()
+        else
+            local old = self.box_dimen
+            self.box_dimen = self:_measure()  -- 收起按钮行，卡片变矮
+            self:_refresh(old)
+        end
     end
     return true
 end
 
--- 让出一次时间片：UIManager 借这段时间处理点击/重绘，超时后再把我们唤醒
-function Toast:pump(delay)
+-- 让出一次时间片：UIManager 借这段时间处理点击/重绘，超时后再把我们唤醒。
+-- 抽成独立函数是因为用户点了「等待」后卡片已被关掉，轮询协程仍必须 yield，
+-- 否则 while 循环会变成不给 UI 任何机会的忙等。
+local function yield_slice(delay)
     local co = coroutine.running()
     if not co then return end
     UIManager:scheduleIn(delay or .08, function()
@@ -212,6 +226,9 @@ function Toast:pump(delay)
         if not ok then logger.dbg("[MiuRead][ProgressToast] resume failed", tostring(err)) end
     end)
     coroutine.yield()
+end
+function Toast:pump(delay)
+    yield_slice(delay)
 end
 
 -- 兼容旧调用点：现在按钮上直接写明「取消 / 确定」，不再追加「点按此处可中止」。
@@ -229,6 +246,7 @@ function M.show(text, opts)
             text = tostring(text or ""),
             with_buttons = opts.buttons == true,
             only_cancel = opts.only_cancel == true,
+            wait_button = opts.wait_button == true,
         }
     end)
     if not ok or not toast then
@@ -238,8 +256,14 @@ function M.show(text, opts)
     live = toast
     UIManager:show(toast)
     if os.getenv("XREAD_AUTOTEST") then
-        print(string.format("[XREAD_AUTOTEST] progress_card buttons=%s only_cancel=%s",
-            tostring(opts.buttons == true), tostring(opts.only_cancel == true)))
+        print(string.format("[XREAD_AUTOTEST] progress_card buttons=%s only_cancel=%s wait_button=%s",
+            tostring(opts.buttons == true), tostring(opts.only_cancel == true),
+            tostring(opts.wait_button == true)))
+        local wr = toast.confirm_rect
+        if wr then
+            print(string.format("[XREAD_AUTOTEST] progress_card_wait_hit x=%d y=%d",
+                math.floor(wr.x + wr.w / 2), math.floor(wr.y + wr.h / 2)))
+        end
         pcall(function() io.stdout:flush() end)
     end
     return toast
@@ -248,11 +272,11 @@ end
 -- 更新文字并让出一次时间片；返回 false 表示用户点了「取消」。
 function M.update(text, delay)
     local toast = live
-    if not toast then return true end
-    if text ~= nil then toast:setText(text) end
-    if toast.aborted then return false end
-    toast:pump(delay)
-    return not toast.aborted
+    if toast and text ~= nil then toast:setText(text) end
+    local aborted = toast ~= nil and toast.aborted == true
+    -- 即使 live=nil（用户点了「等待」收起卡片），也要让出时间片。
+    yield_slice(delay)
+    return not aborted
 end
 
 function M.aborted()

@@ -312,7 +312,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     -- 封面右侧信息，按参考图自上而下分行：
     --   作者 / 来源 / 最新 · 最新章节 / 阅读至 N% / 上次读到第 X 章 · 共 N 章
     -- 简介移到卡片底部（原来书名标题的位置），横贯全宽。
-    local intro_text = U.plain_text(book.description or book.intro or book.summary or "")
+    local intro_text = U.intro_text(book.description or book.intro or book.summary or "")
     if intro_text == "" then intro_text = "暂无简介" end
     local meta_line = U.trim(tostring(book.meta_line or ""))
     local progress_line = U.trim(tostring(book.progress_line or ""))
@@ -341,19 +341,22 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
             height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
         }}
     end
-    -- 「最近阅读」标签：和右上角刷新图标同一行、居中对齐图标那一行，
+    -- 「最近阅读」标签：仍和右上角刷新图标同一行，但横坐标改为 0，
+    -- 与下面封面的左边缘对齐（原先在 info 列里，x = cover_w + gap）。
     -- 用黑色（灰色在电子墨水屏上发虚），字号比详情小一号不抢戏。
     local label_h = math.max(1, math.min(history_h, UiScale.dp(18, 16, 24)))
+    local recent_label_y = math.max(0, math.floor((history_h - label_h) / 2))
+    local recent_label
     if history_w > 0 then
-        info[#info + 1] = OffsetContainer:new{
-            x_off = 0, y_off = math.max(0, math.floor((history_h - label_h) / 2)),
-            TextBoxWidget:new{
-                text = "最近阅读",
-                face = face("smallinfofont", mini and 8.4 or 8.8, mini and 11.4 or 12.0, mini and 7.0 or 7.2),
-                width = math.max(1, text_w - history_w), height = label_h, height_adjust = false,
-                height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
-            },
+        recent_label = TextBoxWidget:new{
+            text = "最近阅读",
+            face = face("smallinfofont", mini and 8.4 or 8.8, mini and 11.4 or 12.0, mini and 7.0 or 7.2),
+            width = math.max(1, text_w - history_w), height = label_h, height_adjust = false,
+            height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
         }
+        if os.getenv("XREAD_AUTOTEST") then
+            print(string.format("[XREAD_AUTOTEST] hero_recent x=0 cover_x=0 y=%d align=cover", recent_label_y))
+        end
     end
     -- 书名：height_adjust 让控件高度收到「实际行数」，
     -- 一格短书名后面就不会再空出一整行（用户反馈书名和详情之间空太大）。
@@ -417,7 +420,9 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     -- 简介起点跟着「详情最后一行」走，不跟 body_h 走：
     -- body_h 是按「书名最多两行」预留的，实际单行书名时那块空白会全堆在详情和简介之间。
     -- 同时不能压到封面（封面在 body_h 里垂直居中），所以取两者更靠下的那个。
-    local intro_y = math.max(rows_bottom, cover_bottom) + section_gap
+    -- 用户要求简介和封面之间空一行：至少让出一整行高度，不再紧贴封面下沿。
+    local intro_gap = math.max(section_gap, line_h)
+    local intro_y = math.max(rows_bottom, cover_bottom) + intro_gap
     -- 简介高度 = 到「阅读进度」文字之前的全部剩余空间（至少保证两行）
     local intro_box_h = math.max(UiScale.dp(26, 24, 34), progress_label_y - section_gap - intro_y)
     if intro_y + intro_box_h > progress_label_y - section_gap then
@@ -426,8 +431,8 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
 
     -- 卡片底部的简介（横贯全宽）
     if os.getenv("XREAD_AUTOTEST") then
-        print(string.format("[XREAD_AUTOTEST] hero_intro y=%d h=%d rows_bottom=%d cover_bottom=%d gap=%d",
-            intro_y, intro_box_h, rows_bottom, cover_bottom, meta_gap))
+        print(string.format("[XREAD_AUTOTEST] hero_intro y=%d h=%d rows_bottom=%d cover_bottom=%d gap=%d intro_gap=%d indent=2",
+            intro_y, intro_box_h, rows_bottom, cover_bottom, meta_gap, intro_gap))
     end
     local intro = TextBoxWidget:new{
         text = intro_text,
@@ -446,6 +451,10 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
             HorizontalSpan:new{width = gap},
             CenterContainer:new{dimen = Geom:new{w = text_w, h = body_h}, info},
         }}
+    end
+    -- 标签最后叠加，确保它不会被封面/信息列盖住；x=0 即封面左边缘。
+    if recent_label then
+        body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = recent_label_y, recent_label}
     end
     body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = intro_y, intro}
 
@@ -585,9 +594,9 @@ local function hero_card_classic(book, width, height, callback, hold_callback, s
     if clean(book.last_read_text) ~= '' then progress_text = progress_text .. ' · ' .. clean(book.last_read_text) end
     -- Book metadata and introductory prose are not interchangeable. In
     -- particular, do not display a translator/language fallback as an intro.
-    -- 简介是富文本（可能带标签/实体/零宽字符），必须走 plain_text 清洗；
+    -- 简介是富文本（可能带标签/实体/零宽字符），必须走 intro_text 清洗；
     -- clean() 只做 trim，直接用它会让 "&; &; &;" 原样画到首页上。
-    local description = U.plain_text(book.description or book.intro or book.summary)
+    local description = U.intro_text(book.description or book.intro or book.summary)
     local intro_available = description ~= ''
     if not intro_available then description = '暂无简介' end
 

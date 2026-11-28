@@ -847,10 +847,10 @@ function XRead:init()
                 autotest_mark("flow=boot_manage done")
             end)
         elseif flow == "progress" then
-            -- 验收：带「取消」的下载进度卡片（只展示几秒，不真的下书）
+            -- 验收：带「取消 / 等待」的下载进度卡片（只展示几秒，不真的下书）
             UIManager:scheduleIn(4, function()
                 ProgressToast.show(T(_("正在下载 %1%（%2/%3）"), "38", "8", "21"),
-                    { buttons = true, only_cancel = true })
+                    { buttons = true, wait_button = true })
                 autotest_mark("flow=progress done")
             end)
         elseif flow == "update_notice" then
@@ -1892,15 +1892,21 @@ function XRead:_makeHeroInfo(hero_book, cover_paths)
     -- 不同书源/后端版本用的字段名不一样，这里按常见别名依次取；
     -- 有的书写简介、有的书（如家父汉高祖）后端本身就是空串，前端只能显示「暂无简介」。
     local intro_text = ""
+    local intro_dropped = 0
     for _, key in ipairs({ "intro", "description", "desc", "summary",
             "bookIntro", "introduction", "brief", "introText" }) do
         local v = tostring(hero_book[key] or "")
         if v ~= "" then
-            -- 后端简介常带 HTML 标签与实体；`&;`、`&#8203;`、`&nbsp;` 这类
-            -- 如果不清掉，首页会直接显示成一串 "&; &; &;"。
-            local clean = MiuiUtil.plain_text(v)
+            -- 后端简介常带 HTML 标签、残缺实体，以及书源把章节列表/作者来源
+            -- 塞进简介的噪声。intro_text 保留段落并过滤非简介内容。
+            local clean, dropped = MiuiUtil.intro_text(v)
+            intro_dropped = intro_dropped + (dropped or 0)
             if clean ~= "" then intro_text = clean break end
         end
+    end
+    if os.getenv("XREAD_AUTOTEST") then
+        print(string.format("[XREAD_AUTOTEST] hero_intro_filtered dropped=%d empty=%s",
+            intro_dropped, tostring(intro_text == "")))
     end
     hero.description = intro_text
     -- 参考图的排法：作者、来源各占一行（来源换行，不和作者挤同一行），
@@ -2880,9 +2886,12 @@ function XRead:buildMiuiToolbarOptions(book, chapters, index, font_size)
                         text = T(_("让服务器缓存「%1」的 %2 章？\n缓存后阅读秒开，失败会提示。"),
                             book.name or "", tostring(count))
                     end
+                    if os.getenv("XREAD_AUTOTEST") then
+                        print("[XREAD_AUTOTEST] cache_confirm ok=缓存")
+                    end
                     MessageBox.confirm{
                         text = text,
-                        ok_text = _("开始缓存"),
+                        ok_text = _("缓存"),
                         callback = function(ok)
                             if ok then self:doCacheBook(book, count) end
                         end,

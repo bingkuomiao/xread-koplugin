@@ -161,6 +161,90 @@ function U.plain_text(s)
         :gsub("%s+", " ")
     return (v:gsub("^%s+", ""):gsub("%s+$", ""))
 end
+
+-- 英雄卡简介：plain_text 会把换行全压成空格，画出来是一整坨，也没有段落缩进。
+-- 这里单独保留段落，并把书源常见的「非简介内容」挡掉：
+--   · 字面量「简介：/内容简介：」只剥前缀，不丢正文；
+--   · 作者/来源/字数/最新章节等元信息行、纯章节标题行、站点水印行直接丢弃；
+--   · 每段补两个全角空格做中文段落缩进（TextBoxWidget 没有 indent 参数）。
+-- 返回 (text, dropped_lines)，调用方可打日志验收过滤是否生效。
+-- Lua 的 pattern 是字节级的，[%s:] 里的全角「：」会被拆成三个字节，
+-- 所以标签判定一律用字符串前缀 + 显式冒号，不用字符类匹配中文标点。
+local function starts_with(s, prefix)
+    return s:sub(1, #prefix) == prefix
+end
+local function labelled(line, label)
+    if not starts_with(line, label) then return false end
+    local rest = line:sub(#label + 1):gsub("^%s+", "")
+    return rest:sub(1, 1) == ":" or starts_with(rest, "：")
+end
+local INTRO_LABELS = {
+    "作者", "来源", "书名", "分类", "类别", "字数", "状态",
+    "最新章节", "更新时间", "章节", "目录", "标签", "出版社",
+}
+local INTRO_PREFIXES = {
+    "http://", "https://", "www.", "QQ", "微信", "手打", "请收藏",
+    "本书由", "整理", "全文完", "未完待续", "Chapter",
+}
+local function is_intro_noise(line)
+    for _, label in ipairs(INTRO_LABELS) do
+        if labelled(line, label) then return true end
+    end
+    -- 纯章节标题行（「第五章 归途」），正文句子里带句号/问号的不误伤。
+    if starts_with(line, "第")
+        and (line:find("章", 1, true) or line:find("节", 1, true)
+            or line:find("话", 1, true) or line:find("回", 1, true))
+        and not (line:find("。", 1, true) or line:find("？", 1, true)
+            or line:find("！", 1, true) or line:find("；", 1, true)) then
+        return true
+    end
+    for _, prefix in ipairs(INTRO_PREFIXES) do
+        if starts_with(line, prefix) then return true end
+    end
+    return false
+end
+local function strip_intro_prefix(line)
+    -- 长前缀先判，否则「内容简介」会被「简介」规则截掉前半截。
+    for _, prefix in ipairs({ "内容简介", "内容介绍", "简介" }) do
+        if starts_with(line, prefix) then
+            local rest = line:sub(#prefix + 1):gsub("^%s+", "")
+            if rest == "" then return "" end
+            if rest:sub(1, 1) == ":" then return U.trim(rest:sub(2)) end
+            if starts_with(rest, "：") then return U.trim(rest:sub(4)) end
+        end
+    end
+    return line
+end
+function U.intro_text(s)
+    local v = tostring(s or "")
+    if v == "" then return "", 0 end
+    -- 清零宽字符，否则 "& ;" 这类残缺实体和段落切分都会失手。
+    v = v:gsub("\226\128\139", ""):gsub("\226\128\140", "")
+        :gsub("\226\128\141", ""):gsub("\226\129\160", "")
+        :gsub("\239\187\191", "")
+    -- 先把块级标签换成换行，再清掉其余标签，段落边界才不会丢。
+    v = v:gsub("<%s*[bB][rR]%s*/?%s*>", "\n")
+        :gsub("<%s*/%s*[pP]%s*>", "\n"):gsub("<%s*[pP]%s*>", "\n")
+        :gsub("<%s*[dD][iI][vV]%s*>", "\n"):gsub("<%s*/%s*[dD][iI][vV]%s*>", "\n")
+        :gsub("<[^>]+>", " ")
+    v = v:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
+        :gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'")
+        :gsub("&#%d+;", " "):gsub("&#[xX]%x+;", " ")
+        :gsub("&[#%w]+;", " "):gsub("&%s*;", " "):gsub("&%s*$", " ")
+    v = v:gsub("%s*[\r\n]+%s*", "\n")
+    local out, dropped = {}, 0
+    for line in v:gmatch("[^\n]+") do
+        local t = strip_intro_prefix(U.trim(line))
+        t = U.trim(t):gsub("%s+", " ")
+        if t == "" or is_intro_noise(t) then
+            dropped = dropped + 1
+        else
+            if not t:match("^　　") then t = "　　" .. t end
+            out[#out + 1] = t
+        end
+    end
+    return table.concat(out, "\n"), dropped
+end
 local function raw_file_exists(p)
     local f=io.open(p,"rb")
     if not f then return false end

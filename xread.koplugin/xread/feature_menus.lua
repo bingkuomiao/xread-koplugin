@@ -479,7 +479,7 @@ function M.install(env)
         local box
         box = MessageBox.confirm{
             text = body,
-            ok_text = _("更新并重启"),
+            ok_text = _("升级"),
             -- 更新前这一步关框后整屏重刷一次，清掉叠层残影
             full_refresh = true,
             callback = function(ok)
@@ -489,7 +489,7 @@ function M.install(env)
         }
         self._update_confirm_box = box
         if os.getenv("XREAD_AUTOTEST") then
-            print("[XREAD_AUTOTEST] update_confirm_shown")
+            print("[XREAD_AUTOTEST] update_confirm_shown ok=升级")
         end
     end
     -- 安装更新：本地包直接解压；远端包下载并替换文件。

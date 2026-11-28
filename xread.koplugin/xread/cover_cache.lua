@@ -148,7 +148,9 @@ local function fetch(url)
         sink = ltn12.sink.table(chunks),
         headers = {
             ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            ["Accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            -- 后端已在 get_cover 命中/下载后把 AVIF/HEIC 转成 JPEG 并回写缓存；
+            -- 这里只声明 KOReader 真正能解的格式，不再主动索要 AVIF。
+            ["Accept"] = "image/jpeg,image/png,image/webp,image/gif,image/*;q=0.8",
             ["Referer"] = referer,   -- 必须是 key-value，否则 luasocket 不会发送该头
         },
     }, 8)
