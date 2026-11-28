@@ -55,6 +55,7 @@ tests/
 | 37_local_shelf | 本地书架复用书架封面 + 长按删除（v0.6.37） | `home` + `FLOW=local_shelf`（造一本与书架第一本同名的假 EPUB，不带随书封面） | `cache=true`/`shown=true`；长按卡片弹确认卡，点「删除」后出现 `local_book_deleted ok=true` 且列表刷新 | ~150s |
 | 38_batch4 | 刷新合并计数 + 封面缓存预算（v0.6.39） | `home` 起两遍，第二遍 `XREAD_MEM_TIER=low` | 日志有 `perf paint req=...` / `memory tier=normal ... cover_cache=true budget=<n>/<m>`；低内存档 `budget=0/16`；两遍截图非空 | ~180s |
 | 39_ui_fixes | v0.6.40 九项 UI 修正 | 三段会话：`home`（英雄卡+更多面板）、`open`+`progress`（下载进度卡）、`shelfback`（长按封面） | `hero_progress text=阅读进度 N%`；`more_row text=加载管理` 且无 `升级管理`；`progress_card buttons=true only_cancel=true`；长按后 `box_geom` + `remove_flow_requested name=`（点忽略，不真删书）；更新提示点「更新」后 `update_confirm_shown` | ~240s |
+| 40_ui_tweaks | v0.6.41 五项修正 | 四段会话：`local_books`（点书不闪首页）、`catalog`（按钮）、`home`+`local_shelf`（行数/角标）+ 纯 Lua 单测 | `local_open keep_shelf=true`→`reader_ready`；`catalog_buttons back_bg=Color8(0) order_bg=Color8(0)`（截图复核白字）；`home_shelf_geom rows=3` / `full_shelf_geom rows=4` + `progress_badge=off`；`comic_detect_test 6 passed` | ~300s |
 
 ## 运行方式
 

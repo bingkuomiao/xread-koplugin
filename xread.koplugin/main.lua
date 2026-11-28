@@ -2356,9 +2356,12 @@ function XRead:openAtChapter(book, chapters, index)
         local ok, html = pcall(function() return self.client:getBookContentRaw(chapters[index], book) end)
         if ok and type(html) == "string" then
             raw, raw_ok = html, true
+            -- 漫画判定：只数图片 URL，不再用「去标签后的正文长度 < 200」。
+            -- 旧写法把 <script>/<style> 的内容也算进正文，漫画页的 JS 动辄几千字，
+            -- text_len 轻易破 200，导致漫画被当成小说渲染成一串「[图 N]」占位。
+            -- 小说正文偶尔也有 1 张插图，所以要 >= 2 张才判漫画，避免误伤。
             local urls = self.client:extractImageUrls(html)
-            local text_len = #(html:gsub("<[^>]+>", ""):gsub("%s", ""))
-            if #urls >= 2 and text_len < 200 then
+            if #urls >= 2 then
                 return self:downloadComicAndOpen(book, chapters, index)
             end
         end

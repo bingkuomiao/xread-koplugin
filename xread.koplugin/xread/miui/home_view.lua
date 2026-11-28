@@ -930,7 +930,8 @@ local function shelf_book_card(book, width, height, callback, hold_callback, sho
     local extra_gaps = (status_h > 0 and 1 or 0) + (download_h > 0 and 1 or 0)
     local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - extra_h - vgap * (1 + extra_gaps))
     local cover_w = math.max(UiScale.dp(54, 46, 78), math.min(math.floor(inner_w * .995), math.floor(cover_h * .715)))
-    local badge_reserve = (downloaded or reading_badge ~= "")
+    -- 用户要求去掉所有封面的百分比角标：占位封面也不用再为角标留空。
+    local badge_reserve = downloaded
         and (UiScale.dp(18, 16, 25) + UiScale.dp(2, 1, 4) * 2) or 0
     local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .06)
         or placeholder(cover_w, cover_h, book.title, book.author, badge_reserve)
@@ -945,17 +946,7 @@ local function shelf_book_card(book, width, height, callback, hold_callback, sho
             outlined_badge_text("✓", badge, badge, face("cfont", 9.4, 13.5)),
         }
     end
-    if reading_badge ~= "" then
-        local chars = math.max(2, U.utf8_len(reading_badge))
-        -- 封面右上角进度徽标：整体比之前收小一档，避免盖住封面主体
-        local badge_w = math.max(UiScale.dp(29, 25, 42), UiScale.dp(8, 7, 13) + chars * UiScale.dp(6.6, 5.6, 9.4))
-        local badge_h = UiScale.dp(18, 16, 25)
-        local inset = UiScale.dp(2, 1, 4)
-        cover_layer[#cover_layer + 1] = OffsetContainer:new{
-            x_off = math.max(0, cover_w - badge_w - inset), y_off = inset,
-            outlined_badge_text(reading_badge, badge_w, badge_h, face("smallinfofont", 8.6, 12.2)),
-        }
-    end
+    -- 阅读进度百分比角标已按用户要求移除（进度仍在正文/详情里显示）。
 
     local body = VerticalGroup:new{align = "center", cover_layer, VerticalSpan:new{width = vgap}}
     body[#body + 1] = TextBoxWidget:new{
@@ -1379,16 +1370,19 @@ end
 
 function HomeWidget:_grid_geometry(m, width, available_h, count, force_rows)
     local columns = 4
-    -- Keep every page on the same 4×2 grid. The last page leaves empty
-    -- slots instead of enlarging the remaining covers.
-    local rows = force_rows or 2
-    rows = math.max(1, math.min(rows, 2))
+    -- 每页统一 4×3：封面收小一档，竖屏多显示一行（用户要求）。
+    -- 末页留空格，不放大剩余封面。
+    local rows = force_rows or 3
+    rows = math.max(1, math.min(rows, 3))
     local col_gap = math.max(UiScale.dp(2, 2, 4), math.floor(m.gap * .55))
     local row_gap = math.max(UiScale.dp(3, 2, 5), math.floor(m.gap * .65))
-    if rows == 2 and math.floor((available_h - row_gap) / 2) < UiScale.dp(118, 96, 170) then rows = 1 end
+    -- 高度实在不够时逐级退行，避免把封面压成一条
+    while rows > 1 and math.floor((available_h - row_gap * (rows - 1)) / rows) < UiScale.dp(88, 74, 120) do
+        rows = rows - 1
+    end
     local card_w = math.max(1, math.floor((width - col_gap * (columns - 1)) / columns))
     local raw_card_h = math.max(1, math.floor((available_h - row_gap * (rows - 1)) / rows))
-    local preferred_card_h = math.max(UiScale.dp(160, 132, 228), math.floor(card_w * 1.80))
+    local preferred_card_h = math.max(UiScale.dp(132, 112, 190), math.floor(card_w * 1.48))
     local card_h = math.min(raw_card_h, preferred_card_h)
     return columns, rows, col_gap, row_gap, card_w, card_h
 end
@@ -1405,6 +1399,11 @@ end
 function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_open, on_hold, force_rows)
     if #books == 0 then return 0 end
     local columns, rows, col_gap, row_gap, card_w, card_h = self:_grid_geometry(m, width, height, #books, force_rows)
+    if os.getenv("XREAD_AUTOTEST") then
+        print(string.format("[XREAD_AUTOTEST] home_shelf_geom rows=%d cols=%d card=%dx%d progress_badge=off",
+            rows, columns, card_w, card_h))
+        pcall(function() io.stdout:flush() end)
+    end
     local capacity = columns * rows
     local slot = 0
     for _,book in ipairs(books) do
@@ -1662,7 +1661,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             if section_h > 0 then shelf_sy = shelf_sy + section_h + math.max(2, math.floor(gap * .25)) end
             local shelf_footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
             local shelf_grid_h = math.max(1, bottom - shelf_sy - shelf_footer_h)
-            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, shelf_w, shelf_grid_h, #books, 2)
+            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, shelf_w, shelf_grid_h, #books, 3)
             local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
                 self:_add(children, x, y, hero_card(self.opts.hero, hero_w, available_h, self.opts.hero.on_tap, compact,
@@ -1734,7 +1733,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             local footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
             local grid_h = math.max(1, bottom - sy - footer_h)
             if #books > 0 then
-                self:_render_grid(children, m, shelf_x, sy, shelf_w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 2)
+                self:_render_grid(children, m, shelf_x, sy, shelf_w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 3)
             else
                 self:_add(children, shelf_x, sy, empty_section(shelf_w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_all))
             end
@@ -1775,7 +1774,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             if section_h > 0 and shelf_y + section_h < bottom then shelf_y = shelf_y + section_h + math.max(2, math.floor(gap * .25)) end
             local shelf_footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
             local shelf_grid_h = math.max(1, bottom - shelf_y - shelf_footer_h)
-            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, w, shelf_grid_h, #books, 2)
+            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, w, shelf_grid_h, #books, 3)
             local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
                 if dashboard_visible then
@@ -1866,7 +1865,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     local footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
     local grid_h = math.max(1, bottom - y - footer_h)
     if #books > 0 then
-        self:_render_grid(children, m, x, y, w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 2)
+        self:_render_grid(children, m, x, y, w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 3)
     else
         self:_add(children, x, y, empty_section(w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_all))
     end

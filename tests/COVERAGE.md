@@ -213,3 +213,36 @@
 
 新增 `39_ui_fixes`（三段会话，均 PASS）。截图人工复核：本地书架封面无 ✓/白边、目录按钮无灰底；
 这两项与「闪首页」「自动更新跳转」没有稳定日志锚点，未写自动断言。
+
+## 十四、v0.6.41 五项修正
+
+1. **本地书架点书闪首页（真修）**：根因不是我们自己的 `setDirty`，而是 KOReader
+   `showReaderCoroutine` 会 `forceRePaint()` 一帧。旧代码在 `on_select` 里先关书架，
+   那一帧画的是下面的首页。现在把关书架延后到 `openLocalBook` 的 `after_open`
+   回调（排在 `showReader` 内部的 nextTick 队尾），reader 已在栈顶时才关。
+   重试耗尽也补关，避免书架永久残留。
+2. **目录按钮黑底白字**：`返回`/`倒序`/`上一页`/`下一页` 四处统一黑底。
+   KOReader 的 `Button` 把文字颜色硬编码成黑色（`color=WHITE` 只控制边框），
+   所以必须在创建后改 `label_widget.fgcolor = WHITE`；`enableDisable` 也会重置颜色，
+   一并覆盖保持白字、用 dim 表示禁用态。
+3. **漫画加载（姻缘宝典 / 妖神记）**：
+   - 后端 `getBookContent`（github bingkuomiao/xread, master）实测返回**原始 HTML 字符串**，
+     不做图片代理/重写、无 timeout/retry，完全依赖书源站（comic.mkzcdn.com）响应；
+     本机到后端 `/health` 200，漫画站详情接口也 200，但带章节接口要用户标识。
+   - 插件旧判定 `text_len < 200` 用 `html:gsub("<[^>]+>", "")`，把 `<script>/<style>`
+     内容也算正文，漫画页 JS 动辄几千字 → 判定失败 → 走小说分支，渲染成 `[图 1]`～`[图 22]`。
+     **改成只看图片 URL 数 `>= 2`**，不再用正文长度。
+   - `extractImageUrls` 扩展懒加载属性（data-src/data-original/data-echo/data-url/
+     original/srcset/source）、CSS `url()`、协议相对 URL，并去重。
+   - `downloadImage` 补 `Referer`（书源域名），修漫画站防盗链导致的 403/1x1 空图。
+   - 新增纯 Lua 单测 `comic_detect_test.lua`（6 项），覆盖上述写法与大 script 回归。
+4. **两个书架多显示一行**：首页网格 4×2→4×3（`_grid_geometry` 上限 3、调用点 force_rows=3），
+   本地书架竖屏 3→4 / 横屏 2→3（`_metrics`）。高度不足时逐级退行，避免压扁封面。
+5. **去掉所有封面百分比角标**：`shelf_book_card` / `full_shelf_view.book_card`
+   都不再画 `N%` / `已读` 徽标，占位封面也不再为角标留空；英雄卡进度条上方的
+   「阅读进度 N%」是上一轮明确要求加回的，保持不动。
+
+新增 `40_ui_tweaks`（四段会话 + 单测），日志锚点：
+`local_open keep_shelf=true` → `local_open reader_ready close_shelf=1`、
+`catalog_buttons back_bg=…`、`home_shelf_geom rows=3` / `full_shelf_geom rows=4`、
+`progress_badge=off`。

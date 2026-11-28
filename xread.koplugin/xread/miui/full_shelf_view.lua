@@ -139,8 +139,8 @@ local function book_card(book, width, height, on_select, on_hold, opts)
         or tostring(book.shelf_section or "") == "generated"
         or status == "已生成" or status == "已下载"
         or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))
-    -- 有徽标时把占位封面的文字往下让，避免书名压在百分比上
-    local badge_reserve = (not plain and (downloaded or progress > 0)) and (badge_h + badge_inset * 2) or 0
+    -- 用户要求去掉所有封面的百分比角标；只保留「已下载 ✓」时给占位留空。
+    local badge_reserve = (not plain and downloaded) and (badge_h + badge_inset * 2) or 0
     local cover = image_widget(book.cover_path, cover_w, cover_h, plain)
         or placeholder(cover_w, cover_h, book.title, book.author, badge_reserve)
     local layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
@@ -150,15 +150,7 @@ local function book_card(book, width, height, on_select, on_hold, opts)
         local badge = UiScale.dp(20, 18, 28)
         layer[#layer + 1] = OffsetContainer:new{x_off = badge_inset, y_off = badge_inset, outlined_badge("✓", badge, badge)}
     end
-    if progress > 0 and not plain then
-        local text = progress >= 100 and "已读" or tostring(math.floor(progress + .5)) .. "%"
-        local badge_w = math.max(UiScale.dp(29, 25, 43), U.utf8_len(text) * UiScale.dp(7.4, 6.4, 10) + UiScale.dp(10, 8, 14))
-        layer[#layer + 1] = OffsetContainer:new{
-            x_off = math.max(0, cover_w - badge_w - badge_inset),
-            y_off = badge_inset,
-            outlined_badge(text, badge_w, badge_h),
-        }
-    end
+    -- 阅读进度角标已按用户要求移除（进度仍写进正文/详情）。
 
     local body = VerticalGroup:new{
         align = "center",
@@ -199,7 +191,8 @@ function GridShelfWidget:_metrics()
     local header_h = UiScale.dp(54, 48, 74)
     local footer_h = UiScale.dp(45, 40, 62)
     local gap = UiScale.dp(6, 5, 10)
-    local rows = m.portrait and 3 or 2
+    -- 封面收小一档，竖屏 4 行 / 横屏 3 行（用户要求多显示一行）
+    local rows = m.portrait and 4 or 3
     return m, margin, header_h, footer_h, gap, rows
 end
 
@@ -312,6 +305,11 @@ function GridShelfWidget:_build()
     local row_gap = UiScale.dp(5, 4, 9)
     local card_w = math.floor((sw - margin * 2 - col_gap * (columns - 1)) / columns)
     local card_h = math.floor((grid_h - row_gap * (rows - 1)) / rows)
+    if os.getenv("XREAD_AUTOTEST") then
+        print(string.format("[XREAD_AUTOTEST] full_shelf_geom rows=%d cols=%d card=%dx%d progress_badge=off",
+            rows, columns, card_w, card_h))
+        pcall(function() io.stdout:flush() end)
+    end
     local first = (self.page - 1) * self.perpage + 1
     local last = math.min(#(self.opts.books or {}), first + self.perpage - 1)
     local slot = 0

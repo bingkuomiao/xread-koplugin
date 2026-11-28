@@ -282,6 +282,28 @@ function M.install(env)
                 mark("flow=local_shelf done stem=" .. tostring(stem)
                     .. " cache=" .. tostring(cover) .. " shown=" .. tostring(shown_cover))
             end)
+        elseif flow == "local_open" then
+            -- 回归（v0.6.41）：点本地书架里的书，不能在 reader 打开前露出首页。
+            -- 直接触发 on_select 回调，避免依赖点击坐标/假 EPUB 能否被 KOReader 打开。
+            UIManager:scheduleIn(4, function()
+                local BookExport = require("xread.book_export")
+                local books = self.meta_cache:getShelf() or {}
+                local first = books[1]
+                if not first then mark("flow=local_open no_shelf") return end
+                local dir = BookExport:exportDir()
+                pcall(function() require("util").makePath(dir) end)
+                local path = dir .. "/" .. BookExport:baseName(first) .. ".epub"
+                local f = io.open(path, "wb")
+                if f then f:write("dummy epub for local open test\n") f:close() end
+                self:showLocalBooks()
+                local opts = self._local_view and self._local_view.opts
+                if not opts or not opts.on_select then
+                    mark("flow=local_open no_view")
+                    return
+                end
+                opts.on_select({ _xread_local = path })
+                mark("flow=local_open invoked")
+            end)
         elseif flow == "notice_demo" then
             -- 回归（v0.6.33）：结果类提示不再自动消失。
             -- 用例流程：等 notice_shown → 静置 12s（断言没有同 id 的 notice_closed）

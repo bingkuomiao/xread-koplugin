@@ -457,17 +457,32 @@ function M.install(env)
                     local ok, html = pcall(function() return self.client:getBookContentRaw(ch, book) end)
                     if ok then
                         local urls = self.client:extractImageUrls(html)
-                        local n = 0
+                        local n, failed = 0, 0
                         for j, url in ipairs(urls) do
-                            local data = self.client:downloadImage(url)
+                            local data, err = self.client:downloadImage(url, nil, book.origin)
                             if data then
                                 n = n + 1
                                 arc:addFileFromMemory(string.format("%04d_%04d.jpg", i, j), data, mtime)
                                 total_img = total_img + 1
+                            else
+                                failed = failed + 1
+                                if failed <= 2 and os.getenv("XREAD_AUTOTEST") then
+                                    print(string.format("[XREAD_AUTOTEST] comic_img_fail url=%s err=%s",
+                                        tostring(url), tostring(err)))
+                                end
                             end
                             -- 静默下载：不再弹进度框，点书后直接等正文打开（避免弹窗挡住操作）
                         end
                         if n > 0 then total_ch = total_ch + 1 end
+                        if os.getenv("XREAD_AUTOTEST") then
+                            print(string.format("[XREAD_AUTOTEST] comic_chapter i=%d urls=%d ok=%d failed=%d",
+                                i, #urls, n, failed))
+                        end
+                    else
+                        -- 后端取正文失败（连接超时属于这一类）：留日志便于真机判断
+                        if os.getenv("XREAD_AUTOTEST") then
+                            print(string.format("[XREAD_AUTOTEST] comic_chapter i=%d raw_error=%s", i, tostring(html)))
+                        end
                     end
                 end
             end

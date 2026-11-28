@@ -66,8 +66,15 @@ function M.install(env)
         return dir, files
     end
 
-    function XRead:openLocalBook(path)
-        if not path or path == "" then return end
+    -- after_open：阅读器真正显示后调用（用于关掉本地书架）。
+    -- 必须在 showReader 之后、用 nextTick 排队，不能在 on_select 里直接关书架：
+    -- KOReader 的 showReaderCoroutine 会 forceRePaint 一帧，若那时书架已关，
+    -- 画出来的就是下面的首页 —— 用户看到的「先闪一下首页再进正文」。
+    function XRead:openLocalBook(path, after_open)
+        if not path or path == "" then
+            if after_open then after_open() end
+            return
+        end
         local ReaderUI = require("apps/reader/readerui")
         local tries = 0
         local function doOpen()
@@ -79,13 +86,21 @@ function M.install(env)
                     if tf then tf:close() end
                 end
                 self.ui:switchDocument(path, true)
+                if after_open then after_open() end
                 return
             end
             if ReaderUI.instance ~= nil and tries < 20 then
                 UIManager:scheduleIn(0.15, doOpen)   -- 旧 ReaderUI 还在拆除，等它收完
                 return
             end
+            if ReaderUI.instance ~= nil and after_open then
+                -- 重试耗尽：旧阅读器一直不拆，此时也别把书架永久留在栈里
+                UIManager:nextTick(after_open)
+            end
             pcall(function() ReaderUI:showReader(path, nil, true) end)
+            -- showReaderCoroutine 内部先 forceRePaint、再 nextTick 建阅读器；
+            -- 这里排在同批 nextTick 队尾，保证关书架时 reader 已在栈顶。
+            if after_open then UIManager:nextTick(after_open) end
         end
         UIManager:nextTick(doOpen)
     end
@@ -214,8 +229,20 @@ function M.install(env)
             end,
             on_select = function(mbook)
                 local path = mbook and mbook._xread_local
-                closeView(true)
-                self:openLocalBook(path)
+                -- 不再提前关书架：让它在 forceRePaint 那一帧仍盖着首页。
+                -- openLocalBook 在 reader 显示后的 nextTick 里回调 closeView。
+                if os.getenv("XREAD_AUTOTEST") then
+                    print(string.format("[XREAD_AUTOTEST] local_open keep_shelf=%s path=%s",
+                        tostring(view and not view._closed), tostring(path)))
+                    pcall(function() io.stdout:flush() end)
+                end
+                self:openLocalBook(path, function()
+                    if os.getenv("XREAD_AUTOTEST") then
+                        print("[XREAD_AUTOTEST] local_open reader_ready close_shelf=1")
+                        pcall(function() io.stdout:flush() end)
+                    end
+                    closeView(true)
+                end)
             end,
             -- 长按删本地文件：本地书架以前没有任何删除入口，
             -- 只能去 KOReader 文件管理器里自己翻目录。

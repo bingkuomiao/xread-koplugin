@@ -412,8 +412,9 @@ function Client:getBookContentRaw(chapter, book)
 end
 
 --- 从 HTML 中提取所有图片 URL
--- 覆盖三种常见写法：src、懒加载 data-src / data-original、srcset、以及 <source>。
--- 懒加载漫画如果只认 src，会得到一堆 data:image/gif 占位图（或直接漏图）。
+-- 漫画站的懒加载属性没有统一标准：src / data-src / data-original / data-echo /
+-- data-url / original / srcset / <source>，还有直接写在 CSS background 和裸文本里的。
+-- 只认 src 会把漫画判定成一堆 data:image/gif 占位图，从而走错小说分支。
 function Client:extractImageUrls(html)
     local urls = {}
     if type(html) ~= "string" then return urls end
@@ -421,25 +422,46 @@ function Client:extractImageUrls(html)
     local function push(u)
         if type(u) ~= "string" then return end
         u = u:gsub("^%s+", ""):gsub("%s+$", "")
+        -- 跳过 data URI、空串、纯占位符
         if u == "" or u:sub(1, 5) == "data:" then return end
+        if u:lower() == "javascript:void(0)" or u == "#" then return end
         if seen[u] then return end
         seen[u] = true
         urls[#urls + 1] = u
     end
-    -- <img>/<source> 标签内部：优先懒加载属性，其次 src
-    for tag in html:gmatch("<%s*[Ii][Mm][Gg][^>]*>") do
-        local u = tag:match("[Dd][Aa][Tt][Aa]%-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]%s*=%s*[\"']([^\"']+)[\"']")
-            or tag:match("[Dd][Aa][Tt][Aa]%-[Ss][Rr][Cc]%s*=%s*[\"']([^\"']+)[\"']")
-            or tag:match("[Ss][Rr][Cc]%s*=%s*[\"']([^\"']+)[\"']")
-        if u then push(u) end
-        -- srcset="a.jpg 1x, b.jpg 2x"：取第一段
-        local srcset = tag:match("[Ss][Rr][Cc][Ss][Ee][Tt]%s*=%s*[\"']([^\"']+)[\"']")
-        if srcset then push(srcset:match("^%s*([^,]+)")) end
+    -- 一个标签里按「真实图优先、占位图兜底」的顺序扫所有可能的属性。
+    -- 大小写不敏感（[Aa] 这种写法），属性名两侧允许空白与单双引号。
+    local function scan_tag(tag)
+        local value = function(name)
+            local pat = "[%s\"']" .. name .. "%s*=%s*[\"']([^\"']+)[\"']"
+            return tag:match(pat) or tag:match("^%s*" .. name .. "%s*=%s*[\"']([^\"']+)[\"']")
+        end
+        -- 真实图属性优先；src 放最后，避免 data: 占位抢在前面
+        for _, name in ipairs({
+            "[Dd][Aa][Tt][Aa]%-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]",
+            "[Dd][Aa][Tt][Aa]%-[Ss][Rr][Cc]",
+            "[Dd][Aa][Tt][Aa]%-[Ee][Cc][Hh][Oo]",
+            "[Dd][Aa][Tt][Aa]%-[Uu][Rr][Ll]",
+            "[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]",
+            "[Ss][Rr][Cc][Ss][Ee][Tt]",
+            "[Ss][Rr][Cc]",
+        }) do
+            local u = value(name)
+            if u then
+                -- srcset="a.jpg 1x, b.jpg 2x"：只取第一段
+                if name:lower():find("srcset", 1, true) then u = u:match("^%s*([^,]+)") end
+                push(u)
+            end
+        end
     end
-    for tag in html:gmatch("<%s*[Ss][Oo][Uu][Rr][Cc][Ee][^>]*>") do
-        local u = tag:match("[Ss][Rr][Cc][Ss][Ee][Tt]%s*=%s*[\"']([^\"']+)[\"']")
-            or tag:match("[Ss][Rr][Cc]%s*=%s*[\"']([^\"']+)[\"']")
-        if u then push(u:match("^%s*([^,]+)")) end
+    for tag in html:gmatch("<%s*[Ii][Mm][Gg][^>]*>") do scan_tag(tag) end
+    for tag in html:gmatch("<%s*[Ss][Oo][Uu][Rr][Cc][Ee][^>]*>") do scan_tag(tag) end
+    -- 有些漫画源把图写进 CSS：background-image:url('...') / style="url(...)"
+    for u in html:gmatch("[Uu][Rr][Ll]%s*%(%s*[\"']?([^\"')]+)[\"']?%s*%)") do
+        if u:match("%.[Jj][Pp][Ee]?[Gg]$") or u:match("%.[Pp][Nn][Gg]$")
+            or u:match("%.[Ww][Ee][Bb][Pp]$") or u:match("%.[Gg][Ii][Ff]$") then
+            push(u)
+        end
     end
     return urls
 end
@@ -561,7 +583,9 @@ local MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
 --- 下载图片到内存（返回 string 或 nil, err）
 -- 用自定义 sink 做两件事：限制累计大小、超限立刻中断传输。
-function Client:downloadImage(url, max_bytes)
+function Client:downloadImage(url, max_bytes, referer)
+    -- 协议相对 URL（//oss.mkzcdn.com/xxx.jpg）在 socket.http 里没有 scheme 会失败
+    if type(url) == "string" and url:sub(1, 2) == "//" then url = "https:" .. url end
     local limit = tonumber(max_bytes) or MAX_IMAGE_BYTES
     local chunks, total, overflow = {}, 0, false
     local sink = function(chunk, err)
@@ -574,10 +598,19 @@ function Client:downloadImage(url, max_bytes)
         chunks[#chunks + 1] = chunk
         return 1
     end
+    -- 漫画站普遍校验 Referer：不带就返回 403 或一张 1x1 防盗图，
+    -- 表现为「图片加载不出来」。用书源域名作 Referer 最通用。
+    local ref = referer
+    if not ref and type(url) == "string" then
+        ref = url:match("^(https?://[^/]+)")
+    end
     local ok, code = HttpClient.request({
         url = url,
         sink = sink,
-        headers = { ["User-Agent"] = "Mozilla/5.0" },
+        headers = {
+            ["User-Agent"] = "Mozilla/5.0",
+            ["Referer"] = ref or "",
+        },
     }, 20)
     if not ok then return nil, "网络错误" end
     if overflow then return nil, "图片超过 " .. tostring(math.floor(limit / 1024)) .. "KB 上限" end
