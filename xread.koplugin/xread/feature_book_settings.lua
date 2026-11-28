@@ -217,7 +217,6 @@ function M.install(env)
         local face_group = Font:getFace("cfont", 15)
         local face_row = Font:getFace("cfont", 17)
         local face_value = Font:getFace("cfont", 16)
-        local face_desc = Font:getFace("cfont", 13)
         local face_hint = Font:getFace("smallinfofont", 13)
 
         -- ---------- 版式零件（与首页「设置」同一套） ----------
@@ -468,22 +467,13 @@ function M.install(env)
 
         -- ---------- 同步管理：两个开关，可以同时开 ----------
         -- 翻页管理已从这里移出（与首页齿轮「设置 → 翻页管理」重复，同一功能两处入口）。
-        local enter_sync_row = toggleRow(_("进入同步"), self:syncOnOpenEnabled(), function()
+        -- 标签写全「做什么」，下面不再挂两行解释小字：解释只会把面板撑长。
+        local enter_sync_row = toggleRow(_("进入书籍拉取进度"), self:syncOnOpenEnabled(), function()
             self:saveSetting("sync_on_open", self:syncOnOpenEnabled() and "0" or "1")
         end)
-        local exit_sync_row = toggleRow(_("退出同步"), self:syncOnExitEnabled(), function()
+        local exit_sync_row = toggleRow(_("退出上传进度"), self:syncOnExitEnabled(), function()
             self:saveSetting("sync_on_exit", self:syncOnExitEnabled() and "0" or "1")
         end)
-        local sync_hint = VerticalGroup:new{ align = "left",
-            TextWidget:new{
-                text = _("进入同步：打开书籍自动拉取云端进度"),
-                face = face_desc, fgcolor = Blitbuffer.COLOR_GRAY_6, max_width = inner_w,
-            },
-            TextWidget:new{
-                text = _("退出同步：关闭书籍自动上传当前进度"),
-                face = face_desc, fgcolor = Blitbuffer.COLOR_GRAY_6, max_width = inner_w,
-            },
-        }
         local rows = VerticalGroup:new{ align = "left" }
         rows[#rows + 1] = groupTitle(_("页面管理"))
         rows[#rows + 1] = card({ indent_row, footer_row })
@@ -491,8 +481,6 @@ function M.install(env)
         rows[#rows + 1] = card({ font_face_row, font_size_row, bold_row, zh_row })
         rows[#rows + 1] = groupTitle(_("同步管理"))
         rows[#rows + 1] = card({ enter_sync_row, exit_sync_row })
-        rows[#rows + 1] = VerticalSpan:new{ width = Screen:scaleBySize(6) }
-        rows[#rows + 1] = sync_hint
         rows[#rows + 1] = VerticalSpan:new{ width = Screen:scaleBySize(14) }
         rows[#rows + 1] = TextWidget:new{
             text = _("改动即时生效并自动保存；点空白处或右上角 ✕ 关闭。"),

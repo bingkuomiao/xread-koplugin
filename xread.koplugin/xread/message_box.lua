@@ -278,6 +278,10 @@ function Box:init()
             print(string.format("[XREAD_AUTOTEST] box_geom n_btn=%d card=%dx%d top=%d btn%d=%d,%d",
                 n_btn, card_w, card_h, card_top, i, bx, btn_y))
         end
+        -- 立刻刷盘：stdout 被重定向到文件时是块缓冲的，
+        -- 用例在运行中 grep 不到这几行（要等进程被杀才落盘），
+        -- 表现就是「弹窗明明出来了，用例说找不到坐标」。
+        pcall(function() io.stdout:flush() end)
     end
 
     self.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = self.full_dimen } } }

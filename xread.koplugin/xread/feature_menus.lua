@@ -38,6 +38,9 @@ function M.install(env)
         -- 给「不想去点标题」的用户留一条明路；位置紧贴升级管理之前（都是「本机维护」类）。
         self:showMoreListPanel(_("更多"), {
             { label = _("我的书架"), callback = function() self:openShelf() end },
+            -- 「本地书架」= 首页底部「本地阅读」按钮的同一入口（本机导出的 EPUB）。
+            -- 放在「我的书架」后面：两者都是书架，先云端再本地。
+            { label = _("本地书架"), callback = function() self:showLocalBooks() end },
             { label = _("首页管理"), callback = function() self:showBootManage() end },
             { label = _("系统管理"), callback = function() self:openReaderMenuFromHome() end },
             { label = _("升级管理"), callback = function() self:showUpdateManage() end },
@@ -141,7 +144,7 @@ function M.install(env)
             text = text,
             sticky = true,
             buttons = {
-                { text = _("去更新"), bold = true,
+                { text = _("更新"), bold = true,
                   callback = function() self:showAboutPanel() end },
                 { text = _("稍后"), callback = function() end },
             },

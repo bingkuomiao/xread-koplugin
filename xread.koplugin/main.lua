@@ -1891,7 +1891,9 @@ function XRead:_makeHeroInfo(hero_book, cover_paths)
     -- 然后是「最新 · 最新章节名」，再是进度，最后是章节规模。
     local author = tostring(hero_book.author or ""):gsub("^%s+", ""):gsub("%s+$", "")
     local origin = tostring(hero_book.originName or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    hero.author_line = author
+    -- 作者行带前缀「作者 · 」：和下面「最新 · 」「阅读至 」保持同一种写法，
+    -- 否则一行光溜溜的人名读者还得自己猜是作者还是书源。
+    hero.author_line = author ~= "" and (_("作者 · ") .. author) or ""
     hero.origin_line = origin
     local meta_bits = {}
     if author ~= "" then meta_bits[#meta_bits + 1] = author end

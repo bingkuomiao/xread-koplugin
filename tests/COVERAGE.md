@@ -17,7 +17,7 @@
 | 开书 / 正文 | 点书进入、正文渲染、翻页 | 02_reading_open、14_full_flow_touch |
 | 阅读工具栏 | 呼出、按钮布局、目录图标、返回书架 | 03_toolbar、08_toolbar_catalog_tap、15b_toolbar_buttons |
 | 目录 | 打开、跳章、缓存态高亮、翻章后章节名同步 | 04_catalog、22_home_hero_cache（chapter_sync） |
-| 更多菜单 | 我的书架/首页管理/系统管理/升级管理/关于本机（v0.6.35 起 5 项） | 15c_more_menu |
+| 更多菜单 | 我的书架/本地书架/首页管理/系统管理/升级管理/关于本机（v0.6.37 起 6 项） | 15c_more_menu |
 | 设置面板 | 地址、账号、翻页、缓存章节数单选 | 22_home_hero_cache（settings / cache_none） |
 | 阅读统计 | 统计页渲染 | 07_stats |
 | 缓存 | 整本预缓存、未设置章节数时的引导、缓存失败常驻卡 | 15b_toolbar_buttons（cache）、22_home_hero_cache |
@@ -49,6 +49,7 @@
 | `updater.lua` / 打包脚本 | 12、16、18、19、13、10 |
 | `cover_cache.lua` | 17_cover_api、06_home、22 |
 | `showMoreListPanel` / 更多菜单增删条目 | 15c_more_menu、29_about_version（坐标按 `more_row` 日志解析） |
+| `feature_quick_actions.lua` 本地书架（列表/封面/删除） | 37_local_shelf |
 | `message_box.lua` / `showInfo` / 任何弹窗文案 | 35_notice_no_auto_dismiss、22（msgbox/msgconfirm）、15c_more_menu |
 
 ## 三、自动化测不到的部分（必须真机/人工）
@@ -150,3 +151,18 @@
 - 字号 +1 档、行距 `.12` → `.26`；书名用 `height_adjust` 收到实际行数，简介起点改为「详情最后一行 / 封面底部」取更大值，剩余高度全给简介。
 - 底部恢复进度条（只画条，没有「阅读进度 N%」文字）。
 - 自动验收新增排版日志：`hero_geom ...`、`hero_intro y= h= rows_bottom= cover_bottom=`。调字号/行距后先看这两行，别靠截图猜简介还能放几行。
+
+## 十一、v0.6.37 本地书架 + 近期阅读卡片回紧凑
+
+- 「更多」增加「本地书架」，与首页底部「本地阅读」同一入口（同一个 `showLocalBooks`）；页面标题也从「本地阅读」改成「本地书架」，和菜单项一致。
+- 本地书共享「我的书架」封面：
+  - `BookExport:baseName()` 成了公开的文件名规则（导出路径与反查共用，改名时不会漏）。
+  - 打开本地书架时先找随书封面 `<书名>.cover.png`；没有就按名字反查书架条目，用 `CoverCache:anyPathFor()` 扫已有缓存（不挑尺寸、不多发请求）；都没有才异步抓一次并落成随书封面。
+  - 导出完成（`_doDownloadBook` 成功分支）也会顺手存一份，离线也有封面。
+- 本地书删除：长按卡片 → 确认卡「删除本机这一份？」→ 删 EPUB + 随书封面 → 重开列表。只动本机文件，服务器与阅读进度不受影响。
+- 近期阅读卡片：
+  - 「最近阅读」改黑色、字号小一号，并按刷新图标那一行高度居中（同行对齐）。
+  - 详情行距 `.26` → `.12` 行高、字号 10.6 → 9.8，信息块不再顶到封面下边缘以外；空间不够时先压 `meta_gap`（`hero_intro` 日志里的 `gap=`）。
+  - 作者行加前缀「作者 · 」，和「最新 · 」「阅读至 」同一写法。
+- 其它文案：正文设置「同步管理」改为「进入书籍拉取进度 / 退出上传进度」，删掉两行解释小字；发现新版本弹窗按钮「去更新」→「更新」。
+- 自动验收踩坑：`message_box` 的 `box_geom` 每个按钮打一行，用例取坐标必须 `grep btn1=`，`tail -1` 拿到的是 btn2；另外 stdout 重定向到文件是块缓冲，打印后要 `io.stdout:flush()`，否则用例运行中 grep 不到（进程被杀才落盘）。

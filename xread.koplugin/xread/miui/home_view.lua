@@ -417,38 +417,40 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     local progress_line = U.trim(tostring(book.progress_line or ""))
 
     local info_h = body_h
-    -- 详情字号与行距整体放大一档：电子墨水屏上 9dp 的小字读着吃力；
-    -- 行距从 0.12 提到 0.30，五行信息不再挤成一坨。
-    local line_h = math.max(UiScale.dp(19, 17, 24), math.floor(body_h * .105))
-    local meta_gap = math.max(1, math.floor(line_h * .26))
+    -- 行距回到紧凑档：0.6.36 把行距放到 0.26 行高后，五行详情加书名会一路
+    -- 顶到封面下边缘以外（用户反馈「间距又过大」）。字号保留比 0.6.35 略大一档，
+    -- 行距收回 0.12，信息块整体落在封面高度范围内。
+    local line_h = math.max(UiScale.dp(15, 13, 20), math.floor(body_h * .088))
+    local meta_gap = math.max(1, math.floor(line_h * .12))
     -- 顶栏一行：左边「最近阅读」标签，右边刷新图标（参考图就是这个排法）。
     -- 书名不再和图标抢同一行：图标行独占，书名从它下面一行开始并用满 text_w。
     -- 原来书名只拿到 text_w - history_w，像「三国之蜀汉我做主」这种 8 字书名
     -- 会被挤成「三国之蜀汉我做」+「主」，第二行只剩一个字。
     local header_h = math.max(history_h, UiScale.dp(22, 20, 30))
-    local title_y = header_h + math.max(1, math.floor(line_h * .18))
+    local title_y = header_h + math.max(1, math.floor(line_h * .12))
     local title_w = math.max(1, text_w)
     local info = OverlapGroup:new{dimen = Geom:new{w = text_w, h = info_h}, allow_mirroring = false}
     local function info_line(text, y, bold, size)
         if text == "" then return end
         info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = y, TextBoxWidget:new{
             text = text,
-            face = face("smallinfofont", size or (mini and 9.6 or 10.6), mini and 12.8 or 13.6, mini and 7.8 or 8.4),
+            face = face("smallinfofont", size or (mini and 9.2 or 9.8), mini and 12.2 or 13.0, mini and 7.6 or 8.0),
             bold = bold == true,
             width = text_w, height = line_h, height_adjust = false,
             height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
         }}
     end
-    -- 「最近阅读」标签：和右上角刷新图标同一行，占文字列最左侧（参考图排法）
-    local label_h = math.max(1, math.min(header_h, UiScale.dp(19, 17, 26)))
+    -- 「最近阅读」标签：和右上角刷新图标同一行、居中对齐图标那一行，
+    -- 用黑色（灰色在电子墨水屏上发虚），字号比详情小一号不抢戏。
+    local label_h = math.max(1, math.min(history_h, UiScale.dp(18, 16, 24)))
     if history_w > 0 then
         info[#info + 1] = OffsetContainer:new{
-            x_off = 0, y_off = math.max(0, math.floor((header_h - label_h) / 2)),
+            x_off = 0, y_off = math.max(0, math.floor((history_h - label_h) / 2)),
             TextBoxWidget:new{
                 text = "最近阅读",
-                face = face("smallinfofont", mini and 9.0 or 9.6, mini and 12.0 or 12.8, mini and 7.4 or 7.6),
+                face = face("smallinfofont", mini and 8.4 or 8.8, mini and 11.4 or 12.0, mini and 7.0 or 7.2),
                 width = math.max(1, text_w - history_w), height = label_h, height_adjust = false,
-                height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+                height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
             },
         }
     end
@@ -491,18 +493,30 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
         { text = progress_line, bold = true },
         { text = last_chap_line, bold = false },
     }
-    for _i, row in ipairs(rows) do
-        if row.text ~= "" then
-            info_line(row.text, intro_top, row.bold)
-            intro_top = intro_top + line_h + meta_gap
+    -- 详情块不要越过封面下边缘：行数多、空间紧时先压行间距（而不是让文字顶出去）。
+    local cover_bottom = (cover_h and cover_h > 0) and math.floor((body_h + cover_h) / 2) or 0
+    local row_count = 0
+    for _i, row in ipairs(rows) do if row.text ~= "" then row_count = row_count + 1 end end
+    if row_count > 1 and cover_bottom > intro_top then
+        local rows_h = row_count * line_h + (row_count - 1) * meta_gap
+        local room = cover_bottom - intro_top
+        if rows_h > room then
+            meta_gap = math.max(0, math.floor((room - row_count * line_h) / (row_count - 1)))
         end
     end
+    local rows_bottom = intro_top
+    for _i, row in ipairs(rows) do
+        if row.text ~= "" then
+            info_line(row.text, rows_bottom, row.bold)
+            rows_bottom = rows_bottom + line_h + meta_gap
+        end
+    end
+    rows_bottom = math.max(intro_top, rows_bottom - meta_gap)
 
     -- 简介起点跟着「详情最后一行」走，不跟 body_h 走：
     -- body_h 是按「书名最多两行」预留的，实际单行书名时那块空白会全堆在详情和简介之间。
     -- 同时不能压到封面（封面在 body_h 里垂直居中），所以取两者更靠下的那个。
-    local cover_bottom = (cover_h and cover_h > 0) and math.floor((body_h + cover_h) / 2) or 0
-    local intro_y = math.max(intro_top, cover_bottom) + section_gap
+    local intro_y = math.max(rows_bottom, cover_bottom) + section_gap
     -- 简介高度 = 到进度条之前的全部剩余空间（至少保证两行）
     local intro_box_h = math.max(UiScale.dp(26, 24, 34), inner_h - section_gap - bar_h - intro_y)
     if intro_y + intro_box_h > inner_h - bar_h - section_gap then
@@ -511,8 +525,8 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
 
     -- 卡片底部的简介（横贯全宽）
     if os.getenv("XREAD_AUTOTEST") then
-        print(string.format("[XREAD_AUTOTEST] hero_intro y=%d h=%d rows_bottom=%d cover_bottom=%d",
-            intro_y, intro_box_h, intro_top, cover_bottom))
+        print(string.format("[XREAD_AUTOTEST] hero_intro y=%d h=%d rows_bottom=%d cover_bottom=%d gap=%d",
+            intro_y, intro_box_h, rows_bottom, cover_bottom, meta_gap))
     end
     local intro = TextBoxWidget:new{
         text = intro_text,

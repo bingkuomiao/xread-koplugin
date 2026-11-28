@@ -231,6 +231,8 @@ function M.install(env)
                 return
             end
             local size = fileSize(payload)
+            -- 顺手把封面存到 EPUB 旁边：本地书架（含离线）就能显示和「我的书架」一样的封面
+            pcall(function() self:saveLocalCover(book, payload) end)
             self:showInfo(T(_("下载完成\n%1\n共 %2 章 · %3\n可在 KOReader 文件管理器打开"),
                 tostring(payload), tostring(total), tostring(size) .. " B"), 8)
         end)

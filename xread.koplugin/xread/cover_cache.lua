@@ -75,6 +75,24 @@ function CoverCache:pathFor(book, max_w, max_h)
     return nil
 end
 
+--- 这本书已经缓存过的任意尺寸封面（不要求尺寸匹配）。
+-- 本地书架要复用「我的书架」的封面，但它只知道书名、不知道当初按哪个尺寸取的图；
+-- 按指纹前缀扫一遍比自己再下一次图便宜得多（离线时也只有这条能成）。
+function CoverCache:anyPathFor(book)
+    if not book or not book.bookUrl then return nil end
+    local prefix = bookFingerprint(book) .. "-"
+    local ok, iter, obj = pcall(lfs.dir, self.dir)
+    if not ok then return nil end
+    local best
+    for name in iter, obj do
+        if type(name) == "string" and name:sub(1, #prefix) == prefix and name:match("%.png$") then
+            best = self.dir .. "/" .. name
+            break
+        end
+    end
+    return best
+end
+
 --- 删除某本书的全部封面缓存（所有尺寸变体）
 -- 新文件名为 <指纹>-<md5>.png，按前缀扫一遍即可；
 -- 老版本的纯 md5 文件名无法归属到具体书，在 migrateLegacy() 里一次性清掉。

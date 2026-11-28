@@ -16,6 +16,7 @@ local MiuiHome = require("xread.miui.home_view")
 local ReaderToolbar = require("xread.miui.reader_toolbar")
 local ReadingStats = require("xread.reading_stats")
 local BookExport = require("xread.book_export")
+local MessageBox = require("xread.message_box")
 
 local M = {}
 
@@ -88,6 +89,60 @@ function M.install(env)
         end
         UIManager:nextTick(doOpen)
     end
+    -- 本地封面文件：导出目录里和 EPUB 同名的 `<书名>.cover.png`。
+    -- 导出/补抓成功后就落一份，删书时跟着 EPUB 一起删。
+    local LOCAL_COVER_W, LOCAL_COVER_H = 400, 600
+    local function localCoverOf(epub_path)
+        local p = tostring(epub_path or ""):gsub("%.epub$", "") .. ".cover.png"
+        return lfs.attributes(p, "mode") == "file" and p or nil
+    end
+
+    --- 本地 EPUB 对应的「我的书架」条目（按导出文件名反查，名字规则在 BookExport 里）
+    function XRead:localShelfBook(name)
+        if not name or name == "" then return nil end
+        local ok, books = pcall(function() return self.meta_cache:getShelf() end)
+        if not ok or type(books) ~= "table" then return nil end
+        for _, b in ipairs(books) do
+            local stem
+            pcall(function() stem = BookExport:baseName(b) end)
+            if stem == name then return b end
+        end
+        return nil
+    end
+
+    --- 把「我的书架」那本书的封面存到本地 EPUB 旁边（有缓存直接拷，没有就异步抓一次）。
+    -- 存成文件而不是每次都去封面缓存里找：缓存按尺寸命名、还会被清，
+    -- 本地书是长期文件，封面得跟着它一起在。
+    function XRead:saveLocalCover(book, epub_path, callback)
+        local function done(p) if callback then pcall(callback, p) end end
+        if not book or not epub_path or epub_path == "" then return done(nil) end
+        local existing = localCoverOf(epub_path)
+        if existing then return done(existing) end
+        local dest = tostring(epub_path):gsub("%.epub$", "") .. ".cover.png"
+        local function write(src)
+            if not src then return done(nil) end
+            local fin = io.open(src, "rb")
+            if not fin then return done(nil) end
+            local data = fin:read("*a")
+            fin:close()
+            if not data or #data < 100 then return done(nil) end
+            local fout = io.open(dest .. ".tmp", "wb")
+            if not fout then return done(nil) end
+            fout:write(data)
+            fout:close()
+            pcall(os.rename, dest .. ".tmp", dest)
+            done(localCoverOf(epub_path))
+        end
+        local cached
+        pcall(function() cached = self.cover_cache:anyPathFor(book) end)
+        if cached then return write(cached) end
+        if type(self._fetchCoverAsync) ~= "function" then return done(nil) end
+        local ok = pcall(function()
+            self:_fetchCoverAsync(book, LOCAL_COVER_W, LOCAL_COVER_H, write)
+        end)
+        if not ok then done(nil) end
+    end
+
     -- 「本地阅读」：本机导出的书（正文「下载」导出的 EPUB）用书架同款网格页展示，
     -- 标题就叫「本地阅读」。以前是一个竖排列表弹窗，跟书架风格不统一。
     function XRead:showLocalBooks()
@@ -101,15 +156,32 @@ function M.install(env)
             return
         end
         local miui_books = {}
+        local pending_cover = {}
         for i, f in ipairs(files) do
             local kb = math.max(1, math.floor((tonumber(f.size) or 0) / 1024 + 0.5))
-            miui_books[i] = {
-                title = tostring(f.name):gsub("%.epub$", ""),
+            local title = tostring(f.name):gsub("%.epub$", "")
+            local mbook = {
+                title = title,
                 author = T(_("%1 KB"), tostring(kb)),
                 file = f.path,                 -- 有 file 就画「已下载」角标
                 bookId = tostring(f.path),
                 _xread_local = f.path,
+                cover_path = localCoverOf(f.path),
             }
+            miui_books[i] = mbook
+            -- 没有随书封面：先借「我的书架」同名的封面；连缓存都没有就排队异步抓
+            if not mbook.cover_path then
+                local shelf_book = self:localShelfBook(title)
+                if shelf_book then
+                    local cached
+                    pcall(function() cached = self.cover_cache:anyPathFor(shelf_book) end)
+                    if cached then
+                        mbook.cover_path = cached
+                    else
+                        pending_cover[#pending_cover + 1] = { mbook = mbook, shelf = shelf_book }
+                    end
+                end
+            end
         end
         local view
         local function closeView()
@@ -124,7 +196,7 @@ function M.install(env)
         end
         view = MiuiShelf.show{
             books = miui_books,
-            title = _("本地阅读"),
+            title = _("本地书架"),
             page = 1,
             show_actions = true,
             -- 统计入口已收进首页仪表盘的数据区，本地书架右上角只留「返回」
@@ -141,6 +213,11 @@ function M.install(env)
                 closeView()
                 self:openLocalBook(path)
             end,
+            -- 长按删本地文件：本地书架以前没有任何删除入口，
+            -- 只能去 KOReader 文件管理器里自己翻目录。
+            on_hold = function(mbook)
+                self:confirmDeleteLocalBook(mbook and mbook._xread_local)
+            end,
             on_back = function()
                 local back = self._local_back
                 if back then back() end
@@ -148,6 +225,49 @@ function M.install(env)
             on_close = function() self._local_view = nil end,
         }
         self._local_view = view
+        -- 缺封面的后台补：网络段在 fork 里跑完再刷新网格，
+        -- 顺带把封面存到 EPUB 旁边，下次离线进来也有图。
+        if #pending_cover > 0 then
+            UIManager:scheduleIn(0.4, function()
+                for _i, item in ipairs(pending_cover) do
+                    self:saveLocalCover(item.shelf, item.mbook._xread_local, function(path)
+                        if not path then return end
+                        item.mbook.cover_path = path
+                        local v = self._local_view
+                        if v and not v._miu_closed and type(v.updateItems) == "function" then
+                            v:updateItems()
+                        end
+                    end)
+                end
+            end)
+        end
+    end
+
+    --- 删除本地导出的 EPUB（连同随附封面），只动本机文件，不动服务器上的书。
+    function XRead:confirmDeleteLocalBook(path)
+        path = tostring(path or "")
+        if path == "" then return end
+        MessageBox.confirm{
+            text = T(_("删除本机这一份？\n%1\n\n服务器上的书和阅读进度都不受影响。"), path),
+            ok_text = _("删除"),
+            callback = function(ok)
+                if not ok then return end
+                -- os.remove 成功返回 true；pcall 只说明「没抛异常」，
+                -- 所以要看返回值本身，否则删不掉也会报成功。
+                local ok_rm, res = pcall(os.remove, path)
+                local removed = ok_rm and res ~= nil and res ~= false
+                local cover = localCoverOf(path)
+                if cover then pcall(os.remove, cover) end
+                if os.getenv("XREAD_AUTOTEST") then
+                    print(string.format("[XREAD_AUTOTEST] local_book_deleted path=%s ok=%s",
+                        tostring(path), tostring(removed)))
+                    pcall(function() io.stdout:flush() end)
+                end
+                -- 重开列表：删完立刻看到结果，不留一张点不开的空卡片
+                self:showLocalBooks()
+                if not removed then self:showInfo(_("删除失败")) end
+            end,
+        }
     end
 
     function XRead:showReadingStats()

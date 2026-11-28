@@ -9,7 +9,7 @@
 tests/
 ├── CASE_INDEX.md          本文件：用例索引 + 判定规则 + 坐标基准
 ├── lib/common.sh          公共库：模拟器启停、验收标记等待、断言、截图
-├── cases/01..36/*.sh      独立用例（12=zip 更新，13=包留存策略，16=按版本挑最新，17=封面单测，18=tar.gz 更新，19=本地包更新，31=静默检查更新，34=更新器建目录，35=提示卡不自动消失，36=英雄卡长书名；11 旧散文件用例已移除）
+├── cases/01..37/*.sh      独立用例（12=zip 更新，13=包留存策略，16=按版本挑最新，17=封面单测，18=tar.gz 更新，19=本地包更新，31=静默检查更新，34=更新器建目录，35=提示卡不自动消失，36=英雄卡长书名，37=本地书架；11 旧散文件用例已移除）
 ├── reports/<时间戳>/      每次运行归档：SUMMARY.md + 逐用例日志 + 截图
 └── run_all.sh             统一入口（--full / --quick / --only）
 ```
@@ -30,7 +30,7 @@ tests/
 | 10_package_consistency | 交付包一致性 | md5 | zip / 源码 / WSL 部署三方逐文件匹配 | <5s |
 | 12_update_zip | 列目录模式 zip 热更新全流程 | `update` + filelist.json + zip + md5 sidecar（无 manifest） | `via=list`、`newer=true`、下载 zip 解压后本地版本变为测试版本；同名 zip 与解压目录同级留存 | ~90s |
 | 13_package_retention | 设备端更新包留存与清理 | `update` + filelist.json（1 包）+ 预置 4 个历史包 | 新包落 `xread_update/<包名>/`；索引只留 3 条；最旧 p1/p2 的目录与 zip 被清理，p3/p4 保留 | ~90s |
-| 15c_more_menu | 更多页 5 项菜单逐项点击（v0.6.35） | `home` + 点右上「更多」→ 按 `more_row` 日志坐标逐项点 | 我的书架/首页管理/系统管理/升级管理/关于本机 各自打开对应面板，无致命错误 | ~240s |
+| 15c_more_menu | 更多页 6 项菜单逐项点击（v0.6.37） | `home` + 点右上「更多」→ 按 `more_row` 日志坐标逐项点 | 我的书架/本地书架/首页管理/系统管理/升级管理/关于本机 各自打开对应页面，无致命错误 | ~300s |
 | 16_filelist_latest | 列目录按版本挑最新（不按时间） | `update` + filelist.json（2 包，无 version 字段）+ md5 sidecar | `via=list`、按包名语义版本挑中高版本（`remote=0.7.1-test`）而非时间戳更新的低版本、包内版本裁决后本地版本更新、不误装旧包 | ~90s |
 | 17_cover_api | 统一封面接口（本地/网络书通用） | 纯 Lua 单测（LuaJIT + mock socket.http） | `path=<customCoverUrl||coverUrl 原值>`、统一带 accessToken/secureKey/userNS、未登录网络书 URL 正确、Referer 为合法 header、本地书 401 重登后用新 token 重试 | <5s |
 | 18_targz_update | tar.gz 包热更新全流程（v0.6.2+） | `update` + filelist.json + tar.gz + md5 sidecar | `via=list`、识别 .tar.gz 包名版本、下载解压后本地版本变为测试版本；同名 tar.gz 与解压目录同级留存 | ~90s |
@@ -52,6 +52,7 @@ tests/
 | 34_updater_ensure_dir | 更新器建目录 | `home` + `FLOW=updater_ensure_dir` | 相对/绝对路径都能建出 `a/b`，mode=directory | ~60s |
 | 35_notice_no_auto_dismiss | 提示卡不自动消失（v0.6.33） | `home` + `FLOW=notice_demo` | 弹卡后静置 12s 无 `notice_closed`；点「知道了」后才出现同 id 关闭标记 | ~90s |
 | 36_hero_title | 英雄卡长书名排版（v0.6.34） | `home` + `FLOW=hero_title`（书名换成「三国之蜀汉我做主」） | `flow=hero_title done ok=true`；截图人工复核书名在刷新图标下一行且完整 | ~90s |
+| 37_local_shelf | 本地书架复用书架封面 + 长按删除（v0.6.37） | `home` + `FLOW=local_shelf`（造一本与书架第一本同名的假 EPUB，不带随书封面） | `cache=true`/`shown=true`；长按卡片弹确认卡，点「删除」后出现 `local_book_deleted ok=true` 且列表刷新 | ~150s |
 
 ## 运行方式
 

@@ -241,6 +241,37 @@ function M.install(env)
                 mark("flow=hero_title done ok=" .. tostring(ok)
                     .. " len=" .. tostring(#hero.title))
             end)
+        elseif flow == "local_shelf" then
+            -- 回归（v0.6.37）：本地书架入口 + 复用「我的书架」的封面。
+            -- 造一本和书架第一本**同名**的假 EPUB（故意不带 .cover.png），
+            -- 打开本地书架时应显示同一张封面，而不是灰底占位块。
+            UIManager:scheduleIn(4, function()
+                local BookExport = require("xread.book_export")
+                local books = self.meta_cache:getShelf() or {}
+                local first = books[1]
+                if not first then
+                    mark("flow=local_shelf no_shelf")
+                    return
+                end
+                local dir = BookExport:exportDir()
+                pcall(function() require("util").makePath(dir) end)
+                local stem = BookExport:baseName(first)
+                local path = dir .. "/" .. stem .. ".epub"
+                local f = io.open(path, "wb")
+                if f then f:write("dummy epub for local shelf test\n") f:close() end
+                local shelf_book = self:localShelfBook(stem)
+                local cover = false
+                if shelf_book and self.cover_cache then
+                    local ok_c, p = pcall(function() return self.cover_cache:anyPathFor(shelf_book) end)
+                    cover = (ok_c and p) and true or false
+                end
+                self:showLocalBooks()
+                local view_books = self._local_view and self._local_view.opts
+                    and self._local_view.opts.books or {}
+                local shown_cover = (view_books[1] and view_books[1].cover_path) and true or false
+                mark("flow=local_shelf done stem=" .. tostring(stem)
+                    .. " cache=" .. tostring(cover) .. " shown=" .. tostring(shown_cover))
+            end)
         elseif flow == "notice_demo" then
             -- 回归（v0.6.33）：结果类提示不再自动消失。
             -- 用例流程：等 notice_shown → 静置 12s（断言没有同 id 的 notice_closed）
